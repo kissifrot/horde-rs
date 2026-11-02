@@ -11,10 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "rustls-tls", "stream"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 futures-util = "0.3"
 bytes = "1"
 serde_json = "1"
 tower = { version = "0.5", features = ["util"] }
 hdrhistogram = { version = "7", default-features = false }
+serde = { version = "1", features = ["derive"] }
+jsonschema = { version = "0.60.2", default-features = false }

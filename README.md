@@ -16,13 +16,14 @@ Use `horde --help` for all options. Only test services you are authorized to loa
 
 ## Assemble the Horde: command-line options
 
-Usage: `horde [OPTIONS] <URL>`
+Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 
 | Argument or option | Description | Default |
 | --- | --- | --- |
-| `<URL>` | Target HTTP or HTTPS URL (required). | — |
-| `-n, --requests <REQUESTS>` | Total number of requests; must be positive. | `1` |
-| `-c, --concurrency <CONCURRENCY>` | Maximum concurrent requests; must be positive. | `1` |
+| `<URL>` | Target HTTP or HTTPS URL; required unless using `--scenario`. | — |
+| `--scenario <FILE>` | Run a JSON scenario instead of a single URL. | Disabled |
+| `-n, --requests <REQUESTS>` | Total requests, or scenario iterations; must be positive. | `1` |
+| `-c, --concurrency <CONCURRENCY>` | Maximum concurrent requests or virtual users; must be positive. | `1` |
 | `-t, --timeout <TIMEOUT>` | Timeout per request, in seconds; must be positive. | `30` |
 | `-X, --method <METHOD>` | HTTP method. | `GET` |
 | `-H, --header <HEADERS>` | HTTP header as `Name: value`; may be repeated. | None |
@@ -54,6 +55,31 @@ horde -X POST --body-file payload.json -H 'Content-Type: application/json' https
 ```
 
 The file is read once and reused. The method is not changed automatically. Redirects follow the HTTP client's method and body rules; for example, 307 preserves them.
+
+### User journeys
+
+Use `--scenario` to run an ordered sequence of HTTP steps, as in [examples/journey.json](examples/journey.json):
+
+```sh
+horde --scenario examples/journey.json -n 100 -c 10 --json
+```
+
+Scenarios must declare `"version": 1` and are validated against the bundled [version 1 JSON Schema](schemas/scenario-v1.schema.json) before execution. The optional `$schema` field helps compatible editors find the schema; Horde uses its bundled copy and does not fetch the URI. Horde also validates semantics that JSON Schema cannot express here, including unique step names, variable references, HTTP methods and the expanded URLs.
+
+Here `-n` is the total number of scenario iterations and `-c` is the maximum number of virtual users. Each user has its own cookie jar, retained across its iterations. Each step has a unique `name`, an absolute HTTP(S) `url`, an optional `method` (default `GET`), `headers`, string `body`, and `wait_ms` before the step. A failed request or 4xx/5xx stops that iteration; later steps are skipped. Redirects are not followed. The report shows completed and failed iterations and per-step counts and mean latency; iteration duration includes waits. The per-request `-t` timeout, `--json` and `-v` are supported; other single-URL options are rejected in scenario mode. Individual failures do not change the exit code.
+
+With `-v`, stderr shows each user's scenario start, waits, step results and final outcome with relative timestamps. URLs, headers, bodies, cookies and variable values are omitted; step names are shown. JSON remains on stdout. Logging can affect timing and throughput.
+
+Define string values under `variables` and refer to them as `{{name}}` in step URLs, header values and bodies. Names contain letters, digits and underscores. Substitution is literal, happens once before the test, and does not perform URL or JSON escaping. Unknown variables or malformed placeholders reject the scenario before any requests. Variables are shared static configuration, not values extracted from responses; avoid committing secrets in scenario files.
+
+For a runnable login example, start the local demo server in one terminal and run the scenario in another:
+
+```sh
+python3 examples/login_server.py
+./target/release/horde --scenario examples/login.json -n 10 -c 2 -v
+```
+
+The example opens a form, submits demo credentials and accesses a protected page using the session cookie. The server listens only on loopback and is for demonstration, not production. The form body uses literal substitution: URL-encode special characters in values yourself. Real login flows that require CSRF tokens or redirects need additional scenario features not yet implemented.
 
 ### Connections and redirects
 
@@ -95,7 +121,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-The library separates the test plan, local execution and report from the CLI. Distributed mode is not implemented. Future agents must authenticate and encrypt communications, enforce target and resource limits, and never offer arbitrary command execution. No remote listener is enabled.
+The library separates the test plan, local execution and report from the CLI. Distributed mode is not implemented and no remote listener is enabled. See the [proposed distributed design](docs/distributed.md) for agent security, result aggregation and implementation steps.
 
 ### Local performance benchmark
 

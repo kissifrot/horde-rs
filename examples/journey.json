@@ -1,0 +1,19 @@
+{
+  "$schema": "../schemas/scenario-v1.schema.json",
+  "version": 1,
+  "name": "Browse the site",
+  "variables": {
+    "base_url": "https://example.com"
+  },
+  "steps": [
+    {
+      "name": "Home page",
+      "url": "{{base_url}}/"
+    },
+    {
+      "name": "Next page",
+      "url": "{{base_url}}/next",
+      "wait_ms": 500
+    }
+  ]
+}

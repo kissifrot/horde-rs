@@ -1,4 +1,5 @@
 use clap::Parser;
+use horde_rs::scenario::{Counts, Scenario, run_scenario_with_options};
 use horde_rs::{LatencyStats, TestPlan, run};
 use reqwest::{
     Method, Url,
@@ -21,7 +22,11 @@ use std::{
 )]
 struct Args {
     /// HTTP or HTTPS target URL.
-    url: Url,
+    #[arg(required_unless_present = "scenario", conflicts_with = "scenario")]
+    url: Option<Url>,
+    /// Run a JSON scenario instead of testing a single URL.
+    #[arg(long, conflicts_with_all = ["method", "headers", "user_agent", "body_file", "duration", "rate", "bounded_latency", "no_connection_reuse", "max_failure_rate", "max_p95_ms", "follow_redirects", "max_redirects"])]
+    scenario: Option<PathBuf>,
     /// Total number of requests.
     #[arg(short = 'n', long)]
     requests: Option<usize>,
@@ -87,6 +92,47 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
     if args.max_p95_ms.is_some_and(|v| !v.is_finite() || v < 0.0) {
         return Err("max p95 must be a finite, non-negative number of milliseconds".into());
     }
+    if let Some(path) = &args.scenario {
+        let scenario = Scenario::from_json(&std::fs::read(path)?)?;
+        let report = run_scenario_with_options(
+            scenario,
+            args.requests.unwrap_or(1),
+            args.concurrency,
+            Duration::from_secs(args.timeout),
+            args.verbose,
+        )
+        .await?;
+        fn mean(count: &Counts) -> Option<f64> {
+            (count.completed > 0)
+                .then(|| count.elapsed.as_secs_f64() * 1000.0 / count.completed as f64)
+        }
+        if args.json {
+            let steps: Vec<_> = report.steps.iter().map(|(name, count)| serde_json::json!({"name": name, "completed": count.completed, "failed": count.failed, "mean_latency_ms": mean(count)})).collect();
+            let output = serde_json::json!({"schema_version": 1, "type": "scenario", "name": report.name, "elapsed_seconds": report.elapsed.as_secs_f64(), "scenarios": {"completed": report.scenarios.completed, "failed": report.scenarios.failed, "mean_duration_ms": mean(&report.scenarios)}, "steps": steps});
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            println!(
+                "For the Horde!\nScenario: {}\nCompleted scenarios: {}\nFailed scenarios:    {}\nElapsed:             {:.3} s",
+                report.name,
+                report.scenarios.completed,
+                report.scenarios.failed,
+                report.elapsed.as_secs_f64()
+            );
+            if let Some(value) = mean(&report.scenarios) {
+                println!("Mean scenario time:  {value:.2} ms");
+            }
+            println!("Steps:");
+            for (name, count) in &report.steps {
+                let latency =
+                    mean(count).map_or_else(|| "n/a".into(), |value| format!("{value:.2} ms"));
+                println!(
+                    "  {name}: completed={} failed={} mean={latency}",
+                    count.completed, count.failed
+                );
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut headers = HeaderMap::new();
     for header in args.headers {
         let (name, value) = header
@@ -106,7 +152,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         .transpose()?
         .map(Into::into);
     let mut report = run(TestPlan {
-        url: args.url,
+        url: args.url.expect("URL is required without --scenario"),
         requests: args.requests.unwrap_or(if args.duration.is_some() {
             usize::MAX
         } else {

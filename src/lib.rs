@@ -1,5 +1,6 @@
 //! Local load generation and reporting, independent of the command-line interface.
 mod latency;
+pub mod scenario;
 use bytes::Bytes;
 use futures_util::StreamExt;
 pub use latency::BoundedLatency;
