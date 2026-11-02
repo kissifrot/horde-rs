@@ -1,0 +1,16 @@
+[package]
+name = "horde-rs"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "An HTTP load testing tool"
+
+[[bin]]
+name = "horde"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+futures-util = "0.3"
