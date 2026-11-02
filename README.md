@@ -67,6 +67,23 @@ cargo test --all-targets --all-features
 
 The library separates the test plan, local execution and report from the CLI. A distributed mode is not implemented: a future controller and agents must authenticate each other, encrypt communications, enforce target and resource limits, and never offer arbitrary command execution. No remote listener is enabled in this release.
 
+### Local performance benchmark
+
+Build an optimized binary and run the standard-library Python 3 harness:
+
+```sh
+cargo build --release --locked
+python3 benchmarks/local.py --requests 10000 --repeats 3 --output /tmp/horde-benchmark.json
+```
+
+The harness starts a local HTTP/1.1 server returning a two-byte body, performs a short warm-up, then measures serial, concurrent (16 and 64), no-reuse and rate-limited workloads. Each scenario runs three times by default. The JSON contains each Horde report, median throughput, elapsed wall time, binary hash, revision and environment metadata. On Linux it also records server CPU time via `/proc` and client CPU time and peak RSS when GNU `/usr/bin/time` is available. The `--binary` option lets you measure a previously built version. Both client and server use the same machine and compete for resources; Python server overhead, loopback, CPU frequency, background activity and operating-system limits can all constrain results. This harness is a repeatable baseline, not a measurement of Horde's absolute capacity.
+
+For comparisons, use the same machine and load, build settings, Python version, request count and repeat count. Compare the individual samples and median, not just one run. A high server CPU time suggests the test server may be limiting throughput; client CPU or memory growth can indicate where to profile Horde, but neither proves a bottleneck. To identify a cause, profile the release binary separately (for example with Linux `perf`) under the same workload, then repeat the benchmark after a change. Avoid treating noisy shared CI runners as a strict performance gate.
+
+GitHub Actions runs the same benchmark for pushes and pull requests. The benchmark job summary shows the median and range for each scenario; the `horde-benchmark-results` artifact contains the full JSON for 90 days. For pull requests, the job also builds the exact base commit and runs it with the pull request's benchmark harness on the same runner, sequentially after the pull request's merge commit. The summary compares median throughput for matching workloads, and the artifact includes both reports. A positive percentage means higher throughput in the pull request. The `binary_revision` metadata identifies each binary; `git_commit` identifies the checkout containing the harness. If the base cannot be built or does not support the harness, the comparison is marked unavailable and its logs explain why. The pull request benchmark itself must still succeed.
+
+The comparison is informational: there is no regression threshold, and shared runner variability, workload order and server contention can affect results even on the same runner. Confirm suspected regressions on controlled hardware. Do not use this workflow with privileged pull request events or secrets: it builds and runs pull request code.
+
 ## License
 
 GPL-3.0-only; see [LICENSE](LICENSE).

@@ -19,3 +19,52 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-targets --all-features
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Checkout pull request base
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: target/benchmark-base
+          persist-credentials: false
+      - name: Build base release binary
+        if: github.event_name == 'pull_request'
+        id: base_build
+        continue-on-error: true
+        run: cargo build --release --locked --manifest-path target/benchmark-base/Cargo.toml --target-dir "$RUNNER_TEMP/horde-base-target"
+      - name: Run local benchmark
+        run: python3 benchmarks/local.py --binary-revision "$GITHUB_SHA" --requests 10000 --repeats 3 --output "$RUNNER_TEMP/benchmark-results.json"
+      - name: Run base benchmark
+        if: github.event_name == 'pull_request' && steps.base_build.outcome == 'success'
+        id: base_benchmark
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 benchmarks/local.py --binary "$RUNNER_TEMP/horde-base-target/release/horde" --binary-revision "$BASE_SHA" --requests 10000 --repeats 3 --output "$RUNNER_TEMP/benchmark-base.json"
+      - name: Add benchmark summary
+        env:
+          BASE_OUTCOME: ${{ steps.base_benchmark.outcome }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 benchmarks/summary.py "$RUNNER_TEMP/benchmark-results.json" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$BASE_OUTCOME" = "success" ]; then
+            python3 benchmarks/compare.py "$RUNNER_TEMP/benchmark-base.json" "$RUNNER_TEMP/benchmark-results.json" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            echo 'Base comparison unavailable: the base build or benchmark failed. See the job logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: horde-benchmark-results
+          path: |
+            ${{ runner.temp }}/benchmark-results.json
+            ${{ runner.temp }}/benchmark-base.json
+          if-no-files-found: error
+          retention-days: 90
