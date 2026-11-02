@@ -1,5 +1,5 @@
 use clap::Parser;
-use horde_rs::{TestPlan, run};
+use horde_rs::{LatencyStats, TestPlan, run};
 use reqwest::{
     Method, Url,
     header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT},
@@ -99,7 +99,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         .map(std::fs::read)
         .transpose()?
         .map(Into::into);
-    let report = run(TestPlan {
+    let mut report = run(TestPlan {
         url: args.url,
         requests: args.requests.unwrap_or(if args.duration.is_some() {
             usize::MAX
@@ -120,7 +120,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         max_redirects: args.max_redirects.map_or(10, NonZeroUsize::get),
     })
     .await?;
-    let stats = report.latency_stats();
+    let stats = LatencyStats::from_samples(std::mem::take(&mut report.latencies));
     let failure_rate =
         (report.completed > 0).then(|| report.failed as f64 * 100.0 / report.completed as f64);
     let p95_ms = stats

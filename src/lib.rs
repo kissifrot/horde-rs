@@ -98,14 +98,7 @@ struct WorkerReport {
 impl Report {
     /// Calculate latency statistics, sorting the samples once.
     pub fn latency_stats(&self) -> Option<LatencyStats> {
-        if self.latencies.is_empty() {
-            return None;
-        }
-        let mut sorted = self.latencies.clone();
-        sorted.sort_unstable();
-        let mean_ms =
-            sorted.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>() / sorted.len() as f64;
-        Some(LatencyStats { sorted, mean_ms })
+        LatencyStats::from_samples(self.latencies.clone())
     }
 
     /// Nearest-rank percentile, with ranks starting at one.
@@ -128,6 +121,17 @@ pub struct LatencyStats {
 }
 
 impl LatencyStats {
+    /// Sort owned samples in place, without allocating a second sample vector.
+    pub fn from_samples(mut sorted: Vec<Duration>) -> Option<Self> {
+        if sorted.is_empty() {
+            return None;
+        }
+        sorted.sort_unstable();
+        let mean_ms =
+            sorted.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>() / sorted.len() as f64;
+        Some(Self { sorted, mean_ms })
+    }
+
     pub fn min(&self) -> Duration {
         self.sorted[0]
     }
@@ -349,7 +353,11 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
         for (code, count) in worker.status_codes {
             *report.status_codes.entry(code).or_default() += count;
         }
-        report.latencies.extend(worker.latencies);
+        if report.latencies.is_empty() {
+            report.latencies = worker.latencies;
+        } else {
+            report.latencies.extend(worker.latencies);
+        }
     }
     report.elapsed = start.elapsed();
     report.redirects_followed = redirects_followed.load(Ordering::Relaxed);
@@ -392,6 +400,9 @@ mod tests {
         assert_eq!(stats.median(), Duration::from_millis(20));
         assert_eq!(stats.mean_ms, 20.0);
         assert_eq!(stats.percentile(99), report.percentile(99));
+        let owned = LatencyStats::from_samples(report.latencies.clone()).unwrap();
+        assert_eq!(owned.percentile(50), report.percentile(50));
+        assert_eq!(owned.percentile(99), report.percentile(99));
         report.latencies.push(Duration::from_millis(40));
         assert_eq!(
             report.latency_stats().unwrap().median(),
@@ -399,6 +410,7 @@ mod tests {
         );
         report.latencies.clear();
         assert!(report.latency_stats().is_none());
+        assert!(LatencyStats::from_samples(Vec::new()).is_none());
     }
     #[tokio::test]
     async fn rejects_zero_requests() {
