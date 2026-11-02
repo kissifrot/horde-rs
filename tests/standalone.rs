@@ -47,6 +47,7 @@ fn cli_runs_requests_and_reports_http_errors() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Completed requests:      4"), "{stdout}");
     assert!(stdout.contains("Failed requests:         1"), "{stdout}");
@@ -91,6 +92,38 @@ fn reports_status_even_when_body_is_incomplete() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Failed requests:         1"), "{stdout}");
     assert!(stdout.contains("  201: 1"), "{stdout}");
+}
+
+#[test]
+fn verbose_success_has_relative_timestamps_and_no_error_field() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 4096];
+        assert!(stream.read(&mut request).unwrap() > 0);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .args(["--verbose", "--json", &format!("http://{address}/")])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let verbose = String::from_utf8(output.stderr).unwrap();
+    assert!(verbose.contains("completed status=200"), "{verbose}");
+    assert!(!verbose.contains("errors="), "{verbose}");
+    assert!(
+        verbose
+            .lines()
+            .all(|line| line.starts_with("[+") && line.contains("s] [worker")),
+        "{verbose}"
+    );
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_ok());
 }
 
 #[test]
@@ -171,6 +204,52 @@ fn ci_thresholds_report_results_and_exit_status() {
         );
         assert_eq!(report["thresholds"]["p95_ms"]["passed"], p95_limit != "0");
     }
+}
+
+#[test]
+fn bounded_latency_reports_method_and_checks_p95() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .args([
+            "-n",
+            "4",
+            "-c",
+            "2",
+            "--bounded-latency",
+            "--max-p95-ms",
+            "0",
+            "--json",
+            &format!("http://{address}/"),
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["completed"], 4);
+    assert_eq!(
+        report["latency_method"],
+        "hdr_histogram_upper_bound_3_significant_digits"
+    );
+    assert_eq!(report["thresholds"]["p95_ms"]["passed"], false);
+    assert_eq!(
+        report["thresholds"]["p95_ms"]["observed"],
+        report["latency_ms"]["p95"]
+    );
+    assert!(report["latency_ms"]["p95"].as_f64().unwrap() > 0.0);
 }
 
 #[test]
@@ -489,7 +568,7 @@ fn json_report_and_request_body_survive_redirect() {
     let path = std::env::temp_dir().join(format!("horde-body-{}", std::process::id()));
     std::fs::write(&path, b"payload").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
-        .args(["-L", "-X", "POST", "--json", "--body-file"])
+        .args(["-L", "-v", "-X", "POST", "--json", "--body-file"])
         .arg(&path)
         .arg(format!("http://{address}/"))
         .output()
@@ -497,6 +576,21 @@ fn json_report_and_request_body_survive_redirect() {
     std::fs::remove_file(path).unwrap();
     server.join().unwrap();
     assert!(output.status.success());
+    let verbose = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        verbose.contains("[worker 1 request 1] started"),
+        "{verbose}"
+    );
+    assert!(verbose.contains("completed status=500"), "{verbose}");
+    assert!(verbose.contains("errors=http"), "{verbose}");
+    assert!(!verbose.contains("=false"), "{verbose}");
+    assert!(
+        verbose
+            .lines()
+            .all(|line| line.starts_with("[+") && line.contains("s] [worker")),
+        "{verbose}"
+    );
+    assert!(!verbose.contains("payload"), "{verbose}");
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["completed"], 1);

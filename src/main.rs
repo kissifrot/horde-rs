@@ -49,6 +49,12 @@ struct Args {
     /// Target rate in logical requests per second (1 to 1000000000).
     #[arg(long)]
     rate: Option<u32>,
+    /// Log request progress to stderr (can affect performance).
+    #[arg(short = 'v', long)]
+    verbose: bool,
+    /// Use a bounded histogram for approximate latency percentiles.
+    #[arg(long)]
+    bounded_latency: bool,
     /// Disable HTTP connection reuse.
     #[arg(long)]
     no_connection_reuse: bool,
@@ -115,12 +121,17 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
             .duration
             .map(|seconds| Duration::from_secs(seconds.get())),
         rate: args.rate,
+        verbose: args.verbose,
+        bounded_latency: args.bounded_latency,
         reuse_connections: !args.no_connection_reuse,
         follow_redirects: args.follow_redirects,
         max_redirects: args.max_redirects.map_or(10, NonZeroUsize::get),
     })
     .await?;
-    let stats = LatencyStats::from_samples(std::mem::take(&mut report.latencies));
+    let stats = match report.bounded_latencies.take() {
+        Some(histogram) => Some(LatencyStats::from_bounded(histogram)),
+        None => LatencyStats::from_samples(std::mem::take(&mut report.latencies)),
+    };
     let failure_rate =
         (report.completed > 0).then(|| report.failed as f64 * 100.0 / report.completed as f64);
     let p95_ms = stats
@@ -178,6 +189,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
             "requests_per_second": report.completed as f64 / report.elapsed.as_secs_f64(),
             "status_codes": report.status_codes,
             "latency_ms": percentiles,
+            "latency_method": if args.bounded_latency { "hdr_histogram_upper_bound_3_significant_digits" } else { "exact" },
             "thresholds": {
                 "failure_rate_percent": args.max_failure_rate.map(|limit| serde_json::json!({"limit": limit, "observed": failure_rate, "passed": failure_rate_passed})),
                 "p95_ms": args.max_p95_ms.map(|limit| serde_json::json!({"limit": limit, "observed": p95_ms, "passed": p95_passed})),
@@ -216,7 +228,11 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
             println!("  {code}: {count}");
         }
     }
-    println!("Ready for action: latency statistics");
+    if args.bounded_latency {
+        println!("Ready for action: latency statistics (HDR histogram, approximate upper bounds)");
+    } else {
+        println!("Ready for action: latency statistics (exact)");
+    }
     if let Some(stats) = &stats {
         for (label, value) in [
             ("Latency min:", stats.min().as_secs_f64() * 1000.0),

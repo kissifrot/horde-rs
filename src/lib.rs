@@ -1,6 +1,8 @@
 //! Local load generation and reporting, independent of the command-line interface.
+mod latency;
 use bytes::Bytes;
 use futures_util::StreamExt;
+pub use latency::BoundedLatency;
 use reqwest::{
     Client, Method, Url,
     header::{CONNECTION, HeaderMap, HeaderValue},
@@ -50,6 +52,10 @@ pub struct TestPlan {
     pub duration: Option<Duration>,
     /// Optional target rate for starting logical requests per second.
     pub rate: Option<u32>,
+    /// Log request progress to stderr; logging can affect benchmark results.
+    pub verbose: bool,
+    /// Use bounded-memory approximate latency percentiles.
+    pub bounded_latency: bool,
     /// Allow HTTP connections to be reused between requests.
     pub reuse_connections: bool,
     /// Whether to follow HTTP redirects.
@@ -79,6 +85,8 @@ pub struct Report {
     /// HTTP status counts for responses whose headers were received.
     pub status_codes: BTreeMap<u16, usize>,
     pub latencies: Vec<Duration>,
+    /// Present when bounded-memory latency collection was selected and recorded samples exist.
+    pub bounded_latencies: Option<BoundedLatency>,
 }
 
 #[derive(Default)]
@@ -93,29 +101,30 @@ struct WorkerReport {
     bytes: u64,
     status_codes: BTreeMap<u16, usize>,
     latencies: Vec<Duration>,
+    bounded_latencies: Option<BoundedLatency>,
+    latency_overflow: bool,
 }
 
 impl Report {
     /// Calculate latency statistics, sorting the samples once.
     pub fn latency_stats(&self) -> Option<LatencyStats> {
-        LatencyStats::from_samples(self.latencies.clone())
+        if let Some(histogram) = &self.bounded_latencies {
+            Some(LatencyStats::from_bounded(histogram.clone()))
+        } else {
+            LatencyStats::from_samples(self.latencies.clone())
+        }
     }
 
     /// Nearest-rank percentile, with ranks starting at one.
     pub fn percentile(&self, percentile: u32) -> Option<Duration> {
-        if self.latencies.is_empty() || !(1..=100).contains(&percentile) {
-            return None;
-        }
-        let mut sorted = self.latencies.clone();
-        sorted.sort_unstable();
-        let rank = (sorted.len() as u128 * u128::from(percentile)).div_ceil(100) as usize;
-        Some(sorted[rank - 1])
+        self.latency_stats()?.percentile(percentile)
     }
 }
 
 /// Summary of the complete request latencies, including failed requests.
 pub struct LatencyStats {
     sorted: Vec<Duration>,
+    bounded: Option<BoundedLatency>,
     /// Arithmetic mean in milliseconds.
     pub mean_ms: f64,
 }
@@ -129,17 +138,41 @@ impl LatencyStats {
         sorted.sort_unstable();
         let mean_ms =
             sorted.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>() / sorted.len() as f64;
-        Some(Self { sorted, mean_ms })
+        Some(Self {
+            sorted,
+            bounded: None,
+            mean_ms,
+        })
+    }
+
+    /// Use an owned bounded histogram without copying it.
+    pub fn from_bounded(bounded: BoundedLatency) -> Self {
+        let mean_ms = bounded.mean_ms();
+        Self {
+            sorted: Vec::new(),
+            bounded: Some(bounded),
+            mean_ms,
+        }
     }
 
     pub fn min(&self) -> Duration {
-        self.sorted[0]
+        self.bounded
+            .as_ref()
+            .map_or_else(|| self.sorted[0], BoundedLatency::min)
     }
     pub fn max(&self) -> Duration {
-        self.sorted[self.sorted.len() - 1]
+        self.bounded
+            .as_ref()
+            .map_or_else(|| self.sorted[self.sorted.len() - 1], BoundedLatency::max)
     }
     /// Median; for an even sample count, the midpoint of the two middle values.
     pub fn median(&self) -> Duration {
+        if let Some(histogram) = &self.bounded {
+            let count = histogram.len();
+            let lower = histogram.rank(count.div_ceil(2));
+            let upper = histogram.rank(count / 2 + 1);
+            return lower + (upper - lower) / 2;
+        }
         let middle = self.sorted.len() / 2;
         if self.sorted.len().is_multiple_of(2) {
             let lower = self.sorted[middle - 1];
@@ -152,6 +185,10 @@ impl LatencyStats {
     pub fn percentile(&self, percentile: u32) -> Option<Duration> {
         if !(1..=100).contains(&percentile) {
             return None;
+        }
+        if let Some(histogram) = &self.bounded {
+            let rank = (u128::from(histogram.len()) * u128::from(percentile)).div_ceil(100) as u64;
+            return Some(histogram.rank(rank));
         }
         let rank = (self.sorted.len() as u128 * u128::from(percentile)).div_ceil(100) as usize;
         Some(self.sorted[rank - 1])
@@ -219,7 +256,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
     let start = Instant::now();
     let next_start = Arc::new(Mutex::new(start));
     let mut workers = tokio::task::JoinSet::new();
-    for _ in 0..plan.concurrency.min(plan.requests) {
+    for worker_id in 1..=plan.concurrency.min(plan.requests) {
         let (client, plan, next, next_start) = (
             client.clone(),
             plan.clone(),
@@ -236,14 +273,14 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                     break;
                 }
                 // try_update prevents the counter from wrapping at usize::MAX.
-                if next
+                let request_id = match next
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         (n < plan.requests).then(|| n + 1)
                     })
-                    .is_err()
                 {
-                    break;
-                }
+                    Ok(index) => index + 1,
+                    Err(_) => break,
+                };
                 if let Some(rate) = plan.rate {
                     let scheduled = {
                         let mut next_time = next_start.lock().unwrap();
@@ -266,6 +303,10 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                     }
                 }
                 let started = Instant::now();
+                if plan.verbose {
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [worker {worker_id} request {request_id}] started", started.duration_since(start).as_secs_f64());
+                }
                 let mut bytes = 0u64;
                 let mut failed = false;
                 let mut status_code = None;
@@ -274,6 +315,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                 let mut connection_failure = false;
                 let mut body_failure = false;
                 let mut other_failure = false;
+                let mut redirect_limit_failure = false;
                 let mut request = client
                     .request(plan.method.clone(), plan.url.clone())
                     .headers(plan.headers.clone());
@@ -303,11 +345,29 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                         failed = true;
                         timeout_failure = error.is_timeout();
                         connection_failure = error.is_connect();
+                        redirect_limit_failure = (plan.verbose || (!timeout_failure && !connection_failure))
+                            && is_redirect_limit(&error);
                         other_failure =
-                            !timeout_failure && !connection_failure && !is_redirect_limit(&error);
+                            !timeout_failure && !connection_failure && !redirect_limit_failure;
                     }
                 }
                 let latency = started.elapsed();
+                if plan.verbose {
+                    use std::io::Write;
+                    let status = status_code.map_or_else(|| "none".to_owned(), |code| code.to_string());
+                    let errors = [(http_failure, "http"), (timeout_failure, "timeout"), (connection_failure, "connection"), (body_failure, "body"), (redirect_limit_failure, "redirect_limit"), (other_failure, "other")];
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = write!(stderr, "[+{:.3}s] [worker {worker_id} request {request_id}] completed status={status} bytes={bytes} latency_ms={:.2}", started.duration_since(start).as_secs_f64() + latency.as_secs_f64(), latency.as_secs_f64() * 1000.0);
+                    if failed {
+                        let _ = write!(stderr, " errors=");
+                        let mut separator = "";
+                        for (_, name) in errors.into_iter().filter(|(active, _)| *active) {
+                            let _ = write!(stderr, "{separator}{name}");
+                            separator = ",";
+                        }
+                    }
+                    let _ = writeln!(stderr);
+                }
                 results.completed += 1;
                 results.failed += usize::from(failed);
                 results.http_failures += usize::from(http_failure);
@@ -319,7 +379,14 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                 if let Some(code) = status_code {
                     *results.status_codes.entry(code).or_default() += 1;
                 }
-                results.latencies.push(latency);
+                if plan.bounded_latency {
+                    let histogram = results.bounded_latencies.get_or_insert_with(BoundedLatency::new);
+                    if histogram.record(latency).is_err() {
+                        results.latency_overflow = true;
+                    }
+                } else {
+                    results.latencies.push(latency);
+                }
             }
             results
         });
@@ -339,9 +406,13 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
         bytes: 0,
         status_codes: BTreeMap::new(),
         latencies: Vec::new(),
+        bounded_latencies: None,
     };
     while let Some(worker) = workers.join_next().await {
         let worker = worker?;
+        if worker.latency_overflow {
+            return Err("latency exceeds bounded histogram range or capacity".into());
+        }
         report.completed += worker.completed;
         report.failed += worker.failed;
         report.http_failures += worker.http_failures;
@@ -357,6 +428,13 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
             report.latencies = worker.latencies;
         } else {
             report.latencies.extend(worker.latencies);
+        }
+        if let Some(histogram) = worker.bounded_latencies {
+            if let Some(current) = &mut report.bounded_latencies {
+                current.merge(&histogram)?;
+            } else {
+                report.bounded_latencies = Some(histogram);
+            }
         }
     }
     report.elapsed = start.elapsed();
@@ -385,6 +463,7 @@ mod tests {
             redirect_limit_failures: 0,
             bytes: 0,
             status_codes: BTreeMap::new(),
+            bounded_latencies: None,
             latencies: vec![
                 Duration::from_millis(30),
                 Duration::from_millis(10),
@@ -412,6 +491,49 @@ mod tests {
         assert!(report.latency_stats().is_none());
         assert!(LatencyStats::from_samples(Vec::new()).is_none());
     }
+
+    #[test]
+    fn bounded_percentiles_are_upper_bounds_and_merge_correctly() {
+        let values: Vec<_> = (0..10_000u64)
+            .map(|n| Duration::from_nanos(n * n * 1_234 + 1))
+            .collect();
+        let exact = LatencyStats::from_samples(values.clone()).unwrap();
+        let mut left = BoundedLatency::new();
+        let mut right = BoundedLatency::new();
+        for (index, value) in values.into_iter().enumerate() {
+            if index % 2 == 0 {
+                left.record(value).unwrap();
+            } else {
+                right.record(value).unwrap();
+            }
+        }
+        left.merge(&right).unwrap();
+        let bounded = LatencyStats::from_bounded(left);
+        assert_eq!(bounded.min(), exact.min());
+        assert_eq!(bounded.max(), exact.max());
+        for p in [1, 50, 90, 95, 99, 100] {
+            let actual = exact.percentile(p).unwrap().as_nanos();
+            let estimate = bounded.percentile(p).unwrap().as_nanos();
+            assert!(estimate >= actual);
+            assert!(
+                estimate - actual <= actual / 1000 + 1,
+                "p{p}: {actual} vs {estimate}"
+            );
+        }
+        assert!(bounded.median() >= exact.median());
+        assert!(bounded.percentile(0).is_none());
+    }
+
+    #[test]
+    fn bounded_histogram_handles_extremes_and_rejects_overflow() {
+        let mut histogram = BoundedLatency::new();
+        histogram.record(Duration::ZERO).unwrap();
+        histogram.record(Duration::from_nanos(u64::MAX)).unwrap();
+        assert!(histogram.record(Duration::from_secs(u64::MAX)).is_err());
+        let stats = LatencyStats::from_bounded(histogram);
+        assert_eq!(stats.percentile(50), Some(Duration::ZERO));
+        assert_eq!(stats.percentile(100), Some(Duration::from_nanos(u64::MAX)));
+    }
     #[tokio::test]
     async fn rejects_zero_requests() {
         let plan = TestPlan {
@@ -424,6 +546,8 @@ mod tests {
             body: None,
             duration: None,
             rate: None,
+            verbose: false,
+            bounded_latency: false,
             reuse_connections: true,
             follow_redirects: false,
             max_redirects: 10,
