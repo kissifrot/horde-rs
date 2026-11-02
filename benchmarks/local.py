@@ -84,24 +84,26 @@ def run_cases(args, binary, server, server_binary, target, directory):
                    {"name": "next", "url": "{{base}}/", "headers": {"X-Length": "{{length}}"}},
                    {"name": "finish", "url": "{{base}}/", "expect": {"status": [200]}}
                ]}
-    cases = [("serial", 1, [], None), ("concurrent", 16, [], None),
-             ("high_concurrency", 64, [], None), ("no_reuse", 16, ["--no-connection-reuse"], None),
-             ("rate_limited", 16, ["--rate", "1000"], None),
-             ("scenario_single", 16, [], one_step), ("scenario_journey", 16, [], journey),
-             ("scenario_journey_bounded", 16, ["--bounded-latency"], journey)]
+    cases = [("serial", 1, [], None, "/", 0), ("concurrent", 16, [], None, "/", 0),
+             ("high_concurrency", 64, [], None, "/", 0), ("no_reuse", 16, ["--no-connection-reuse"], None, "/", 0),
+             ("rate_limited", 16, ["--rate", "1000"], None, "/", 0),
+             ("redirect_one", 16, ["-L"], None, "/redirect/1", 1),
+             ("redirect_three", 16, ["-L"], None, "/redirect/3", 3),
+             ("scenario_single", 16, [], one_step, "/", 0), ("scenario_journey", 16, [], journey, "/", 0),
+             ("scenario_journey_bounded", 16, ["--bounded-latency"], journey, "/", 0)]
     results = []
     skipped = []
-    for name, concurrency, options, scenario in cases:
+    for name, concurrency, options, scenario, path, redirects in cases:
         scenario_hash = None
         if scenario is None:
-            destination = [target]
+            destination = [target.rstrip("/") + path]
         else:
             scenario_hash = hashlib.sha256(json.dumps(scenario, sort_keys=True).encode()).hexdigest()
             scenario = json.loads(json.dumps(scenario))
             scenario["variables"]["base"] = target.rstrip("/")
-            path = directory / f"{name}.json"
-            path.write_text(json.dumps(scenario), encoding="utf-8")
-            destination = ["--scenario", str(path)]
+            scenario_path = directory / f"{name}.json"
+            scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+            destination = ["--scenario", str(scenario_path)]
         command = [str(binary), "--json", "-n", str(args.requests), "-c", str(concurrency), *options, *destination]
         # Warm up connections, caches and executable pages; do not record the run.
         warmup_count = min(args.requests, 200)
@@ -114,7 +116,7 @@ def run_cases(args, binary, server, server_binary, target, directory):
                 continue
             raise RuntimeError(f"{name}: warm-up failed: {warmup_result.stderr}")
         warmup_report = json.loads(warmup_result.stdout)
-        if not valid_report(warmup_report, scenario, warmup_count):
+        if not valid_report(warmup_report, scenario, warmup_count, redirects):
             if scenario is not None and args.allow_unsupported_scenarios:
                 skipped.append({"name": name, "reason": "base binary did not complete scenario warm-up"})
                 print(f"Skipping {name}: base binary did not complete scenario warm-up", file=sys.stderr)
@@ -138,11 +140,11 @@ def run_cases(args, binary, server, server_binary, target, directory):
             wall = time.monotonic() - started
             after = cpu_seconds(server.pid)
             report = json.loads(completed.stdout)
-            if not valid_report(report, scenario, args.requests):
+            if not valid_report(report, scenario, args.requests, redirects):
                 raise RuntimeError(f"{name}: incomplete or failed benchmark run")
             rate = report["requests_per_second"] if scenario is None else args.requests / report["elapsed_seconds"]
             samples.append({"wall_seconds": wall, "rate_per_second": rate, "server_cpu_seconds": None if before is None or after is None else after - before, "client_resources": client, "report": report})
-        results.append({"name": name, "concurrency": concurrency, "options": options,
+        results.append({"name": name, "concurrency": concurrency, "options": options, "path": path,
                         "unit": "requests/s" if scenario is None else "iterations/s", "scenario_sha256": scenario_hash,
                         "median_rate_per_second": statistics.median(s["rate_per_second"] for s in samples),
                         "samples": samples})
@@ -152,7 +154,7 @@ def run_cases(args, binary, server, server_binary, target, directory):
               "git_commit": command_output("git", "rev-parse", "HEAD"), "git_dirty": None if dirty is None else bool(dirty),
               "binary": str(binary), "binary_revision": args.binary_revision,
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-              "server_implementation": "custom" if args.server_binary else "rust-thread-pool-v1", "server_sha256": hashlib.sha256(server_binary.read_bytes()).hexdigest(),
+              "server_implementation": "custom" if args.server_binary else "rust-thread-pool-v2", "server_sha256": hashlib.sha256(server_binary.read_bytes()).hexdigest(),
               "requests": args.requests, "repeats": args.repeats}, "cases": results, "skipped_cases": skipped}
     output = json.dumps(result, indent=2) + "\n"
     if args.output:
@@ -161,9 +163,11 @@ def run_cases(args, binary, server, server_binary, target, directory):
         print(output, end="")
 
 
-def valid_report(report, scenario, count):
+def valid_report(report, scenario, count, redirects=0):
     if scenario is None:
-        return report.get("completed") == count and report.get("failed") == 0
+        return (report.get("completed") == count and report.get("failed") == 0
+                and report.get("status_codes", {}).get("200") == count
+                and report.get("redirects_followed") == count * redirects)
     totals = report.get("scenarios", {})
     steps = report.get("steps", [])
     return (totals.get("completed") == count and totals.get("failed") == 0

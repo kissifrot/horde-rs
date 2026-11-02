@@ -25,15 +25,15 @@ struct Args {
     #[arg(required_unless_present = "scenario", conflicts_with = "scenario")]
     url: Option<Url>,
     /// Run a JSON scenario instead of testing a single URL.
-    #[arg(long, conflicts_with_all = ["method", "headers", "body_file", "duration", "rate", "no_connection_reuse", "max_p95_ms"])]
+    #[arg(long, conflicts_with_all = ["method", "headers", "body_file", "rate", "no_connection_reuse", "max_p95_ms"])]
     scenario: Option<PathBuf>,
     /// Derive Referer between scenario steps (requires --scenario).
     #[arg(long, requires = "scenario")]
     auto_referer: bool,
-    /// Total number of requests.
+    /// Total number of requests or scenario iterations.
     #[arg(short = 'n', long)]
     requests: Option<usize>,
-    /// Maximum number of concurrent requests.
+    /// Maximum concurrent requests or scenario users.
     #[arg(short = 'c', long, default_value_t = 1)]
     concurrency: usize,
     /// Per-request timeout in seconds, including the response body.
@@ -51,7 +51,7 @@ struct Args {
     /// Read the request body from a file and reuse it for each request.
     #[arg(long)]
     body_file: Option<PathBuf>,
-    /// Stop starting requests after this many seconds.
+    /// Stop starting requests or scenario iterations after this many seconds.
     #[arg(long)]
     duration: Option<NonZeroU64>,
     /// Target rate in logical requests per second (1 to 1000000000).
@@ -108,7 +108,11 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         let scenario = Scenario::from_json(&std::fs::read(path)?)?;
         let mut report = run_scenario_config(
             scenario,
-            args.requests.unwrap_or(1),
+            args.requests.unwrap_or(if args.duration.is_some() {
+                usize::MAX
+            } else {
+                1
+            }),
             args.concurrency,
             Duration::from_secs(args.timeout),
             ScenarioOptions {
@@ -119,6 +123,9 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
                 auto_referer: args.auto_referer,
                 bounded_latency: args.bounded_latency,
                 user_agent: args.user_agent.clone(),
+                duration: args
+                    .duration
+                    .map(|seconds| Duration::from_secs(seconds.get())),
             },
         )
         .await?;

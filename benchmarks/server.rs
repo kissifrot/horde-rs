@@ -7,12 +7,31 @@ use std::{
 
 const WORKERS: usize = 128;
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+const REDIRECT_ONE: &[u8] = b"HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\n\r\n";
+const REDIRECT_TWO: &[u8] =
+    b"HTTP/1.1 302 Found\r\nLocation: /redirect/1\r\nContent-Length: 0\r\n\r\n";
+const REDIRECT_THREE: &[u8] =
+    b"HTTP/1.1 302 Found\r\nLocation: /redirect/2\r\nContent-Length: 0\r\n\r\n";
 
 fn serve(stream: TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let mut stream = BufReader::new(stream);
     let mut line = Vec::with_capacity(1024);
     loop {
+        line.clear();
+        if stream.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        let path = line
+            .split(u8::is_ascii_whitespace)
+            .nth(1)
+            .unwrap_or_default();
+        let response = match path {
+            b"/redirect/1" => REDIRECT_ONE,
+            b"/redirect/2" => REDIRECT_TWO,
+            b"/redirect/3" => REDIRECT_THREE,
+            _ => RESPONSE,
+        };
         let mut close = false;
         loop {
             line.clear();
@@ -31,7 +50,7 @@ fn serve(stream: TcpStream) -> io::Result<()> {
                 }
             }
         }
-        stream.get_mut().write_all(RESPONSE)?;
+        stream.get_mut().write_all(response)?;
         if close {
             return Ok(());
         }

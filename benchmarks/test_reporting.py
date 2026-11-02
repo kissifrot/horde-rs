@@ -13,6 +13,13 @@ DIRECTORY = Path(__file__).resolve().parent
 
 
 class BenchmarkReportingTests(unittest.TestCase):
+    def test_single_url_requires_expected_status_and_redirect_count(self):
+        report = {"completed": 3, "failed": 0, "status_codes": {"200": 3}, "redirects_followed": 9}
+        self.assertTrue(valid_report(report, None, 3, 3))
+        self.assertFalse(valid_report(report, None, 3, 1))
+        report["status_codes"] = {"302": 3}
+        self.assertFalse(valid_report(report, None, 3, 3))
+
     def test_scenario_requires_all_steps_to_succeed(self):
         scenario = {"steps": [{}, {}]}
         report = {"elapsed_seconds": 1, "scenarios": {"completed": 3, "failed": 0},
@@ -41,6 +48,10 @@ class BenchmarkReportingTests(unittest.TestCase):
             comparison = subprocess.check_output([sys.executable, str(DIRECTORY / "compare.py"), str(base), str(candidate)], text=True)
             self.assertIn("| serial | 100 | 110 | requests/s | +10.0% |", comparison)
             self.assertIn("| journey | — | — | iterations/s | Not comparable |", comparison)
+            old["cases"][0]["path"] = "/old"
+            base.write_text(json.dumps(old))
+            comparison = subprocess.check_output([sys.executable, str(DIRECTORY / "compare.py"), str(base), str(candidate)], text=True)
+            self.assertIn("| serial | — | — | requests/s | Not comparable |", comparison)
             self.assertIn("| journey | 16 | 20 | 20–20 | iterations/s |", summary)
             old["cases"].append(copy.deepcopy(new["cases"][1]))
             old["cases"][1]["scenario_sha256"] = "different"

@@ -19,6 +19,7 @@ for case in candidate["cases"]:
     previous = base_cases.get(case["name"])
     if (previous is None or previous["concurrency"] != case["concurrency"]
             or previous["options"] != case["options"]
+            or previous.get("path", "/") != case.get("path", "/")
             or previous.get("unit", "requests/s") != case.get("unit", "requests/s")
             or previous.get("scenario_sha256") != case.get("scenario_sha256")
             or base["metadata"]["requests"] != candidate["metadata"]["requests"]

@@ -93,6 +93,59 @@ fn redirect_chain_uses_one_timeout_including_final_body() {
 }
 
 #[test]
+fn post_redirects_switch_to_get_and_remove_body_headers() {
+    for status in [301, 302, 303] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            let (mut first, _) = listener.accept().unwrap();
+            let n = first.read(&mut buffer).unwrap();
+            assert!(String::from_utf8_lossy(&buffer[..n]).starts_with("POST "));
+            write!(first, "HTTP/1.1 {status} Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            let (mut second, _) = listener.accept().unwrap();
+            let n = second.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
+            assert!(request.starts_with("get /next "), "{request}");
+            assert!(
+                !request.contains("content-type:") && !request.contains("content-length:"),
+                "{request}"
+            );
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let body = std::env::temp_dir().join(format!(
+            "horde-redirect-body-{status}-{}",
+            std::process::id()
+        ));
+        std::fs::write(&body, "payload").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+            .args([
+                "-L",
+                "--json",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: text/plain",
+                "--body-file",
+            ])
+            .arg(&body)
+            .arg(format!("http://{addr}/"))
+            .output()
+            .unwrap();
+        std::fs::remove_file(body).unwrap();
+        server.join().unwrap();
+        assert!(output.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["failed"], 0);
+        assert_eq!(report["redirects_followed"], 1);
+    }
+}
+
+#[test]
 fn auto_referer_uses_final_redirect_url_and_respects_explicit_header() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

@@ -47,6 +47,21 @@ class ServerTest(unittest.TestCase):
             for conn in sockets:
                 conn.close()
 
+    def test_redirect_chains_reuse_connection(self):
+        response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as conn:
+            conn.settimeout(5)
+            with conn.makefile("rb") as reader:
+                for path, location in [("/redirect/3", "/redirect/2"),
+                                       ("/redirect/2", "/redirect/1"),
+                                       ("/redirect/1", "/")]:
+                    conn.sendall(f"GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+                    expected = f"HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n".encode()
+                    self.assertEqual(reader.read(len(expected)), expected)
+                conn.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                self.assertEqual(reader.read(len(response)), response)
+                self.assertEqual(reader.read(1), b"")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -242,6 +242,23 @@ use crate::redirect::referer as step_referer;
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn scenario_rejects_zero_duration_in_library_options() {
+        let scenario = Scenario::from_json(br#"{"version":1,"name":"duration","steps":[{"name":"one","url":"http://127.0.0.1/"}]}"#).unwrap();
+        let result = run_scenario_config(
+            scenario,
+            1,
+            1,
+            Duration::from_secs(1),
+            ScenarioOptions {
+                duration: Some(Duration::ZERO),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
     #[test]
     fn referer_policy_removes_credentials_fragments_and_cross_origin_paths() {
         let previous =
@@ -732,6 +749,8 @@ pub struct ScenarioOptions {
     pub bounded_latency: bool,
     /// Default User-Agent, overridden by an explicit step header.
     pub user_agent: Option<String>,
+    /// Stop starting new iterations after this duration; active iterations finish.
+    pub duration: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -805,6 +824,7 @@ pub async fn run_scenario_with_referer(
             auto_referer,
             bounded_latency: false,
             user_agent: None,
+            duration: None,
         },
     )
     .await
@@ -824,12 +844,16 @@ pub async fn run_scenario_config(
         auto_referer,
         bounded_latency,
         user_agent,
+        duration,
     } = options;
     if iterations == 0 || users == 0 || timeout.is_zero() {
         return Err("iterations, users and timeout must be greater than zero".into());
     }
     if max_redirects == Some(0) {
         return Err("max redirects must be greater than zero".into());
+    }
+    if duration.is_some_and(|duration| duration.is_zero()) {
+        return Err("duration must be greater than zero".into());
     }
     let user_agent = reqwest::header::HeaderValue::from_str(
         user_agent
@@ -858,6 +882,9 @@ pub async fn run_scenario_config(
                 }) {
                 let iteration = index + 1;
                 let run_started = Instant::now();
+                if duration.is_some_and(|duration| run_started.duration_since(started) >= duration) {
+                    break;
+                }
                 if verbose {
                     use std::io::Write;
                     let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] started", started.elapsed().as_secs_f64());
