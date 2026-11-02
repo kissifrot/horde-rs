@@ -81,6 +81,20 @@ pub struct Report {
     pub latencies: Vec<Duration>,
 }
 
+#[derive(Default)]
+struct WorkerReport {
+    completed: usize,
+    failed: usize,
+    http_failures: usize,
+    timeout_failures: usize,
+    connection_failures: usize,
+    body_failures: usize,
+    other_failures: usize,
+    bytes: u64,
+    status_codes: BTreeMap<u16, usize>,
+    latencies: Vec<Duration>,
+}
+
 impl Report {
     /// Calculate latency statistics, sorting the samples once.
     pub fn latency_stats(&self) -> Option<LatencyStats> {
@@ -209,7 +223,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
             Arc::clone(&next_start),
         );
         workers.spawn(async move {
-            let mut results = Vec::new();
+            let mut results = WorkerReport::default();
             loop {
                 if plan
                     .duration
@@ -289,17 +303,19 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                             !timeout_failure && !connection_failure && !is_redirect_limit(&error);
                     }
                 }
-                results.push((
-                    started.elapsed(),
-                    failed,
-                    bytes,
-                    status_code,
-                    http_failure,
-                    timeout_failure,
-                    connection_failure,
-                    body_failure,
-                    other_failure,
-                ));
+                let latency = started.elapsed();
+                results.completed += 1;
+                results.failed += usize::from(failed);
+                results.http_failures += usize::from(http_failure);
+                results.timeout_failures += usize::from(timeout_failure);
+                results.connection_failures += usize::from(connection_failure);
+                results.body_failures += usize::from(body_failure);
+                results.other_failures += usize::from(other_failure);
+                results.bytes = results.bytes.saturating_add(bytes);
+                if let Some(code) = status_code {
+                    *results.status_codes.entry(code).or_default() += 1;
+                }
+                results.latencies.push(latency);
             }
             results
         });
@@ -321,21 +337,19 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
         latencies: Vec::new(),
     };
     while let Some(worker) = workers.join_next().await {
-        for (latency, failed, bytes, status_code, http, timeout, connection, body, other) in worker?
-        {
-            report.completed += 1;
-            report.failed += usize::from(failed);
-            report.http_failures += usize::from(http);
-            report.timeout_failures += usize::from(timeout);
-            report.connection_failures += usize::from(connection);
-            report.body_failures += usize::from(body);
-            report.other_failures += usize::from(other);
-            report.bytes = report.bytes.saturating_add(bytes);
-            if let Some(code) = status_code {
-                *report.status_codes.entry(code).or_default() += 1;
-            }
-            report.latencies.push(latency);
+        let worker = worker?;
+        report.completed += worker.completed;
+        report.failed += worker.failed;
+        report.http_failures += worker.http_failures;
+        report.timeout_failures += worker.timeout_failures;
+        report.connection_failures += worker.connection_failures;
+        report.body_failures += worker.body_failures;
+        report.other_failures += worker.other_failures;
+        report.bytes = report.bytes.saturating_add(worker.bytes);
+        for (code, count) in worker.status_codes {
+            *report.status_codes.entry(code).or_default() += count;
         }
+        report.latencies.extend(worker.latencies);
     }
     report.elapsed = start.elapsed();
     report.redirects_followed = redirects_followed.load(Ordering::Relaxed);

@@ -307,6 +307,53 @@ fn user_agent_can_be_set_and_overrides_header_option() {
 }
 
 #[test]
+fn requests_preserve_credentials_and_repeated_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let n = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+            assert!(
+                request.contains(
+                    "authorization: basic dXNlcjpwYXNz"
+                        .to_ascii_lowercase()
+                        .as_str()
+                )
+            );
+            assert!(request.contains("x-test: one"));
+            assert!(request.contains("x-test: two"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .args([
+            "-n",
+            "2",
+            "-H",
+            "X-Test: one",
+            "-H",
+            "X-Test: two",
+            &format!("http://user:pass@{address}/"),
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Failed requests:         0")
+    );
+}
+
+#[test]
 fn redirects_are_opt_in_and_bounded() {
     for (follow, limit, redirects, expected_status, expected_failed) in [
         (false, None, 1, "  302: 1", "Failed requests:         0"),

@@ -19,7 +19,9 @@ for case in candidate["cases"]:
     previous = base_cases.get(case["name"])
     if (previous is None or previous["concurrency"] != case["concurrency"]
             or previous["options"] != case["options"]
-            or base["metadata"]["requests"] != candidate["metadata"]["requests"]):
+            or base["metadata"]["requests"] != candidate["metadata"]["requests"]
+            or not base["metadata"].get("server_sha256")
+            or base["metadata"].get("server_sha256") != candidate["metadata"].get("server_sha256")):
         print(f"| {case['name']} | — | — | Not comparable |")
         continue
     old = previous["median_requests_per_second"]
