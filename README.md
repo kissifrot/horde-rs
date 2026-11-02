@@ -28,7 +28,7 @@ Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 | `-t, --timeout <TIMEOUT>` | Timeout per request, in seconds; must be positive. | `30` |
 | `-X, --method <METHOD>` | HTTP method. | `GET` |
 | `-H, --header <HEADERS>` | HTTP header as `Name: value`; may be repeated. | None |
-| `-A, --user-agent <USER_AGENT>` | Set the `User-Agent` header; overrides a `User-Agent` set with `-H`. | `Horde/<version>` (e.g. `Horde/0.1.0`) |
+| `-A, --user-agent <USER_AGENT>` | Set `User-Agent`; overrides `-H` for single-URL tests. Scenario step headers take precedence. | `Horde/<version>` (e.g. `Horde/0.1.0`) |
 | `--body-file <BODY_FILE>` | Read a request body from a file and reuse it for every request. | No body |
 | `--duration <DURATION>` | Stop starting new requests after this many seconds; must be positive. | No duration limit |
 | `--rate <RATE>` | Target rate of logical requests per second, from 1 to 1,000,000,000. | Unlimited |
@@ -108,9 +108,9 @@ Connections may be reused by default. `--no-connection-reuse` disables the idle 
 
 Redirects are not followed by default. Use `-L` to follow up to 10 per request, or `-L --max-redirects 5` to set another limit. Exceeding it counts as a failure.
 
-When following a redirect, Horde's HTTP client automatically sets `Referer` to the previous URL, without credentials or fragment; it does not generate one for an HTTPS-to-HTTP redirect. Redirect referers may include URL query parameters, including across origins, and do not necessarily match browser referrer policies.
+When following a redirect, Horde sets `Referer` from the previous URL: the full URL without credentials or fragment on the same origin, only the origin across origins, and nothing on HTTPS-to-HTTP transitions. This applies to each redirect in both modes, replacing any explicit `Referer` from the previous request. Cross-origin redirects also remove sensitive request headers such as `Authorization` and explicit cookies. The timeout applies to the complete chain and final response body.
 
-For separate scenario steps, `--auto-referer` derives the header from the previous final response URL for each virtual user, including across iterations. It sends the full URL without credentials or fragment for the same origin, only the origin across origins, and nothing on HTTPS-to-HTTP transitions. An explicit step `Referer` takes precedence. This option controls step-to-step headers; redirects retain the behavior described above.
+For separate scenario steps, `--auto-referer` derives the header from the previous final response URL for each virtual user, including across iterations, using the same policy. An explicit step `Referer` takes precedence for that step's initial request. Horde does not interpret `Referrer-Policy` response headers or HTML attributes, so it does not fully emulate browser behavior.
 
 ## Work complete: the report
 
@@ -157,11 +157,11 @@ cargo build --release --locked
 python3 benchmarks/local.py --requests 10000 --repeats 5 --output /tmp/horde-benchmark.json
 ```
 
-The Python harness compiles a Rust HTTP/1.1 loopback server, warms up, then measures serial, concurrent, no-reuse and rate-limited workloads. It records each run, median throughput, binary hashes and environment metadata; on Linux, it also records server CPU and, when GNU `time` is available, client CPU and peak RSS. Use `--binary` or `--server-binary` to select prebuilt binaries, or `python3 benchmarks/local.py --server` to run the server separately.
+The Python harness compiles a Rust HTTP/1.1 loopback server, warms up, then measures serial, concurrent, no-reuse and rate-limited workloads. It also measures one-step and three-step scenarios, including assertions and header extraction, with exact and bounded latency statistics. Single-URL throughput is in requests/s; scenario throughput is in iterations/s. Each run, median throughput, binary hashes and environment metadata are recorded; on Linux, the harness also records server CPU and, when GNU `time` is available, client CPU and peak RSS. Use `--binary` or `--server-binary` to select prebuilt binaries, or `python3 benchmarks/local.py --server` to run the server separately.
 
 The server handles up to 128 connections and shares resources with Horde. Either can become a bottleneck; CPU frequency, scheduling and background activity also affect results. Compare repeated runs on the same machine with the same binaries and settings, then profile suspected bottlenecks separately. Results from the former Python server are not directly comparable.
 
-GitHub Actions runs five repetitions per scenario on pushes and pull requests. The job summary shows medians and ranges; detailed JSON is retained for 90 days as `horde-benchmark-results`. For pull requests, the exact base commit is measured sequentially on the same runner with the pull request's harness. The summary compares medians; a positive percentage means higher throughput in the pull request. `binary_revision` identifies each binary and `git_commit` identifies the harness checkout. If the base cannot be measured, the comparison is marked unavailable; the pull request benchmark must still succeed.
+GitHub Actions runs five repetitions per workload on pushes and pull requests. The job summary shows medians and ranges; detailed JSON is retained for 90 days as `horde-benchmark-results`. For pull requests, the exact base commit is measured sequentially on the same runner with the pull request's harness. The summary compares compatible workloads; a positive percentage means higher throughput in the pull request. Scenario definitions are hashed to avoid comparing different workloads. `binary_revision` identifies each binary and `git_commit` identifies the harness checkout. If the base cannot run a scenario workload, that workload is marked not comparable; the pull request benchmark must still succeed.
 
 CI comparisons are informational and have no regression threshold. Shared runner variability and run order can affect results; confirm suspected regressions on controlled hardware. Do not use this workflow with privileged pull request events or secrets: it runs pull request code.
 

@@ -236,21 +236,7 @@ impl Template {
     }
 }
 
-// Match strict-origin-when-cross-origin for independent scenario steps.
-fn step_referer(previous: &Url, next: &Url) -> Option<HeaderValue> {
-    if previous.scheme() == "https" && next.scheme() == "http" {
-        return None;
-    }
-    let mut referer = previous.clone();
-    let _ = referer.set_username("");
-    let _ = referer.set_password(None);
-    referer.set_fragment(None);
-    if previous.origin() != next.origin() {
-        referer.set_path("/");
-        referer.set_query(None);
-    }
-    HeaderValue::from_str(referer.as_str()).ok()
-}
+use crate::redirect::referer as step_referer;
 
 #[cfg(test)]
 mod tests {
@@ -738,12 +724,14 @@ impl Counts {
 }
 
 /// Scenario execution options.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ScenarioOptions {
     pub verbose: bool,
     pub max_redirects: Option<usize>,
     pub auto_referer: bool,
     pub bounded_latency: bool,
+    /// Default User-Agent, overridden by an explicit step header.
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug)]
@@ -816,6 +804,7 @@ pub async fn run_scenario_with_referer(
             max_redirects,
             auto_referer,
             bounded_latency: false,
+            user_agent: None,
         },
     )
     .await
@@ -834,6 +823,7 @@ pub async fn run_scenario_config(
         max_redirects,
         auto_referer,
         bounded_latency,
+        user_agent,
     } = options;
     if iterations == 0 || users == 0 || timeout.is_zero() {
         return Err("iterations, users and timeout must be greater than zero".into());
@@ -841,6 +831,11 @@ pub async fn run_scenario_config(
     if max_redirects == Some(0) {
         return Err("max redirects must be greater than zero".into());
     }
+    let user_agent = reqwest::header::HeaderValue::from_str(
+        user_agent
+            .as_deref()
+            .unwrap_or(concat!("Horde/", env!("CARGO_PKG_VERSION"))),
+    )?;
     let scenario = Arc::new(scenario);
     let next = Arc::new(AtomicUsize::new(0));
     let mut tasks = tokio::task::JoinSet::new();
@@ -851,11 +846,8 @@ pub async fn run_scenario_config(
         let client = Client::builder()
             .cookie_store(true)
             .timeout(timeout)
-            .user_agent(concat!("Horde/", env!("CARGO_PKG_VERSION")))
-            .redirect(match max_redirects {
-                Some(limit) => reqwest::redirect::Policy::limited(limit),
-                None => reqwest::redirect::Policy::none(),
-            })
+            .user_agent(user_agent.clone())
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         tasks.spawn(async move {
             let mut totals = Counts::default();
@@ -920,7 +912,15 @@ pub async fn run_scenario_config(
                     let mut body_assertion_error = false;
                     let mut extraction_error = false;
                     let mut other_error = false;
-                    let failed = match request.send().await {
+                    let result = if let Some(limit) = max_redirects {
+                        match request.build() {
+                            Ok(request) => crate::redirect::send(&client, request, limit, timeout, None).await,
+                            Err(error) => Err(crate::redirect::RedirectError::Request(error)),
+                        }
+                    } else {
+                        request.send().await.map_err(crate::redirect::RedirectError::Request)
+                    };
+                    let failed = match result {
                         Ok(response) => {
                             if auto_referer {
                                 previous_url = Some(response.url().clone());
@@ -978,7 +978,7 @@ pub async fn run_scenario_config(
                         Err(error) => {
                             timeout_error = error.is_timeout();
                             connection_error = error.is_connect();
-                            redirect_error = error.is_redirect();
+                            redirect_error = matches!(error, crate::redirect::RedirectError::Limit | crate::redirect::RedirectError::InvalidScheme);
                             other_error = !timeout_error && !connection_error && !redirect_error;
                             true
                         },

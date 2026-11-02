@@ -25,7 +25,7 @@ struct Args {
     #[arg(required_unless_present = "scenario", conflicts_with = "scenario")]
     url: Option<Url>,
     /// Run a JSON scenario instead of testing a single URL.
-    #[arg(long, conflicts_with_all = ["method", "headers", "user_agent", "body_file", "duration", "rate", "no_connection_reuse", "max_p95_ms"])]
+    #[arg(long, conflicts_with_all = ["method", "headers", "body_file", "duration", "rate", "no_connection_reuse", "max_p95_ms"])]
     scenario: Option<PathBuf>,
     /// Derive Referer between scenario steps (requires --scenario).
     #[arg(long, requires = "scenario")]
@@ -118,6 +118,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
                     .then(|| args.max_redirects.map_or(10, NonZeroUsize::get)),
                 auto_referer: args.auto_referer,
                 bounded_latency: args.bounded_latency,
+                user_agent: args.user_agent.clone(),
             },
         )
         .await?;

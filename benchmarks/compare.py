@@ -13,18 +13,20 @@ print("Informational only. Both binaries ran sequentially on the same shared run
       "noise, run order and the local server can affect the result. "
       "A positive change means higher throughput.\n")
 base_cases = {case["name"]: case for case in base["cases"]}
-print("| Scenario | Base median req/s | PR median req/s | Change |")
-print("| --- | ---: | ---: | ---: |")
+print("| Workload | Base median | PR median | Unit | Change |")
+print("| --- | ---: | ---: | --- | ---: |")
 for case in candidate["cases"]:
     previous = base_cases.get(case["name"])
     if (previous is None or previous["concurrency"] != case["concurrency"]
             or previous["options"] != case["options"]
+            or previous.get("unit", "requests/s") != case.get("unit", "requests/s")
+            or previous.get("scenario_sha256") != case.get("scenario_sha256")
             or base["metadata"]["requests"] != candidate["metadata"]["requests"]
             or not base["metadata"].get("server_sha256")
             or base["metadata"].get("server_sha256") != candidate["metadata"].get("server_sha256")):
-        print(f"| {case['name']} | — | — | Not comparable |")
+        print(f"| {case['name']} | — | — | {case.get('unit', 'requests/s')} | Not comparable |")
         continue
-    old = previous["median_requests_per_second"]
-    new = case["median_requests_per_second"]
+    old = previous.get("median_rate_per_second", previous.get("median_requests_per_second"))
+    new = case.get("median_rate_per_second", case.get("median_requests_per_second"))
     change = f"{(new / old - 1) * 100:+.1f}%" if old > 0 else "N/A"
-    print(f"| {case['name']} | {old:.0f} | {new:.0f} | {change} |")
+    print(f"| {case['name']} | {old:.0f} | {new:.0f} | {case.get('unit', 'requests/s')} | {change} |")

@@ -1,5 +1,6 @@
 //! Local load generation and reporting, independent of the command-line interface.
 mod latency;
+mod redirect;
 pub mod scenario;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -16,27 +17,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-#[derive(Debug)]
-struct RedirectLimit;
-
-impl std::fmt::Display for RedirectLimit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("redirect limit exceeded")
-    }
-}
-impl std::error::Error for RedirectLimit {}
-
-fn is_redirect_limit(error: &reqwest::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(current) = source {
-        if current.is::<RedirectLimit>() {
-            return true;
-        }
-        source = current.source();
-    }
-    false
-}
 
 /// A self-contained description of a load test.
 #[derive(Clone, Debug)]
@@ -99,6 +79,7 @@ struct WorkerReport {
     connection_failures: usize,
     body_failures: usize,
     other_failures: usize,
+    redirect_limit_failures: usize,
     bytes: u64,
     status_codes: BTreeMap<u16, usize>,
     latencies: Vec<Duration>,
@@ -218,24 +199,6 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
     }
     let redirects_followed = Arc::new(AtomicUsize::new(0));
     let connections_opened = Arc::new(AtomicUsize::new(0));
-    let redirect_limit_failures = Arc::new(AtomicUsize::new(0));
-    let redirect_policy = if plan.follow_redirects {
-        let followed = Arc::clone(&redirects_followed);
-        let limit_failures = Arc::clone(&redirect_limit_failures);
-        let limit = plan.max_redirects;
-        reqwest::redirect::Policy::custom(move |attempt| {
-            // previous includes the initial URL, which is not a redirect.
-            if attempt.previous().len() > limit {
-                limit_failures.fetch_add(1, Ordering::Relaxed);
-                attempt.error(RedirectLimit)
-            } else {
-                followed.fetch_add(1, Ordering::Relaxed);
-                attempt.follow()
-            }
-        })
-    } else {
-        reqwest::redirect::Policy::none()
-    };
     if !plan.reuse_connections {
         plan.headers
             .insert(CONNECTION, HeaderValue::from_static("close"));
@@ -244,7 +207,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
     let mut builder = Client::builder()
         .user_agent(concat!("Horde/", env!("CARGO_PKG_VERSION")))
         .timeout(plan.timeout)
-        .redirect(redirect_policy)
+        .redirect(reqwest::redirect::Policy::none())
         .connector_layer(tower::util::MapResponseLayer::new(move |connection| {
             connection_counter.fetch_add(1, Ordering::Relaxed);
             connection
@@ -258,6 +221,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
     let next_start = Arc::new(Mutex::new(start));
     let mut workers = tokio::task::JoinSet::new();
     for worker_id in 1..=plan.concurrency.min(plan.requests) {
+        let redirects_followed = Arc::clone(&redirects_followed);
         let (client, plan, next, next_start) = (
             client.clone(),
             plan.clone(),
@@ -323,7 +287,15 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                 if let Some(body) = &plan.body {
                     request = request.body(body.clone());
                 }
-                match request.send().await {
+                let result = if plan.follow_redirects {
+                    match request.build() {
+                        Ok(request) => redirect::send(&client, request, plan.max_redirects, plan.timeout, Some(&redirects_followed)).await,
+                        Err(error) => Err(redirect::RedirectError::Request(error)),
+                    }
+                } else {
+                    request.send().await.map_err(redirect::RedirectError::Request)
+                };
+                match result {
                     Ok(response) => {
                         status_code = Some(response.status().as_u16());
                         http_failure = response.status().is_client_error()
@@ -346,8 +318,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                         failed = true;
                         timeout_failure = error.is_timeout();
                         connection_failure = error.is_connect();
-                        redirect_limit_failure = (plan.verbose || (!timeout_failure && !connection_failure))
-                            && is_redirect_limit(&error);
+                        redirect_limit_failure = matches!(error, redirect::RedirectError::Limit);
                         other_failure =
                             !timeout_failure && !connection_failure && !redirect_limit_failure;
                     }
@@ -376,6 +347,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                 results.connection_failures += usize::from(connection_failure);
                 results.body_failures += usize::from(body_failure);
                 results.other_failures += usize::from(other_failure);
+                results.redirect_limit_failures += usize::from(redirect_limit_failure);
                 results.bytes = results.bytes.saturating_add(bytes);
                 if let Some(code) = status_code {
                     *results.status_codes.entry(code).or_default() += 1;
@@ -421,6 +393,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
         report.connection_failures += worker.connection_failures;
         report.body_failures += worker.body_failures;
         report.other_failures += worker.other_failures;
+        report.redirect_limit_failures += worker.redirect_limit_failures;
         report.bytes = report.bytes.saturating_add(worker.bytes);
         for (code, count) in worker.status_codes {
             *report.status_codes.entry(code).or_default() += count;
@@ -440,7 +413,6 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
     }
     report.elapsed = start.elapsed();
     report.redirects_followed = redirects_followed.load(Ordering::Relaxed);
-    report.redirect_limit_failures = redirect_limit_failures.load(Ordering::Relaxed);
     report.connections_opened = connections_opened.load(Ordering::Relaxed);
     Ok(report)
 }

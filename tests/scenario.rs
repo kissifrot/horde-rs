@@ -10,6 +10,87 @@ use std::{
 };
 
 #[test]
+fn scenario_user_agent_defaults_and_step_overrides() {
+    for (case, custom, expected) in [
+        (
+            "default",
+            None,
+            concat!("Horde/", env!("CARGO_PKG_VERSION")),
+        ),
+        ("custom", Some("Horde-load/2"), "Horde-load/2"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for expected in [expected, "Step-agent/1"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut data = [0; 4096];
+                let n = stream.read(&mut data).unwrap();
+                let request = String::from_utf8_lossy(&data[..n]);
+                let agents: Vec<_> = request
+                    .lines()
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("user-agent")
+                            .then_some(value.trim())
+                    })
+                    .collect();
+                assert_eq!(agents, [expected]);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        let file = std::env::temp_dir().join(format!(
+            "horde-scenario-agent-{case}-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&file, serde_json::to_vec(&serde_json::json!({"version":1,"name":"agent", "steps":[
+            {"name":"default", "url":format!("http://{address}/")},
+            {"name":"override", "url":format!("http://{address}/"), "headers":{"User-Agent":"Step-agent/1"}}
+        ]})).unwrap()).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_horde"));
+        command.arg("--scenario").arg(&file).arg("--json");
+        if let Some(agent) = custom {
+            command.args(["-A", agent]);
+        }
+        let output = command.output().unwrap();
+        std::fs::remove_file(file).unwrap();
+        server.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["scenarios"]["failed"], 0);
+    }
+}
+
+#[test]
+fn scenario_rejects_invalid_user_agent() {
+    let file = std::env::temp_dir().join(format!(
+        "horde-scenario-invalid-agent-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(
+        &file,
+        r#"{"version":1,"name":"agent","steps":[{"name":"one","url":"http://127.0.0.1/"}]}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .arg("--scenario")
+        .arg(&file)
+        .args(["-A", "invalid\nagent"])
+        .output()
+        .unwrap();
+    std::fs::remove_file(file).unwrap();
+    assert!(!output.status.success());
+}
+
+#[test]
 fn scenario_users_keep_isolated_cookies_across_steps() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

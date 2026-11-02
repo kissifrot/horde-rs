@@ -6,6 +6,93 @@ use std::{
 };
 
 #[test]
+fn standalone_redirect_restricts_referer_and_sensitive_headers() {
+    let site = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let site_addr = site.local_addr().unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let site_server = thread::spawn(move || {
+        let (mut stream, _) = site.accept().unwrap();
+        let mut buffer = [0; 4096];
+        let n = stream.read(&mut buffer).unwrap();
+        assert!(String::from_utf8_lossy(&buffer[..n]).contains("secret=private"));
+        write!(stream, "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    });
+    let target_server = thread::spawn(move || {
+        let (mut stream, _) = target.accept().unwrap();
+        let mut buffer = [0; 4096];
+        let n = stream.read(&mut buffer).unwrap();
+        let request = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
+        assert!(
+            request.contains(&format!("referer: http://{site_addr}/\r\n")),
+            "{request}"
+        );
+        assert!(!request.contains("secret=private"), "{request}");
+        assert!(
+            !request.contains("authorization:") && !request.contains("cookie:"),
+            "{request}"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .args([
+            "-L",
+            "--json",
+            "-H",
+            "Authorization: Bearer secret",
+            "-H",
+            "Cookie: secret=private",
+        ])
+        .arg(format!("http://{site_addr}/private?secret=private"))
+        .output()
+        .unwrap();
+    site_server.join().unwrap();
+    target_server.join().unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["completed"], 1);
+    assert_eq!(report["failed"], 0);
+    assert_eq!(report["redirects_followed"], 1);
+}
+
+#[test]
+fn redirect_chain_uses_one_timeout_including_final_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let mut buffer = [0; 4096];
+        assert!(first.read(&mut buffer).unwrap() > 0);
+        thread::sleep(std::time::Duration::from_millis(600));
+        write!(first, "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        let (mut second, _) = listener.accept().unwrap();
+        assert!(second.read(&mut buffer).unwrap() > 0);
+        write!(
+            second,
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        thread::sleep(std::time::Duration::from_millis(650));
+        let _ = second.write_all(b"x");
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .args(["-L", "--json", "-t", "1"])
+        .arg(format!("http://{addr}/start"))
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["failed"], 1);
+    assert_eq!(report["failure_details"]["timeout"], 1);
+    assert_eq!(report["redirects_followed"], 1);
+}
+
+#[test]
 fn auto_referer_uses_final_redirect_url_and_respects_explicit_header() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -21,6 +108,10 @@ fn auto_referer_uses_final_redirect_url_and_respects_explicit_header() {
                     write!(stream, "HTTP/1.1 302 Found\r\nLocation: /landed?from=redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                 }
                 1 => {
+                    assert!(
+                        request.contains(&format!("referer: http://{addr}/start")),
+                        "{request}"
+                    );
                     write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -124,7 +215,7 @@ fn scenario_follows_redirects_across_site_and_authentication_server() {
         let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
         assert!(request.starts_with("get /callback "), "{request}");
         assert!(
-            request.contains(&format!("referer: http://localhost:{auth_port}/authorize")),
+            request.contains(&format!("referer: http://localhost:{auth_port}/")),
             "{request}"
         );
         assert!(request.contains("site_session=site"), "{request}");
@@ -142,7 +233,7 @@ fn scenario_follows_redirects_across_site_and_authentication_server() {
         let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
         assert!(request.starts_with("get /authorize "), "{request}");
         assert!(
-            request.contains(&format!("referer: http://{site_addr}/login")),
+            request.contains(&format!("referer: http://{site_addr}/")),
             "{request}"
         );
         assert!(!request.contains("site_session=site"), "{request}");
@@ -153,7 +244,7 @@ fn scenario_follows_redirects_across_site_and_authentication_server() {
         "horde-scenario-redirect-{}.json",
         std::process::id()
     ));
-    let scenario = serde_json::json!({"version":1,"name":"redirect", "steps":[{"name":"login", "url":format!("http://{site_addr}/login"), "headers":{"Authorization":"Bearer example"}}]});
+    let scenario = serde_json::json!({"version":1,"name":"redirect", "steps":[{"name":"login", "url":format!("http://{site_addr}/login?secret=private"), "headers":{"Authorization":"Bearer example"}}]});
     std::fs::write(&path, serde_json::to_vec(&scenario).unwrap()).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .arg("--scenario")

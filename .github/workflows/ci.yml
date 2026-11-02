@@ -21,8 +21,8 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-targets --all-features
-      - name: Test benchmark server
-        run: python3 benchmarks/test_server.py
+      - name: Test benchmark tools
+        run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
   benchmark:
     runs-on: ubuntu-latest
     steps:
@@ -51,7 +51,7 @@ jobs:
         continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: python3 benchmarks/local.py --binary "$RUNNER_TEMP/horde-base-target/release/horde" --binary-revision "$BASE_SHA" --requests 10000 --repeats 5 --output "$RUNNER_TEMP/benchmark-base.json"
+        run: python3 benchmarks/local.py --binary "$RUNNER_TEMP/horde-base-target/release/horde" --binary-revision "$BASE_SHA" --requests 10000 --repeats 5 --allow-unsupported-scenarios --output "$RUNNER_TEMP/benchmark-base.json"
       - name: Add benchmark summary
         env:
           BASE_OUTCOME: ${{ steps.base_benchmark.outcome }}

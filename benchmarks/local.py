@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--binary-revision", help="revision used to build the binary, if known")
     parser.add_argument("--requests", type=int, default=10000)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--allow-unsupported-scenarios", action="store_true", help="skip scenario cases unsupported by a comparison binary")
     parser.add_argument("--output", type=Path, help="write JSON to this file instead of stdout")
     args = parser.parse_args()
     if args.requests <= 0 or args.repeats <= 0:
@@ -69,15 +70,56 @@ def run_benchmark(args, binary, server, server_binary):
     if not port.isdecimal():
         raise RuntimeError("benchmark server failed to start")
     target = f"http://127.0.0.1:{port}/"
-    cases = [("serial", 1, []), ("concurrent", 16, []),
-             ("high_concurrency", 64, []), ("no_reuse", 16, ["--no-connection-reuse"]),
-             ("rate_limited", 16, ["--rate", "1000"])]
+    with tempfile.TemporaryDirectory(prefix="horde-bench-scenarios-") as directory:
+        run_cases(args, binary, server, server_binary, target, Path(directory))
+
+
+def run_cases(args, binary, server, server_binary, target, directory):
+    one_step = {"version": 1, "name": "one step", "variables": {"base": "<loopback>"},
+                "steps": [{"name": "get", "url": "{{base}}/"}]}
+    journey = {"version": 1, "name": "journey", "variables": {"base": "<loopback>"},
+               "steps": [
+                   {"name": "open", "url": "{{base}}/", "expect": {"body_contains": "OK"},
+                    "extract": {"length": {"from": "header", "name": "Content-Length"}}},
+                   {"name": "next", "url": "{{base}}/", "headers": {"X-Length": "{{length}}"}},
+                   {"name": "finish", "url": "{{base}}/", "expect": {"status": [200]}}
+               ]}
+    cases = [("serial", 1, [], None), ("concurrent", 16, [], None),
+             ("high_concurrency", 64, [], None), ("no_reuse", 16, ["--no-connection-reuse"], None),
+             ("rate_limited", 16, ["--rate", "1000"], None),
+             ("scenario_single", 16, [], one_step), ("scenario_journey", 16, [], journey),
+             ("scenario_journey_bounded", 16, ["--bounded-latency"], journey)]
     results = []
-    for name, concurrency, options in cases:
-        command = [str(binary), "--json", "-n", str(args.requests), "-c", str(concurrency), *options, target]
+    skipped = []
+    for name, concurrency, options, scenario in cases:
+        scenario_hash = None
+        if scenario is None:
+            destination = [target]
+        else:
+            scenario_hash = hashlib.sha256(json.dumps(scenario, sort_keys=True).encode()).hexdigest()
+            scenario = json.loads(json.dumps(scenario))
+            scenario["variables"]["base"] = target.rstrip("/")
+            path = directory / f"{name}.json"
+            path.write_text(json.dumps(scenario), encoding="utf-8")
+            destination = ["--scenario", str(path)]
+        command = [str(binary), "--json", "-n", str(args.requests), "-c", str(concurrency), *options, *destination]
         # Warm up connections, caches and executable pages; do not record the run.
-        warmup = [str(binary), "--json", "-n", str(min(args.requests, 200)), "-c", str(concurrency), *options, target]
-        subprocess.run(warmup, check=True, stdout=subprocess.DEVNULL)
+        warmup_count = min(args.requests, 200)
+        warmup = [str(binary), "--json", "-n", str(warmup_count), "-c", str(concurrency), *options, *destination]
+        warmup_result = subprocess.run(warmup, capture_output=True, text=True)
+        if warmup_result.returncode != 0:
+            if scenario is not None and args.allow_unsupported_scenarios:
+                skipped.append({"name": name, "reason": "base binary could not run scenario warm-up"})
+                print(f"Skipping {name}: base binary could not run scenario warm-up", file=sys.stderr)
+                continue
+            raise RuntimeError(f"{name}: warm-up failed: {warmup_result.stderr}")
+        warmup_report = json.loads(warmup_result.stdout)
+        if not valid_report(warmup_report, scenario, warmup_count):
+            if scenario is not None and args.allow_unsupported_scenarios:
+                skipped.append({"name": name, "reason": "base binary did not complete scenario warm-up"})
+                print(f"Skipping {name}: base binary did not complete scenario warm-up", file=sys.stderr)
+                continue
+            raise RuntimeError(f"{name}: incomplete or failed warm-up")
         samples = []
         for _ in range(args.repeats):
             before = cpu_seconds(server.pid)
@@ -96,25 +138,38 @@ def run_benchmark(args, binary, server, server_binary):
             wall = time.monotonic() - started
             after = cpu_seconds(server.pid)
             report = json.loads(completed.stdout)
-            if report["completed"] != args.requests or report["failed"]:
-                raise RuntimeError(f"{name}: invalid benchmark run: {report['completed']} completed, {report['failed']} failed")
-            samples.append({"wall_seconds": wall, "server_cpu_seconds": None if before is None or after is None else after - before, "client_resources": client, "report": report})
+            if not valid_report(report, scenario, args.requests):
+                raise RuntimeError(f"{name}: incomplete or failed benchmark run")
+            rate = report["requests_per_second"] if scenario is None else args.requests / report["elapsed_seconds"]
+            samples.append({"wall_seconds": wall, "rate_per_second": rate, "server_cpu_seconds": None if before is None or after is None else after - before, "client_resources": client, "report": report})
         results.append({"name": name, "concurrency": concurrency, "options": options,
-                        "median_requests_per_second": statistics.median(s["report"]["requests_per_second"] for s in samples),
+                        "unit": "requests/s" if scenario is None else "iterations/s", "scenario_sha256": scenario_hash,
+                        "median_rate_per_second": statistics.median(s["rate_per_second"] for s in samples),
                         "samples": samples})
     dirty = command_output("git", "status", "--porcelain")
-    result = {"schema_version": 1, "metadata": {"platform": platform.platform(), "cpu_count": os.cpu_count(),
+    result = {"schema_version": 2, "metadata": {"platform": platform.platform(), "cpu_count": os.cpu_count(),
               "python": platform.python_version(), "rustc": command_output("rustc", "--version"),
               "git_commit": command_output("git", "rev-parse", "HEAD"), "git_dirty": None if dirty is None else bool(dirty),
               "binary": str(binary), "binary_revision": args.binary_revision,
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "server_implementation": "custom" if args.server_binary else "rust-thread-pool-v1", "server_sha256": hashlib.sha256(server_binary.read_bytes()).hexdigest(),
-              "requests": args.requests, "repeats": args.repeats}, "cases": results}
+              "requests": args.requests, "repeats": args.repeats}, "cases": results, "skipped_cases": skipped}
     output = json.dumps(result, indent=2) + "\n"
     if args.output:
         args.output.write_text(output)
     else:
         print(output, end="")
+
+
+def valid_report(report, scenario, count):
+    if scenario is None:
+        return report.get("completed") == count and report.get("failed") == 0
+    totals = report.get("scenarios", {})
+    steps = report.get("steps", [])
+    return (totals.get("completed") == count and totals.get("failed") == 0
+            and len(steps) == len(scenario["steps"])
+            and all(step.get("completed") == count and step.get("failed") == 0 for step in steps)
+            and report.get("elapsed_seconds", 0) > 0)
 
 if __name__ == "__main__":
     main()
