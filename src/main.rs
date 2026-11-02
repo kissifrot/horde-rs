@@ -1,5 +1,5 @@
 use clap::Parser;
-use horde_rs::scenario::{Counts, Scenario, run_scenario_with_redirects};
+use horde_rs::scenario::{Counts, Scenario, ScenarioOptions, run_scenario_config};
 use horde_rs::{LatencyStats, TestPlan, run};
 use reqwest::{
     Method, Url,
@@ -25,8 +25,11 @@ struct Args {
     #[arg(required_unless_present = "scenario", conflicts_with = "scenario")]
     url: Option<Url>,
     /// Run a JSON scenario instead of testing a single URL.
-    #[arg(long, conflicts_with_all = ["method", "headers", "user_agent", "body_file", "duration", "rate", "bounded_latency", "no_connection_reuse", "max_failure_rate", "max_p95_ms"])]
+    #[arg(long, conflicts_with_all = ["method", "headers", "user_agent", "body_file", "duration", "rate", "no_connection_reuse", "max_p95_ms"])]
     scenario: Option<PathBuf>,
+    /// Derive Referer between scenario steps (requires --scenario).
+    #[arg(long, requires = "scenario")]
+    auto_referer: bool,
     /// Total number of requests.
     #[arg(short = 'n', long)]
     requests: Option<usize>,
@@ -69,6 +72,9 @@ struct Args {
     /// Maximum p95 request latency in milliseconds.
     #[arg(long, allow_hyphen_values = true)]
     max_p95_ms: Option<f64>,
+    /// Maximum p95 latency in milliseconds for each scenario step (requires --scenario).
+    #[arg(long, requires = "scenario", allow_hyphen_values = true)]
+    max_step_p95_ms: Option<f64>,
     /// Print a machine-readable JSON summary instead of the text report.
     #[arg(long)]
     json: bool,
@@ -92,25 +98,78 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
     if args.max_p95_ms.is_some_and(|v| !v.is_finite() || v < 0.0) {
         return Err("max p95 must be a finite, non-negative number of milliseconds".into());
     }
+    if args
+        .max_step_p95_ms
+        .is_some_and(|v| !v.is_finite() || v < 0.0)
+    {
+        return Err("max step p95 must be a finite, non-negative number of milliseconds".into());
+    }
     if let Some(path) = &args.scenario {
         let scenario = Scenario::from_json(&std::fs::read(path)?)?;
-        let report = run_scenario_with_redirects(
+        let mut report = run_scenario_config(
             scenario,
             args.requests.unwrap_or(1),
             args.concurrency,
             Duration::from_secs(args.timeout),
-            args.verbose,
-            args.follow_redirects
-                .then(|| args.max_redirects.map_or(10, NonZeroUsize::get)),
+            ScenarioOptions {
+                verbose: args.verbose,
+                max_redirects: args
+                    .follow_redirects
+                    .then(|| args.max_redirects.map_or(10, NonZeroUsize::get)),
+                auto_referer: args.auto_referer,
+                bounded_latency: args.bounded_latency,
+            },
         )
         .await?;
         fn mean(count: &Counts) -> Option<f64> {
             (count.completed > 0)
                 .then(|| count.elapsed.as_secs_f64() * 1000.0 / count.completed as f64)
         }
+        fn percentile(stats: &Option<LatencyStats>, p: u32) -> Option<f64> {
+            stats
+                .as_ref()
+                .and_then(|stats| stats.percentile(p))
+                .map(|duration| duration.as_secs_f64() * 1000.0)
+        }
+        let scenario_stats = report.scenarios.take_latency_stats();
+        let step_stats: Vec<_> = report
+            .steps
+            .iter_mut()
+            .map(|(_, count)| count.take_latency_stats())
+            .collect();
+        let failure_rate = (report.scenarios.completed > 0)
+            .then(|| report.scenarios.failed as f64 * 100.0 / report.scenarios.completed as f64);
+        let failure_passed = args
+            .max_failure_rate
+            .map(|limit| failure_rate.is_some_and(|value| value <= limit));
+        let step_checks: Vec<_> = report
+            .steps
+            .iter()
+            .zip(&step_stats)
+            .map(|((name, _), stats)| {
+                let p95 = percentile(stats, 95);
+                (
+                    name,
+                    p95,
+                    args.max_step_p95_ms
+                        .map(|limit| p95.is_some_and(|value| value <= limit)),
+                )
+            })
+            .collect();
+        let step_passed = args.max_step_p95_ms.map(|_| {
+            step_checks
+                .iter()
+                .all(|(_, _, passed)| *passed == Some(true))
+        });
+        let exit_code = if failure_passed == Some(false) || step_passed == Some(false) {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        };
         if args.json {
-            let steps: Vec<_> = report.steps.iter().map(|(name, count)| serde_json::json!({"name": name, "completed": count.completed, "failed": count.failed, "mean_latency_ms": mean(count)})).collect();
-            let output = serde_json::json!({"schema_version": 1, "type": "scenario", "name": report.name, "elapsed_seconds": report.elapsed.as_secs_f64(), "scenarios": {"completed": report.scenarios.completed, "failed": report.scenarios.failed, "mean_duration_ms": mean(&report.scenarios)}, "steps": steps});
+            let steps: Vec<_> = report.steps.iter().zip(&step_stats).map(|((name, count), stats)| serde_json::json!({"name": name, "completed": count.completed, "failed": count.failed, "mean_latency_ms": mean(count), "latency_ms": {"p50": percentile(stats, 50), "p90": percentile(stats, 90), "p95": percentile(stats, 95), "p99": percentile(stats, 99), "p100": percentile(stats, 100)}, "status_codes": count.status_codes, "failure_details": count.failure_details})).collect();
+            let checks: Vec<_> = step_checks.iter().map(|(name, observed, passed)| serde_json::json!({"name": name, "observed": observed, "passed": passed})).collect();
+            let output = serde_json::json!({"schema_version": 1, "type": "scenario", "name": report.name, "elapsed_seconds": report.elapsed.as_secs_f64(), "latency_method": if args.bounded_latency { "hdr_histogram_upper_bound_3_significant_digits" } else { "exact" }, "scenarios": {"completed": report.scenarios.completed, "failed": report.scenarios.failed, "mean_duration_ms": mean(&report.scenarios), "duration_ms": {"p50": percentile(&scenario_stats, 50), "p95": percentile(&scenario_stats, 95), "p99": percentile(&scenario_stats, 99)}}, "steps": steps, "thresholds": {"failure_rate_percent": args.max_failure_rate.map(|limit| serde_json::json!({"limit":limit,"observed":failure_rate,"passed":failure_passed})), "step_p95_ms": args.max_step_p95_ms.map(|limit| serde_json::json!({"limit":limit,"passed":step_passed,"steps":checks}))}});
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
             println!(
@@ -124,16 +183,58 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
                 println!("Mean scenario time:  {value:.2} ms");
             }
             println!("Steps:");
-            for (name, count) in &report.steps {
+            for ((name, count), stats) in report.steps.iter().zip(&step_stats) {
                 let latency =
                     mean(count).map_or_else(|| "n/a".into(), |value| format!("{value:.2} ms"));
                 println!(
                     "  {name}: completed={} failed={} mean={latency}",
                     count.completed, count.failed
                 );
+                for p in [50, 90, 95, 99, 100] {
+                    if let Some(value) = percentile(stats, p) {
+                        println!("    p{p}: {value:.2} ms");
+                    }
+                }
+                if !count.status_codes.is_empty() {
+                    println!("    HTTP status codes: {:?}", count.status_codes);
+                }
+                if !count.failure_details.is_empty() {
+                    println!("    Failure details: {:?}", count.failure_details);
+                }
+            }
+            if args.bounded_latency {
+                println!("Latency method: HDR histogram (approximate upper bounds)");
+            }
+            if let Some(limit) = args.max_failure_rate {
+                let observed = failure_rate.map_or_else(
+                    || "no completed scenarios".to_owned(),
+                    |value| format!("{value:.2}%"),
+                );
+                println!(
+                    "Scenario failure rate threshold: {observed} / {limit:.2}% — {}",
+                    if failure_passed == Some(true) {
+                        "PASS"
+                    } else {
+                        "FAIL"
+                    }
+                );
+            }
+            if let Some(limit) = args.max_step_p95_ms {
+                for (name, observed, passed) in &step_checks {
+                    let observed = observed
+                        .map_or_else(|| "no samples".to_owned(), |value| format!("{value:.2} ms"));
+                    println!(
+                        "Step {name:?} p95 threshold: {observed} / {limit:.2} ms — {}",
+                        if *passed == Some(true) {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        }
+                    );
+                }
             }
         }
-        return Ok(ExitCode::SUCCESS);
+        return Ok(exit_code);
     }
     let mut headers = HeaderMap::new();
     for header in args.headers {

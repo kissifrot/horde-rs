@@ -6,6 +6,80 @@ use std::{
 };
 
 #[test]
+fn auto_referer_uses_final_redirect_url_and_respects_explicit_header() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for index in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let count = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..count]).to_ascii_lowercase();
+            match index {
+                0 => {
+                    assert!(!request.contains("referer:"));
+                    write!(stream, "HTTP/1.1 302 Found\r\nLocation: /landed?from=redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+                1 => {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+                2 => {
+                    assert!(
+                        request.contains(&format!("referer: http://{addr}/landed?from=redirect")),
+                        "{request}"
+                    );
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    assert!(
+                        request.contains("referer: https://explicit.example/path"),
+                        "{request}"
+                    );
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "horde-scenario-referer-{}.json",
+        std::process::id()
+    ));
+    let scenario = serde_json::json!({"version":1, "name":"referer", "steps":[
+        {"name":"redirect", "url":format!("http://{addr}/start")},
+        {"name":"next", "url":format!("http://{addr}/next")},
+        {"name":"explicit", "url":format!("http://{addr}/last"), "headers":{"Referer":"https://explicit.example/path"}}
+    ]});
+    std::fs::write(&path, serde_json::to_vec(&scenario).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .arg("--scenario")
+        .arg(&path)
+        .args(["--auto-referer", "-L", "--json"])
+        .output()
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["scenarios"]["failed"], 0);
+}
+
+#[test]
 fn scenario_redirects_are_not_followed_by_default() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -30,7 +104,7 @@ fn scenario_redirects_are_not_followed_by_default() {
     server.join().unwrap();
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["scenarios"]["failed"], 0);
+    assert_eq!(report["scenarios"]["failed"], 1);
     assert!(String::from_utf8_lossy(&output.stderr).contains("completed status=302"));
 }
 
@@ -49,6 +123,10 @@ fn scenario_follows_redirects_across_site_and_authentication_server() {
         let read = callback.read(&mut buffer).unwrap();
         let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
         assert!(request.starts_with("get /callback "), "{request}");
+        assert!(
+            request.contains(&format!("referer: http://localhost:{auth_port}/authorize")),
+            "{request}"
+        );
         assert!(request.contains("site_session=site"), "{request}");
         assert!(!request.contains("auth_session=auth"), "{request}");
         write!(
@@ -63,6 +141,10 @@ fn scenario_follows_redirects_across_site_and_authentication_server() {
         let read = stream.read(&mut buffer).unwrap();
         let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
         assert!(request.starts_with("get /authorize "), "{request}");
+        assert!(
+            request.contains(&format!("referer: http://{site_addr}/login")),
+            "{request}"
+        );
         assert!(!request.contains("site_session=site"), "{request}");
         assert!(!request.contains("authorization:"), "{request}");
         write!(stream, "HTTP/1.1 302 Found\r\nLocation: http://{site_addr}/callback\r\nSet-Cookie: auth_session=auth; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();

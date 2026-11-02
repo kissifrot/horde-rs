@@ -3,7 +3,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::{
     Client, Method, Url,
-    header::{HeaderMap, HeaderName, HeaderValue},
+    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, REFERER},
 };
 use serde::Deserialize;
 use std::{
@@ -40,8 +40,38 @@ struct StepFile {
     #[serde(default)]
     headers: BTreeMap<String, String>,
     body: Option<String>,
+    form: Option<BTreeMap<String, String>>,
+    json_body: Option<serde_json::Value>,
     #[serde(default)]
     wait_ms: u64,
+    expect: Option<ExpectFile>,
+    #[serde(default)]
+    extract: BTreeMap<String, ExtractFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "from", rename_all = "lowercase", deny_unknown_fields)]
+enum ExtractFile {
+    Header { name: String },
+    Json { pointer: String },
+    Html { selector: String, attribute: String },
+}
+
+#[derive(Clone, Debug)]
+enum Extract {
+    Header(HeaderName),
+    Json(String),
+    Html { selector: String, attribute: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectFile {
+    status: Option<Vec<u16>>,
+    final_url: Option<String>,
+    body_contains: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
 }
 
 fn default_method() -> String {
@@ -73,6 +103,234 @@ fn expand(input: &str, variables: &BTreeMap<String, String>) -> Result<String, R
     Ok(output)
 }
 
+#[derive(Clone, Debug)]
+enum Part {
+    Literal(String),
+    Variable(String),
+}
+
+#[derive(Clone, Debug)]
+struct Template {
+    parts: Vec<Part>,
+    dynamic: bool,
+}
+
+#[derive(Clone, Debug)]
+enum JsonTemplate {
+    Value(serde_json::Value),
+    String(Template),
+    Array(Vec<JsonTemplate>),
+    Object(BTreeMap<String, JsonTemplate>),
+}
+
+impl JsonTemplate {
+    fn compile(
+        value: serde_json::Value,
+        static_vars: &BTreeMap<String, String>,
+        available: &std::collections::HashSet<String>,
+    ) -> Result<Self, RunError> {
+        Ok(match value {
+            serde_json::Value::String(value) => {
+                Self::String(Template::compile(&value, static_vars, available)?)
+            }
+            serde_json::Value::Array(items) => Self::Array(
+                items
+                    .into_iter()
+                    .map(|value| Self::compile(value, static_vars, available))
+                    .collect::<Result<_, _>>()?,
+            ),
+            serde_json::Value::Object(items) => Self::Object(
+                items
+                    .into_iter()
+                    .map(|(key, value)| Ok((key, Self::compile(value, static_vars, available)?)))
+                    .collect::<Result<_, RunError>>()?,
+            ),
+            value => Self::Value(value),
+        })
+    }
+
+    fn dynamic(&self) -> bool {
+        match self {
+            Self::String(template) => template.dynamic,
+            Self::Array(items) => items.iter().any(Self::dynamic),
+            Self::Object(items) => items.values().any(Self::dynamic),
+            Self::Value(_) => false,
+        }
+    }
+
+    fn render(&self, variables: &BTreeMap<String, String>) -> Result<serde_json::Value, RunError> {
+        Ok(match self {
+            Self::Value(value) => value.clone(),
+            Self::String(template) => serde_json::Value::String(template.render(variables)?),
+            Self::Array(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|value| value.render(variables))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Self::Object(items) => serde_json::Value::Object(
+                items
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), value.render(variables)?)))
+                    .collect::<Result<_, RunError>>()?,
+            ),
+        })
+    }
+}
+
+fn render_form(
+    fields: &[(String, Template)],
+    variables: &BTreeMap<String, String>,
+) -> Result<Bytes, RunError> {
+    let fields: Vec<_> = fields
+        .iter()
+        .map(|(key, template)| Ok((key.as_str(), template.render(variables)?)))
+        .collect::<Result<_, RunError>>()?;
+    Ok(Bytes::from(serde_urlencoded::to_string(fields)?))
+}
+
+impl Template {
+    fn compile(
+        input: &str,
+        static_vars: &BTreeMap<String, String>,
+        available: &std::collections::HashSet<String>,
+    ) -> Result<Self, RunError> {
+        let mut parts = Vec::new();
+        let mut rest = input;
+        let mut dynamic = false;
+        while let Some(start) = rest.find("{{") {
+            parts.push(Part::Literal(rest[..start].to_owned()));
+            let expression = &rest[start + 2..];
+            let end = expression.find("}}").ok_or("unclosed scenario variable")?;
+            let name = &expression[..end];
+            if !valid_variable_name(name) {
+                return Err("invalid scenario variable name".into());
+            }
+            if let Some(value) = static_vars.get(name) {
+                parts.push(Part::Literal(value.clone()));
+            } else if available.contains(name) {
+                parts.push(Part::Variable(name.to_owned()));
+                dynamic = true;
+            } else {
+                return Err(format!("undefined scenario variable: {name}").into());
+            }
+            rest = &expression[end + 2..];
+        }
+        parts.push(Part::Literal(rest.to_owned()));
+        Ok(Self { parts, dynamic })
+    }
+
+    fn render(&self, variables: &BTreeMap<String, String>) -> Result<String, RunError> {
+        let mut result = String::new();
+        for part in &self.parts {
+            match part {
+                Part::Literal(value) => result.push_str(value),
+                Part::Variable(name) => result.push_str(
+                    variables
+                        .get(name)
+                        .ok_or("scenario variable not available")?,
+                ),
+            }
+        }
+        Ok(result)
+    }
+}
+
+// Match strict-origin-when-cross-origin for independent scenario steps.
+fn step_referer(previous: &Url, next: &Url) -> Option<HeaderValue> {
+    if previous.scheme() == "https" && next.scheme() == "http" {
+        return None;
+    }
+    let mut referer = previous.clone();
+    let _ = referer.set_username("");
+    let _ = referer.set_password(None);
+    referer.set_fragment(None);
+    if previous.origin() != next.origin() {
+        referer.set_path("/");
+        referer.set_query(None);
+    }
+    HeaderValue::from_str(referer.as_str()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn referer_policy_removes_credentials_fragments_and_cross_origin_paths() {
+        let previous =
+            Url::parse("https://user:pass@example.com/private?token=secret#fragment").unwrap();
+        let same = Url::parse("https://example.com/next").unwrap();
+        let other = Url::parse("https://auth.example.com/").unwrap();
+        let downgrade = Url::parse("http://example.com/").unwrap();
+        assert_eq!(
+            step_referer(&previous, &same).unwrap(),
+            "https://example.com/private?token=secret"
+        );
+        assert_eq!(
+            step_referer(&previous, &other).unwrap(),
+            "https://example.com/"
+        );
+        assert!(step_referer(&previous, &downgrade).is_none());
+    }
+
+    #[test]
+    fn extracts_html_json_and_headers_without_logging_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-token", HeaderValue::from_static("header-value"));
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "header".into(),
+            Extract::Header(HeaderName::from_static("x-token")),
+        );
+        sources.insert("json".into(), Extract::Json("/item/token".into()));
+        let values =
+            extract_values(&sources, &headers, br#"{"item":{"token":"json-value"}}"#).unwrap();
+        assert_eq!(values["header"], "header-value");
+        assert_eq!(values["json"], "json-value");
+        sources.clear();
+        sources.insert(
+            "csrf".into(),
+            Extract::Html {
+                selector: "input[name=csrf]".into(),
+                attribute: "value".into(),
+            },
+        );
+        let values = extract_values(
+            &sources,
+            &headers,
+            br#"<input name="csrf" value="a&amp;b">"#,
+        )
+        .unwrap();
+        assert_eq!(values["csrf"], "a&b");
+        assert!(extract_values(&sources, &headers, b"<p>missing</p>").is_err());
+    }
+
+    #[test]
+    fn dynamic_variables_require_a_preceding_unique_extractor() {
+        for value in [
+            serde_json::json!({"version":1,"name":"x","steps":[{"name":"a","url":"http://example.com/{{later}}"},{"name":"b","url":"http://example.com/","extract":{"later":{"from":"header","name":"X-Value"}}}]}),
+            serde_json::json!({"version":1,"name":"x","variables":{"token":"static"},"steps":[{"name":"a","url":"http://example.com/","extract":{"token":{"from":"header","name":"X-Value"}}}]}),
+            serde_json::json!({"version":1,"name":"x","steps":[{"name":"a","url":"http://example.com/","extract":{"token":{"from":"html","selector":"[","attribute":"value"}}}]}),
+        ] {
+            assert!(Scenario::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn structured_json_sets_content_type_and_preserves_types() {
+        let input = br#"{"version":1,"name":"json","variables":{"x":"quote\"slash\\"},"steps":[{"name":"post","url":"http://example.com/","json_body":{"nested":["{{x}}",true,42,null]}}]}"#;
+        let scenario = Scenario::from_json(input).unwrap();
+        let (_, headers, body) = scenario.steps[0].prepare(&BTreeMap::new()).unwrap();
+        assert_eq!(headers[CONTENT_TYPE], "application/json");
+        let body: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"nested":["quote\"slash\\",true,42,null]})
+        );
+    }
+}
+
 /// A validated scenario; every URL must be absolute HTTP or HTTPS.
 #[derive(Clone, Debug)]
 pub struct Scenario {
@@ -83,11 +341,116 @@ pub struct Scenario {
 #[derive(Clone, Debug)]
 struct Step {
     name: String,
-    url: Url,
+    url: Option<Url>,
+    dynamic_url: Option<Template>,
     method: Method,
     headers: HeaderMap,
+    dynamic_headers: Vec<(HeaderName, Template)>,
     body: Option<Bytes>,
+    dynamic_body: Option<Template>,
+    form: Option<Vec<(String, Template)>>,
+    json_body: Option<JsonTemplate>,
     wait: Duration,
+    expect: Expect,
+    extract: BTreeMap<String, Extract>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Expect {
+    status: Option<Vec<u16>>,
+    final_url: Option<Url>,
+    body_contains: Option<Bytes>,
+    headers: HeaderMap,
+}
+
+fn validate_url(value: &str) -> Result<Url, RunError> {
+    let url: Url = value.parse()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("step URLs must be absolute HTTP or HTTPS URLs".into());
+    }
+    Ok(url)
+}
+
+impl Step {
+    fn prepare(
+        &self,
+        variables: &BTreeMap<String, String>,
+    ) -> Result<(Url, HeaderMap, Option<Bytes>), RunError> {
+        let url = match &self.dynamic_url {
+            Some(template) => validate_url(&template.render(variables)?)?,
+            None => self.url.clone().expect("validated static URL"),
+        };
+        let mut headers = self.headers.clone();
+        for (name, template) in &self.dynamic_headers {
+            headers.insert(
+                name.clone(),
+                HeaderValue::from_str(&template.render(variables)?)?,
+            );
+        }
+        let body = match (&self.form, &self.json_body, &self.dynamic_body) {
+            (Some(fields), _, _) => Some(render_form(fields, variables)?),
+            (_, Some(json), _) => Some(Bytes::from(serde_json::to_vec(&json.render(variables)?)?)),
+            (_, _, Some(template)) => Some(Bytes::from(template.render(variables)?)),
+            _ => self.body.clone(),
+        };
+        Ok((url, headers, body))
+    }
+}
+
+fn extract_values(
+    sources: &BTreeMap<String, Extract>,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<BTreeMap<String, String>, RunError> {
+    let mut result = BTreeMap::new();
+    let json = if sources
+        .values()
+        .any(|source| matches!(source, Extract::Json(_)))
+    {
+        Some(
+            serde_json::from_slice::<serde_json::Value>(body)
+                .map_err(|_| "response is not valid JSON")?,
+        )
+    } else {
+        None
+    };
+    let html = if sources
+        .values()
+        .any(|source| matches!(source, Extract::Html { .. }))
+    {
+        Some(scraper::Html::parse_document(
+            std::str::from_utf8(body).map_err(|_| "HTML is not UTF-8")?,
+        ))
+    } else {
+        None
+    };
+    for (name, source) in sources {
+        let value = match source {
+            Extract::Header(header) => headers
+                .get(header)
+                .ok_or("response header missing")?
+                .to_str()
+                .map_err(|_| "response header is not text")?,
+            Extract::Json(pointer) => json
+                .as_ref()
+                .and_then(|value| value.pointer(pointer))
+                .and_then(|value| value.as_str())
+                .ok_or("JSON pointer does not identify a string")?,
+            Extract::Html {
+                selector,
+                attribute,
+            } => {
+                let selector =
+                    scraper::Selector::parse(selector).map_err(|_| "invalid HTML selector")?;
+                html.as_ref()
+                    .and_then(|document| document.select(&selector).next())
+                    .and_then(|element| element.value().attr(attribute))
+                    .ok_or("HTML attribute missing")?
+            }
+        };
+        result.insert(name.clone(), value.to_owned());
+    }
+    Ok(result)
 }
 
 impl Scenario {
@@ -121,33 +484,166 @@ impl Scenario {
             return Err("variable names must contain only letters, digits or underscores".into());
         }
         let mut names = std::collections::HashSet::new();
+        let mut available = std::collections::HashSet::new();
         let mut steps = Vec::with_capacity(file.steps.len());
         for step in file.steps {
             if step.name.trim().is_empty() || !names.insert(step.name.clone()) {
                 return Err("step names must be nonempty and unique".into());
             }
-            let url: Url = expand(&step.url, &file.variables)?.parse()?;
-            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-                return Err("step URLs must be absolute HTTP or HTTPS URLs".into());
-            }
+            let url_template = Template::compile(&step.url, &file.variables, &available)?;
+            let (url, dynamic_url) = if url_template.dynamic {
+                (None, Some(url_template))
+            } else {
+                (
+                    Some(validate_url(&url_template.render(&BTreeMap::new())?)?),
+                    None,
+                )
+            };
             let mut headers = HeaderMap::new();
+            let mut dynamic_headers = Vec::new();
             for (key, value) in step.headers {
-                headers.insert(
-                    HeaderName::from_bytes(key.as_bytes())?,
-                    HeaderValue::from_str(&expand(&value, &file.variables)?)?,
-                );
+                let key = HeaderName::from_bytes(key.as_bytes())?;
+                let value = Template::compile(&value, &file.variables, &available)?;
+                if value.dynamic {
+                    dynamic_headers.push((key, value));
+                } else {
+                    headers.insert(
+                        key,
+                        HeaderValue::from_str(&value.render(&BTreeMap::new())?)?,
+                    );
+                }
+            }
+            let (mut body, dynamic_body) = match step.body {
+                Some(value) => {
+                    let template = Template::compile(&value, &file.variables, &available)?;
+                    if template.dynamic {
+                        (None, Some(template))
+                    } else {
+                        (Some(Bytes::from(template.render(&BTreeMap::new())?)), None)
+                    }
+                }
+                None => (None, None),
+            };
+            let mut form = None;
+            let mut json_body = None;
+            let mut default_content_type = None;
+            if let Some(fields) = step.form {
+                let fields: Vec<_> = fields
+                    .into_iter()
+                    .map(|(name, value)| {
+                        Ok((
+                            name,
+                            Template::compile(&value, &file.variables, &available)?,
+                        ))
+                    })
+                    .collect::<Result<_, RunError>>()?;
+                default_content_type = Some("application/x-www-form-urlencoded");
+                if fields.iter().any(|(_, value)| value.dynamic) {
+                    form = Some(fields);
+                } else {
+                    body = Some(render_form(&fields, &BTreeMap::new())?);
+                }
+            }
+            if let Some(value) = step.json_body {
+                let template = JsonTemplate::compile(value, &file.variables, &available)?;
+                default_content_type = Some("application/json");
+                if template.dynamic() {
+                    json_body = Some(template);
+                } else {
+                    body = Some(Bytes::from(serde_json::to_vec(
+                        &template.render(&BTreeMap::new())?,
+                    )?));
+                }
+            }
+            if let Some(value) = default_content_type
+                && !headers.contains_key(CONTENT_TYPE)
+                && !dynamic_headers.iter().any(|(name, _)| name == CONTENT_TYPE)
+            {
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static(value));
+            }
+            let expect = if let Some(expect) = step.expect {
+                let final_url = expect
+                    .final_url
+                    .map(|url| -> Result<Url, RunError> {
+                        let url: Url = expand(&url, &file.variables)?.parse()?;
+                        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                            return Err("expected final URL must use HTTP or HTTPS".into());
+                        }
+                        Ok(url)
+                    })
+                    .transpose()?;
+                let body_contains = expect
+                    .body_contains
+                    .map(|body| expand(&body, &file.variables))
+                    .transpose()?;
+                if body_contains.as_ref().is_some_and(String::is_empty) {
+                    return Err(
+                        "expected body text must not be empty after variable substitution".into(),
+                    );
+                }
+                let mut expected_headers = HeaderMap::new();
+                for (name, value) in expect.headers {
+                    expected_headers.insert(
+                        HeaderName::from_bytes(name.as_bytes())?,
+                        HeaderValue::from_str(&expand(&value, &file.variables)?)?,
+                    );
+                }
+                Expect {
+                    status: expect.status,
+                    final_url,
+                    body_contains: body_contains.map(Bytes::from),
+                    headers: expected_headers,
+                }
+            } else {
+                Expect::default()
+            };
+            let mut extract = BTreeMap::new();
+            for (name, source) in step.extract {
+                if file.variables.contains_key(&name) || !available.insert(name.clone()) {
+                    return Err(format!("duplicate scenario variable: {name}").into());
+                }
+                let source = match source {
+                    ExtractFile::Header { name } => {
+                        Extract::Header(HeaderName::from_bytes(name.as_bytes())?)
+                    }
+                    ExtractFile::Json { pointer } => {
+                        if !pointer.is_empty()
+                            && (!pointer.starts_with('/')
+                                || pointer.split('~').skip(1).any(|escape| {
+                                    !escape.starts_with('0') && !escape.starts_with('1')
+                                }))
+                        {
+                            return Err("invalid JSON pointer".into());
+                        }
+                        Extract::Json(pointer)
+                    }
+                    ExtractFile::Html {
+                        selector,
+                        attribute,
+                    } => {
+                        scraper::Selector::parse(&selector).map_err(|_| "invalid HTML selector")?;
+                        Extract::Html {
+                            selector,
+                            attribute,
+                        }
+                    }
+                };
+                extract.insert(name, source);
             }
             steps.push(Step {
                 name: step.name,
                 url,
+                dynamic_url,
                 method: step.method.parse()?,
                 headers,
-                body: step
-                    .body
-                    .map(|body| expand(&body, &file.variables))
-                    .transpose()?
-                    .map(Bytes::from),
+                dynamic_headers,
+                body,
+                dynamic_body,
+                form,
+                json_body,
                 wait: Duration::from_millis(step.wait_ms),
+                expect,
+                extract,
             });
         }
         Ok(Self {
@@ -163,6 +659,91 @@ pub struct Counts {
     pub completed: usize,
     pub failed: usize,
     pub elapsed: Duration,
+    /// Final HTTP status counts; requests that receive no final response have none.
+    pub status_codes: BTreeMap<u16, usize>,
+    /// Failure categories may overlap within one step.
+    pub failure_details: BTreeMap<&'static str, usize>,
+    latencies: Vec<Duration>,
+    bounded_latencies: Option<crate::BoundedLatency>,
+    latency_overflow: bool,
+}
+
+impl Counts {
+    fn record(
+        &mut self,
+        latency: Duration,
+        failed: bool,
+        status: Option<u16>,
+        errors: &[(bool, &'static str)],
+        bounded: bool,
+    ) {
+        self.completed += 1;
+        self.failed += usize::from(failed);
+        self.elapsed = self.elapsed.saturating_add(latency);
+        if let Some(code) = status {
+            *self.status_codes.entry(code).or_default() += 1;
+        }
+        for (_, error) in errors.iter().filter(|(active, _)| *active) {
+            *self.failure_details.entry(error).or_default() += 1;
+        }
+        if bounded {
+            if self
+                .bounded_latencies
+                .get_or_insert_with(crate::BoundedLatency::new)
+                .record(latency)
+                .is_err()
+            {
+                self.latency_overflow = true;
+            }
+        } else {
+            self.latencies.push(latency);
+        }
+    }
+
+    fn merge(&mut self, other: Self) -> Result<(), RunError> {
+        if other.latency_overflow {
+            return Err("latency exceeds bounded histogram range or capacity".into());
+        }
+        self.completed += other.completed;
+        self.failed += other.failed;
+        self.elapsed = self.elapsed.saturating_add(other.elapsed);
+        for (code, count) in other.status_codes {
+            *self.status_codes.entry(code).or_default() += count;
+        }
+        for (name, count) in other.failure_details {
+            *self.failure_details.entry(name).or_default() += count;
+        }
+        if self.latencies.is_empty() {
+            self.latencies = other.latencies;
+        } else {
+            self.latencies.extend(other.latencies);
+        }
+        if let Some(histogram) = other.bounded_latencies {
+            if let Some(current) = &mut self.bounded_latencies {
+                current.merge(&histogram)?;
+            } else {
+                self.bounded_latencies = Some(histogram);
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume collected latency samples without copying; returns None for skipped steps.
+    pub fn take_latency_stats(&mut self) -> Option<crate::LatencyStats> {
+        match self.bounded_latencies.take() {
+            Some(histogram) => Some(crate::LatencyStats::from_bounded(histogram)),
+            None => crate::LatencyStats::from_samples(std::mem::take(&mut self.latencies)),
+        }
+    }
+}
+
+/// Scenario execution options.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScenarioOptions {
+    pub verbose: bool,
+    pub max_redirects: Option<usize>,
+    pub auto_referer: bool,
+    pub bounded_latency: bool,
 }
 
 #[derive(Debug)]
@@ -203,6 +784,57 @@ pub async fn run_scenario_with_redirects(
     verbose: bool,
     max_redirects: Option<usize>,
 ) -> Result<ScenarioReport, RunError> {
+    run_scenario_with_referer(
+        scenario,
+        iterations,
+        users,
+        timeout,
+        verbose,
+        max_redirects,
+        false,
+    )
+    .await
+}
+
+/// Run a scenario with optional redirects and automatic step-to-step referers.
+pub async fn run_scenario_with_referer(
+    scenario: Scenario,
+    iterations: usize,
+    users: usize,
+    timeout: Duration,
+    verbose: bool,
+    max_redirects: Option<usize>,
+    auto_referer: bool,
+) -> Result<ScenarioReport, RunError> {
+    run_scenario_config(
+        scenario,
+        iterations,
+        users,
+        timeout,
+        ScenarioOptions {
+            verbose,
+            max_redirects,
+            auto_referer,
+            bounded_latency: false,
+        },
+    )
+    .await
+}
+
+/// Run a scenario using the given execution options.
+pub async fn run_scenario_config(
+    scenario: Scenario,
+    iterations: usize,
+    users: usize,
+    timeout: Duration,
+    options: ScenarioOptions,
+) -> Result<ScenarioReport, RunError> {
+    let ScenarioOptions {
+        verbose,
+        max_redirects,
+        auto_referer,
+        bounded_latency,
+    } = options;
     if iterations == 0 || users == 0 || timeout.is_zero() {
         return Err("iterations, users and timeout must be greater than zero".into());
     }
@@ -228,6 +860,7 @@ pub async fn run_scenario_with_redirects(
         tasks.spawn(async move {
             let mut totals = Counts::default();
             let mut steps = vec![Counts::default(); scenario.steps.len()];
+            let mut previous_url: Option<Url> = None;
             while let Ok(index) = next.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                     (n < iterations).then(|| n + 1)
                 }) {
@@ -238,6 +871,8 @@ pub async fn run_scenario_with_redirects(
                     let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] started", started.elapsed().as_secs_f64());
                 }
                 let mut run_failed = false;
+                // Extracted values are isolated per user and reset for each iteration.
+                let mut variables = BTreeMap::new();
                 for (index, step) in scenario.steps.iter().enumerate() {
                     if !step.wait.is_zero() {
                         if verbose {
@@ -251,11 +886,27 @@ pub async fn run_scenario_with_redirects(
                         let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} started", started.elapsed().as_secs_f64(), step.name);
                     }
                     let step_started = Instant::now();
-                    let mut request = client
-                        .request(step.method.clone(), step.url.clone())
-                        .headers(step.headers.clone());
-                    if let Some(body) = &step.body {
-                        request = request.body(body.clone());
+                    let (target_url, headers, request_body) = match step.prepare(&variables) {
+                        Ok(prepared) => prepared,
+                        Err(_) => {
+                            if verbose {
+                                use std::io::Write;
+                                let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} failed errors=variable", started.elapsed().as_secs_f64(), step.name);
+                            }
+                            steps[index].record(step_started.elapsed(), true, None, &[(true, "variable")], bounded_latency);
+                            run_failed = true;
+                            break;
+                        }
+                    };
+                    let referer = if auto_referer && !headers.contains_key(REFERER) {
+                        previous_url.as_ref().and_then(|previous| step_referer(previous, &target_url))
+                    } else { None };
+                    let mut request = client.request(step.method.clone(), target_url).headers(headers);
+                    if let Some(referer) = referer {
+                        request = request.header(REFERER, referer);
+                    }
+                    if let Some(body) = request_body {
+                        request = request.body(body);
                     }
                     let mut status = None;
                     let mut bytes = 0u64;
@@ -264,20 +915,65 @@ pub async fn run_scenario_with_redirects(
                     let mut connection_error = false;
                     let mut body_error = false;
                     let mut redirect_error = false;
+                    let mut url_assertion_error = false;
+                    let mut header_assertion_error = false;
+                    let mut body_assertion_error = false;
+                    let mut extraction_error = false;
                     let mut other_error = false;
                     let failed = match request.send().await {
                         Ok(response) => {
+                            if auto_referer {
+                                previous_url = Some(response.url().clone());
+                            }
                             status = Some(response.status().as_u16());
-                            http_error = response.status().is_client_error()
-                                || response.status().is_server_error();
+                            let code = response.status().as_u16();
+                            let status_matches = step.expect.status.as_ref().map_or_else(|| response.status().is_success(), |allowed| allowed.contains(&code));
+                            http_error = !status_matches;
+                            url_assertion_error = step.expect.final_url.as_ref().is_some_and(|expected| expected != response.url());
+                            header_assertion_error = step.expect.headers.iter().any(|(name, value)| !response.headers().get_all(name).iter().any(|actual| actual == value));
+                            let headers = if step.extract.is_empty() { HeaderMap::new() } else { response.headers().clone() };
+                            let capture_body = step.extract.values().any(|source| matches!(source, Extract::Json(_) | Extract::Html { .. }));
+                            let mut captured = Vec::new();
+                            let mut found = step.expect.body_contains.is_none();
+                            let mut tail = Vec::new();
                             let mut body = response.bytes_stream();
                             while let Some(chunk) = body.next().await {
                                 match chunk {
-                                    Ok(chunk) => { if verbose { bytes = bytes.saturating_add(chunk.len() as u64); } }
+                                    Ok(chunk) => {
+                                        if verbose { bytes = bytes.saturating_add(chunk.len() as u64); }
+                                        if capture_body {
+                                            const MAX_EXTRACT_BODY: usize = 2 * 1024 * 1024;
+                                            if chunk.len() > MAX_EXTRACT_BODY.saturating_sub(captured.len()) {
+                                                extraction_error = true;
+                                                break;
+                                            }
+                                            captured.extend_from_slice(&chunk);
+                                        }
+                                        if let Some(needle) = step.expect.body_contains.as_ref().filter(|_| !found) {
+                                            let keep = needle.len() - 1;
+                                            let prefix = keep.min(chunk.len());
+                                            tail.extend_from_slice(&chunk[..prefix]);
+                                            found = tail.windows(needle.len()).any(|window| window == needle.as_ref())
+                                                || chunk.windows(needle.len()).any(|window| window == needle.as_ref());
+                                            if chunk.len() >= keep {
+                                                tail.clear();
+                                                tail.extend_from_slice(&chunk[chunk.len() - keep..]);
+                                            } else if tail.len() > keep {
+                                                tail.drain(..tail.len() - keep);
+                                            }
+                                        }
+                                    }
                                     Err(error) => { body_error = true; timeout_error = error.is_timeout(); break; }
                                 }
                             }
-                            http_error || body_error
+                            body_assertion_error = !found;
+                            if !step.extract.is_empty() && !http_error && !body_error && !url_assertion_error && !header_assertion_error && !body_assertion_error && !extraction_error {
+                                match extract_values(&step.extract, &headers, &captured) {
+                                    Ok(extracted) => variables.extend(extracted),
+                                    Err(_) => extraction_error = true,
+                                }
+                            }
+                            http_error || body_error || url_assertion_error || header_assertion_error || body_assertion_error || extraction_error
                         }
                         Err(error) => {
                             timeout_error = error.is_timeout();
@@ -288,6 +984,7 @@ pub async fn run_scenario_with_redirects(
                         },
                     };
                     let latency = step_started.elapsed();
+                    let errors = [(http_error, "status"), (url_assertion_error, "final_url"), (header_assertion_error, "header_assertion"), (body_assertion_error, "body_assertion"), (extraction_error, "extraction"), (timeout_error, "timeout"), (connection_error, "connection"), (body_error, "body"), (redirect_error, "redirect"), (other_error, "other")];
                     if verbose {
                         use std::io::Write;
                         let mut stderr = std::io::stderr().lock();
@@ -296,17 +993,14 @@ pub async fn run_scenario_with_redirects(
                         if failed {
                             let _ = write!(stderr, " errors=");
                             let mut separator = "";
-                            for (_, label) in [(http_error, "http"), (timeout_error, "timeout"), (connection_error, "connection"), (body_error, "body"), (redirect_error, "redirect"), (other_error, "other")].into_iter().filter(|(active, _)| *active) {
+                            for (_, label) in errors.into_iter().filter(|(active, _)| *active) {
                                 let _ = write!(stderr, "{separator}{label}");
                                 separator = ",";
                             }
                         }
                         let _ = writeln!(stderr);
                     }
-                    steps[index].completed += 1;
-                    steps[index].failed += usize::from(failed);
-                    steps[index].elapsed =
-                        steps[index].elapsed.saturating_add(latency);
+                    steps[index].record(latency, failed, status, &errors, bounded_latency);
                     if failed {
                         run_failed = true;
                         break;
@@ -317,9 +1011,7 @@ pub async fn run_scenario_with_redirects(
                     let outcome = if run_failed { "failed" } else { "succeeded" };
                     let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] {outcome}", started.elapsed().as_secs_f64());
                 }
-                totals.completed += 1;
-                totals.failed += usize::from(run_failed);
-                totals.elapsed = totals.elapsed.saturating_add(run_started.elapsed());
+                totals.record(run_started.elapsed(), run_failed, None, &[], bounded_latency);
             }
             (totals, steps)
         });
@@ -336,13 +1028,9 @@ pub async fn run_scenario_with_redirects(
     };
     while let Some(task) = tasks.join_next().await {
         let (totals, steps) = task?;
-        report.scenarios.completed += totals.completed;
-        report.scenarios.failed += totals.failed;
-        report.scenarios.elapsed = report.scenarios.elapsed.saturating_add(totals.elapsed);
+        report.scenarios.merge(totals)?;
         for ((_, aggregate), step) in report.steps.iter_mut().zip(steps) {
-            aggregate.completed += step.completed;
-            aggregate.failed += step.failed;
-            aggregate.elapsed = aggregate.elapsed.saturating_add(step.elapsed);
+            aggregate.merge(step)?;
         }
     }
     report.elapsed = started.elapsed();

@@ -22,6 +22,7 @@ Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 | --- | --- | --- |
 | `<URL>` | Target HTTP or HTTPS URL; required unless using `--scenario`. | — |
 | `--scenario <FILE>` | Run a JSON scenario instead of a single URL. | Disabled |
+| `--auto-referer` | Derive `Referer` between scenario steps; requires `--scenario`. | Disabled |
 | `-n, --requests <REQUESTS>` | Total requests, or scenario iterations; must be positive. | `1` |
 | `-c, --concurrency <CONCURRENCY>` | Maximum concurrent requests or virtual users; must be positive. | `1` |
 | `-t, --timeout <TIMEOUT>` | Timeout per request, in seconds; must be positive. | `30` |
@@ -32,10 +33,11 @@ Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 | `--duration <DURATION>` | Stop starting new requests after this many seconds; must be positive. | No duration limit |
 | `--rate <RATE>` | Target rate of logical requests per second, from 1 to 1,000,000,000. | Unlimited |
 | `-v, --verbose` | Log the start and result of every request to stderr. | Disabled |
-| `--bounded-latency` | Use a bounded-memory HDR histogram for approximate percentiles. | Disabled (exact samples) |
+| `--bounded-latency` | Use bounded-memory HDR histograms for approximate percentiles. | Disabled (exact samples) |
 | `--no-connection-reuse` | Disable reuse of HTTP connections. | Reuse enabled |
-| `--max-failure-rate <PERCENT>` | Maximum failed request percentage, from 0 to 100. | Disabled |
-| `--max-p95-ms <MILLISECONDS>` | Maximum p95 latency in milliseconds; must be non-negative. | Disabled |
+| `--max-failure-rate <PERCENT>` | Maximum failed request or scenario percentage, from 0 to 100. | Disabled |
+| `--max-p95-ms <MILLISECONDS>` | Maximum p95 request latency for a single-URL test. | Disabled |
+| `--max-step-p95-ms <MILLISECONDS>` | Maximum p95 latency for every scenario step; requires `--scenario`. | Disabled |
 | `--json` | Print a JSON summary instead of the text report. | Disabled |
 | `-L, --follow-redirects` | Follow HTTP redirects. | Disabled |
 | `--max-redirects <MAX_REDIRECTS>` | Maximum redirects per request; positive and requires `-L`. | `10` |
@@ -66,11 +68,21 @@ horde --scenario examples/journey.json -n 100 -c 10 --json
 
 Scenarios must declare `"version": 1` and are validated against the bundled [version 1 JSON Schema](schemas/scenario-v1.schema.json) before execution. The optional `$schema` field helps compatible editors find the schema; Horde uses its bundled copy and does not fetch the URI. Horde also validates semantics that JSON Schema cannot express here, including unique step names, variable references, HTTP methods and the expanded URLs.
 
-Here `-n` is the total number of scenario iterations and `-c` is the maximum number of virtual users. Each user has its own cookie jar, retained across its iterations. Each step has a unique `name`, an absolute HTTP(S) `url`, an optional `method` (default `GET`), `headers`, string `body`, and `wait_ms` before the step. A failed request or 4xx/5xx stops that iteration; later steps are skipped. Redirects are not followed unless `-L` is set; `--max-redirects` sets the per-step limit, and exceeding it fails the step. The report shows completed and failed iterations and per-step counts and mean latency; iteration duration includes waits. The per-request `-t` timeout, `--json` and `-v` are supported; other single-URL options are rejected in scenario mode. Individual failures do not change the exit code.
+Here `-n` is the total number of scenario iterations and `-c` is the maximum number of virtual users. Each user has its own cookie jar, retained across its iterations. Each step has a unique `name`, an absolute HTTP(S) `url`, an optional `method` (default `GET`), `headers`, request body, and `wait_ms` before the step. By default, a step requires a 2xx response. A failed request or assertion stops that iteration; later steps are skipped. Redirects are not followed unless `-L` is set; `--max-redirects` sets the per-step limit. The report shows iteration duration and per-step counts, final HTTP statuses, failure categories and latency percentiles. Iteration duration includes waits; step latency excludes waits but includes assertions and extraction. Error categories can overlap. Skipped steps have no latency sample or HTTP status. Individual failures do not change the exit code unless a CI threshold is set.
 
 With `-v`, stderr shows each user's scenario start, waits, step results and final outcome with relative timestamps. URLs, headers, bodies, cookies and variable values are omitted; step names are shown. JSON remains on stdout. Logging can affect timing and throughput.
 
-Define string values under `variables` and refer to them as `{{name}}` in step URLs, header values and bodies. Names contain letters, digits and underscores. Substitution is literal, happens once before the test, and does not perform URL or JSON escaping. Unknown variables or malformed placeholders reject the scenario before any requests. Variables are shared static configuration, not values extracted from responses; avoid committing secrets in scenario files.
+Define string values under `variables` and refer to them as `{{name}}` in step URLs, header values and bodies. Names contain letters, digits and underscores. Substitution in URLs, headers and raw bodies is literal; use the structured body options below for form or JSON encoding. Unknown variables or malformed placeholders reject the scenario before any requests. Avoid committing secrets in scenario files.
+
+For a request body, choose one of `body` (a raw string), `form` (an object of string fields) or `json_body` (an object or array). Form values are URL-encoded after substitution; JSON string values are escaped during serialization and other JSON types are preserved. Field and object names are literal. Horde sets the appropriate content type for `form` and `json_body` unless the step specifies one. Static structured bodies are prepared once.
+
+### Assertions and extraction
+
+An optional `expect` object checks the final response: `status` lists accepted codes (default: any 2xx), `final_url` matches the final URL, `headers` checks exact header values, and `body_contains` looks for literal UTF-8 text. All specified checks must pass. Static variables may be used in `final_url`, `headers` and `body_contains`.
+
+An optional `extract` object defines variables for later steps, for example `"csrf": {"from": "html", "selector": "input[name=csrf]", "attribute": "value"}`. Sources are response headers (`from: "header"`, `name`), JSON strings (`from: "json"`, JSON `pointer`), and HTML attributes (`from: "html"`, CSS `selector` and `attribute`). HTML uses the first match. Response bodies used for JSON or HTML extraction are limited to 2 MiB; missing values, invalid content or exceeding the limit fail the step. Header extraction does not buffer the body.
+
+Extracted values belong to one user and iteration, and are discarded before the next iteration. Names must be unique and cannot replace static variables; only later steps may reference them. They are not logged in verbose output. See [examples/federated-login.json](examples/federated-login.json) for a form with a per-session CSRF token.
 
 For a runnable login example, start the local demo server in one terminal and run the scenario in another:
 
@@ -79,7 +91,7 @@ python3 examples/login_server.py
 ./target/release/horde --scenario examples/login.json -n 10 -c 2 -v
 ```
 
-The example opens a form, submits demo credentials and accesses a protected page using the session cookie. The server listens only on loopback and is for demonstration, not production. The form body uses literal substitution: URL-encode special characters in values yourself. Real login flows that require CSRF tokens need additional scenario features not yet implemented.
+The example opens a form, submits demo credentials and accesses a protected page using the session cookie. The server listens only on loopback and is for demonstration, not production. Its raw form body uses literal substitution; `form` can be used to encode special characters automatically.
 
 For a redirect between a site and a separate authentication service, use the two-service demo:
 
@@ -88,13 +100,17 @@ python3 examples/federated_login_server.py
 ./target/release/horde --scenario examples/federated-login.json -n 10 -c 2 -L -v
 ```
 
-The services use different loopback hostnames to demonstrate separate cookies. They use demo credentials and a simplified one-time ticket; this is not an OAuth or OpenID Connect implementation. `-L` is required to follow the redirects.
+The services use different loopback hostnames to demonstrate separate cookies. The scenario extracts a per-session CSRF token from the login form before submitting it. They use demo credentials and a simplified one-time ticket; this is not an OAuth or OpenID Connect implementation. `-L` is required to follow the redirects.
 
 ### Connections and redirects
 
 Connections may be reused by default. `--no-connection-reuse` disables the idle pool and sends `Connection: close`, overriding a custom `Connection` header. The server may close connections even when reuse is enabled.
 
 Redirects are not followed by default. Use `-L` to follow up to 10 per request, or `-L --max-redirects 5` to set another limit. Exceeding it counts as a failure.
+
+When following a redirect, Horde's HTTP client automatically sets `Referer` to the previous URL, without credentials or fragment; it does not generate one for an HTTPS-to-HTTP redirect. Redirect referers may include URL query parameters, including across origins, and do not necessarily match browser referrer policies.
+
+For separate scenario steps, `--auto-referer` derives the header from the previous final response URL for each virtual user, including across iterations. It sends the full URL without credentials or fragment for the same origin, only the origin across origins, and nothing on HTTPS-to-HTTP transitions. An explicit step `Referer` takes precedence. This option controls step-to-step headers; redirects retain the behavior described above.
 
 ## Work complete: the report
 
@@ -112,7 +128,7 @@ Use `--json` for a machine-readable summary (schema version 1, elapsed time in s
 
 ### Bounded-memory latency statistics
 
-For long tests, `--bounded-latency` uses a fixed-size HDR histogram per active worker. Percentiles and the median are approximate upper bounds, with about 0.1% precision; minimum, maximum and mean use observed latencies. Memory depends on concurrency and may exceed exact mode for small tests. The report and JSON identify the method.
+For long tests, `--bounded-latency` uses fixed-size HDR histograms per active worker; scenarios use one per executed step as well as one for iteration duration. Percentiles and the median are approximate upper bounds, with about 0.1% precision; minimum, maximum and mean use observed latencies. Memory depends on concurrency and the number of steps, and may exceed exact mode for small tests. The report and JSON identify the method.
 
 A sample beyond the histogram's range (about 584 years) fails the run rather than being clipped.
 
@@ -121,6 +137,8 @@ A sample beyond the histogram's range (about 584 years) fails the run rather tha
 Use `--max-failure-rate 1 --max-p95-ms 250` to set a maximum failure percentage and p95 in milliseconds. Failure rate is `failed / completed * 100`; p95 includes failed requests. Values equal to the limits pass, and comparisons use unrounded values.
 
 If a configured threshold is exceeded or cannot be evaluated because no requests completed, Horde prints the report and exits with code 2. JSON includes the limits and results under `thresholds`. In bounded mode, the approximate p95 upper bound is compared with the limit, so a true p95 just below it may fail.
+
+For scenarios, `--max-failure-rate` applies to iterations and `--max-step-p95-ms` applies to every step. A step with no samples, including one skipped after an earlier failure, fails its p95 threshold. Scenario p95 thresholds use step latencies, including failed steps but excluding waits. JSON reports each step's observed value and result. `--max-p95-ms` applies only to single-URL tests.
 
 ## More work? Development
 

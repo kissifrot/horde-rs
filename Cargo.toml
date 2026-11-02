@@ -20,3 +20,5 @@ tower = { version = "0.5", features = ["util"] }
 hdrhistogram = { version = "7", default-features = false }
 serde = { version = "1", features = ["derive"] }
 jsonschema = { version = "0.60.2", default-features = false }
+scraper = { version = "0.29.0", default-features = false }
+serde_urlencoded = "0.7"

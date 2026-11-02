@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 lock = threading.Lock()
-auth_sessions = set()
+auth_sessions = {}
 tickets = set()
 site_sessions = set()
 
@@ -71,9 +71,10 @@ class Auth(Handler):
             self.respond(404, "Not found")
             return
         session = secrets.token_urlsafe(24)
+        csrf = secrets.token_urlsafe(24)
         with lock:
-            auth_sessions.add(session)
-        self.respond(200, '<form method="post" action="/authenticate"><input name="username"><input name="password" type="password"><button>Log in</button></form>', [("Set-Cookie", f"auth_session={session}; Path=/; HttpOnly; SameSite=Strict")])
+            auth_sessions[session] = csrf
+        self.respond(200, f'<form method="post" action="/authenticate"><input type="hidden" name="csrf" value="{csrf}"><input name="username"><input name="password" type="password"><button>Log in</button></form>', [("Set-Cookie", f"auth_session={session}; Path=/; HttpOnly; SameSite=Strict")])
 
     def do_POST(self):
         if urlsplit(self.path).path != "/authenticate":
@@ -90,9 +91,11 @@ class Auth(Handler):
         form = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
         username = form.get("username", [""])[0]
         password = form.get("password", [""])[0]
+        csrf = form.get("csrf", [""])[0]
         session = session_cookie(self, "auth_session")
         with lock:
-            valid_session = session in auth_sessions
+            expected_csrf = auth_sessions.get(session, "")
+            valid_session = bool(expected_csrf) and hmac.compare_digest(csrf.encode(), expected_csrf.encode())
         valid_credentials = hmac.compare_digest(username.encode(), b"grunt") and hmac.compare_digest(password.encode(), b"zugzug")
         if not valid_session or not valid_credentials:
             self.respond(401, "Invalid session or credentials")
