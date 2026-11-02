@@ -103,6 +103,12 @@ fn rejects_invalid_options() {
     for args in [
         vec!["-L", "--max-redirects", "0", "http://localhost/"],
         vec!["--max-redirects", "5", "http://localhost/"],
+        vec!["--rate", "0", "http://localhost/"],
+        vec!["--rate", "1000000001", "http://localhost/"],
+        vec!["--max-failure-rate", "101", "http://localhost/"],
+        vec!["--max-failure-rate", "NaN", "http://localhost/"],
+        vec!["--max-p95-ms", "-1", "http://localhost/"],
+        vec!["--max-p95-ms", "inf", "http://localhost/"],
     ] {
         assert!(
             !Command::new(env!("CARGO_BIN_EXE_horde"))
@@ -112,6 +118,148 @@ fn rejects_invalid_options() {
                 .status
                 .success()
         );
+    }
+}
+
+#[test]
+fn ci_thresholds_report_results_and_exit_status() {
+    for (failure_limit, p95_limit, success) in [
+        ("50", "10000", true),
+        ("49", "10000", false),
+        ("50", "0", false),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for status in ["200 OK", "500 Error"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+            .args([
+                "-n",
+                "2",
+                "--json",
+                "--max-failure-rate",
+                failure_limit,
+                "--max-p95-ms",
+                p95_limit,
+                &format!("http://{address}/"),
+            ])
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(output.status.success(), success);
+        if !success {
+            assert_eq!(output.status.code(), Some(2));
+        }
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["thresholds"]["failure_rate_percent"]["observed"],
+            50.0
+        );
+        assert_eq!(
+            report["thresholds"]["failure_rate_percent"]["passed"],
+            failure_limit == "50"
+        );
+        assert_eq!(report["thresholds"]["p95_ms"]["passed"], p95_limit != "0");
+    }
+}
+
+#[test]
+fn rate_is_shared_across_workers() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .args([
+            "-n",
+            "4",
+            "-c",
+            "4",
+            "--rate",
+            "5",
+            "--json",
+            &format!("http://{address}/"),
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["completed"], 4);
+    assert!(report["elapsed_seconds"].as_f64().unwrap() >= 0.55);
+}
+
+#[test]
+fn connection_reuse_can_be_disabled_and_connections_are_counted() {
+    use std::io::BufRead;
+    for reuse in [true, false] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = 0;
+            let mut connections = 0;
+            while requests < 2 {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                connections += 1;
+                let mut stream = std::io::BufReader::new(stream);
+                for _ in 0..if reuse { 2 } else { 1 } {
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        assert!(stream.read_line(&mut line).unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        request.push_str(&line);
+                    }
+                    assert_eq!(
+                        request.to_ascii_lowercase().contains("connection: close"),
+                        !reuse
+                    );
+                    write!(
+                        stream.get_mut(),
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .unwrap();
+                    requests += 1;
+                }
+            }
+            connections
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_horde"));
+        command.args(["-n", "2", "-c", "1", "--json"]);
+        if !reuse {
+            command.arg("--no-connection-reuse");
+        }
+        let output = command.arg(format!("http://{address}/")).output().unwrap();
+        let actual = server.join().unwrap();
+        assert!(output.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(actual, if reuse { 1 } else { 2 });
+        assert_eq!(report["connections_opened"], actual);
     }
 }
 
@@ -307,6 +455,7 @@ fn json_report_and_request_body_survive_redirect() {
     assert_eq!(report["completed"], 1);
     assert_eq!(report["failure_details"]["http"], 1);
     assert_eq!(report["redirects_followed"], 1);
+    assert_eq!(report["connections_opened"], 2);
     assert_eq!(report["status_codes"]["500"], 1);
 }
 

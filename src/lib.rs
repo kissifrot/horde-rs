@@ -1,11 +1,14 @@
 //! Local load generation and reporting, independent of the command-line interface.
 use bytes::Bytes;
 use futures_util::StreamExt;
-use reqwest::{Client, Method, Url, header::HeaderMap};
+use reqwest::{
+    Client, Method, Url,
+    header::{CONNECTION, HeaderMap, HeaderValue},
+};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -45,6 +48,10 @@ pub struct TestPlan {
     pub body: Option<Bytes>,
     /// Stop starting new requests after this duration; in-flight requests finish.
     pub duration: Option<Duration>,
+    /// Optional target rate for starting logical requests per second.
+    pub rate: Option<u32>,
+    /// Allow HTTP connections to be reused between requests.
+    pub reuse_connections: bool,
     /// Whether to follow HTTP redirects.
     pub follow_redirects: bool,
     /// Maximum redirects per request when following redirects; must be nonzero.
@@ -57,6 +64,8 @@ pub struct Report {
     pub elapsed: Duration,
     pub completed: usize,
     pub failed: usize,
+    /// Connections successfully established by the HTTP connector during the run.
+    pub connections_opened: usize,
     pub http_failures: usize,
     pub timeout_failures: usize,
     pub connection_failures: usize,
@@ -132,12 +141,18 @@ impl LatencyStats {
 }
 
 /// Run a plan locally. No listener or remote execution capability is started.
-pub async fn run(plan: TestPlan) -> Result<Report, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error + Send + Sync>> {
     if plan.requests == 0 || plan.concurrency == 0 || plan.timeout.is_zero() {
         return Err("requests, concurrency and timeout must be greater than zero".into());
     }
     if plan.duration.is_some_and(|duration| duration.is_zero()) {
         return Err("duration must be greater than zero".into());
+    }
+    if plan
+        .rate
+        .is_some_and(|rate| !(1..=1_000_000_000).contains(&rate))
+    {
+        return Err("rate must be between 1 and 1000000000 requests per second".into());
     }
     if plan.follow_redirects && plan.max_redirects == 0 {
         return Err("max redirects must be greater than zero when following redirects".into());
@@ -146,6 +161,7 @@ pub async fn run(plan: TestPlan) -> Result<Report, Box<dyn std::error::Error + S
         return Err("URL must use http or https".into());
     }
     let redirects_followed = Arc::new(AtomicUsize::new(0));
+    let connections_opened = Arc::new(AtomicUsize::new(0));
     let redirect_limit_failures = Arc::new(AtomicUsize::new(0));
     let redirect_policy = if plan.follow_redirects {
         let followed = Arc::clone(&redirects_followed);
@@ -164,16 +180,34 @@ pub async fn run(plan: TestPlan) -> Result<Report, Box<dyn std::error::Error + S
     } else {
         reqwest::redirect::Policy::none()
     };
-    let client = Client::builder()
+    if !plan.reuse_connections {
+        plan.headers
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
+    let connection_counter = Arc::clone(&connections_opened);
+    let mut builder = Client::builder()
         .user_agent(concat!("Horde/", env!("CARGO_PKG_VERSION")))
         .timeout(plan.timeout)
         .redirect(redirect_policy)
-        .build()?;
+        .connector_layer(tower::util::MapResponseLayer::new(move |connection| {
+            connection_counter.fetch_add(1, Ordering::Relaxed);
+            connection
+        }));
+    if !plan.reuse_connections {
+        builder = builder.pool_max_idle_per_host(0);
+    }
+    let client = builder.build()?;
     let next = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
+    let next_start = Arc::new(Mutex::new(start));
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..plan.concurrency.min(plan.requests) {
-        let (client, plan, next) = (client.clone(), plan.clone(), Arc::clone(&next));
+        let (client, plan, next, next_start) = (
+            client.clone(),
+            plan.clone(),
+            Arc::clone(&next),
+            Arc::clone(&next_start),
+        );
         workers.spawn(async move {
             let mut results = Vec::new();
             loop {
@@ -191,6 +225,27 @@ pub async fn run(plan: TestPlan) -> Result<Report, Box<dyn std::error::Error + S
                     .is_err()
                 {
                     break;
+                }
+                if let Some(rate) = plan.rate {
+                    let scheduled = {
+                        let mut next_time = next_start.lock().unwrap();
+                        let scheduled = (*next_time).max(Instant::now());
+                        *next_time = scheduled + Duration::from_secs_f64(1.0 / f64::from(rate));
+                        scheduled
+                    };
+                    if plan
+                        .duration
+                        .is_some_and(|duration| scheduled.duration_since(start) >= duration)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep_until(scheduled.into()).await;
+                    if plan
+                        .duration
+                        .is_some_and(|duration| start.elapsed() >= duration)
+                    {
+                        break;
+                    }
                 }
                 let started = Instant::now();
                 let mut bytes = 0u64;
@@ -253,6 +308,7 @@ pub async fn run(plan: TestPlan) -> Result<Report, Box<dyn std::error::Error + S
         elapsed: Duration::ZERO,
         completed: 0,
         failed: 0,
+        connections_opened: 0,
         http_failures: 0,
         timeout_failures: 0,
         connection_failures: 0,
@@ -284,6 +340,7 @@ pub async fn run(plan: TestPlan) -> Result<Report, Box<dyn std::error::Error + S
     report.elapsed = start.elapsed();
     report.redirects_followed = redirects_followed.load(Ordering::Relaxed);
     report.redirect_limit_failures = redirect_limit_failures.load(Ordering::Relaxed);
+    report.connections_opened = connections_opened.load(Ordering::Relaxed);
     Ok(report)
 }
 
@@ -296,6 +353,7 @@ mod tests {
             elapsed: Duration::ZERO,
             completed: 3,
             failed: 0,
+            connections_opened: 0,
             http_failures: 0,
             timeout_failures: 0,
             connection_failures: 0,
@@ -339,6 +397,8 @@ mod tests {
             headers: HeaderMap::new(),
             body: None,
             duration: None,
+            rate: None,
+            reuse_connections: true,
             follow_redirects: false,
             max_redirects: 10,
         };

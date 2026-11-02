@@ -305,6 +305,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]
