@@ -96,16 +96,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         max_redirects: args.max_redirects.map_or(10, NonZeroUsize::get),
     })
     .await?;
+    let stats = report.latency_stats();
     if args.json {
-        let percentiles: std::collections::BTreeMap<String, Option<f64>> = [50, 90, 95, 99, 100]
-            .into_iter()
-            .map(|p| {
-                (
-                    format!("p{p}"),
-                    report.percentile(p).map(|d| d.as_secs_f64() * 1000.0),
-                )
-            })
-            .collect();
+        let mut percentiles: std::collections::BTreeMap<String, Option<f64>> =
+            [50, 90, 95, 99, 100]
+                .into_iter()
+                .map(|p| {
+                    (
+                        format!("p{p}"),
+                        stats
+                            .as_ref()
+                            .and_then(|s| s.percentile(p))
+                            .map(|d| d.as_secs_f64() * 1000.0),
+                    )
+                })
+                .collect();
+        percentiles.insert(
+            "min".into(),
+            stats.as_ref().map(|s| s.min().as_secs_f64() * 1000.0),
+        );
+        percentiles.insert("mean".into(), stats.as_ref().map(|s| s.mean_ms));
+        percentiles.insert(
+            "median".into(),
+            stats.as_ref().map(|s| s.median().as_secs_f64() * 1000.0),
+        );
+        percentiles.insert(
+            "max".into(),
+            stats.as_ref().map(|s| s.max().as_secs_f64() * 1000.0),
+        );
         let json = serde_json::json!({
             "schema_version": 1,
             "completed": report.completed,
@@ -150,9 +168,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             println!("  {code}: {count}");
         }
     }
-    println!("Ready for action: latency percentiles");
+    println!("Ready for action: latency statistics");
+    if let Some(stats) = &stats {
+        for (label, value) in [
+            ("Latency min:", stats.min().as_secs_f64() * 1000.0),
+            ("Latency mean:", stats.mean_ms),
+            ("Latency median:", stats.median().as_secs_f64() * 1000.0),
+            ("Latency max:", stats.max().as_secs_f64() * 1000.0),
+        ] {
+            println!("{label:<25}{value:.2} ms");
+        }
+    }
     for p in [50, 90, 95, 99, 100] {
-        if let Some(latency) = report.percentile(p) {
+        if let Some(latency) = stats.as_ref().and_then(|s| s.percentile(p)) {
             println!(
                 "{:<25}{:.2} ms",
                 format!("Latency p{p}:"),

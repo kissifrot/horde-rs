@@ -73,6 +73,18 @@ pub struct Report {
 }
 
 impl Report {
+    /// Calculate latency statistics, sorting the samples once.
+    pub fn latency_stats(&self) -> Option<LatencyStats> {
+        if self.latencies.is_empty() {
+            return None;
+        }
+        let mut sorted = self.latencies.clone();
+        sorted.sort_unstable();
+        let mean_ms =
+            sorted.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>() / sorted.len() as f64;
+        Some(LatencyStats { sorted, mean_ms })
+    }
+
     /// Nearest-rank percentile, with ranks starting at one.
     pub fn percentile(&self, percentile: u32) -> Option<Duration> {
         if self.latencies.is_empty() || !(1..=100).contains(&percentile) {
@@ -82,6 +94,40 @@ impl Report {
         sorted.sort_unstable();
         let rank = (sorted.len() as u128 * u128::from(percentile)).div_ceil(100) as usize;
         Some(sorted[rank - 1])
+    }
+}
+
+/// Summary of the complete request latencies, including failed requests.
+pub struct LatencyStats {
+    sorted: Vec<Duration>,
+    /// Arithmetic mean in milliseconds.
+    pub mean_ms: f64,
+}
+
+impl LatencyStats {
+    pub fn min(&self) -> Duration {
+        self.sorted[0]
+    }
+    pub fn max(&self) -> Duration {
+        self.sorted[self.sorted.len() - 1]
+    }
+    /// Median; for an even sample count, the midpoint of the two middle values.
+    pub fn median(&self) -> Duration {
+        let middle = self.sorted.len() / 2;
+        if self.sorted.len().is_multiple_of(2) {
+            let lower = self.sorted[middle - 1];
+            lower + (self.sorted[middle] - lower) / 2
+        } else {
+            self.sorted[middle]
+        }
+    }
+    /// Nearest-rank percentile.
+    pub fn percentile(&self, percentile: u32) -> Option<Duration> {
+        if !(1..=100).contains(&percentile) {
+            return None;
+        }
+        let rank = (self.sorted.len() as u128 * u128::from(percentile)).div_ceil(100) as usize;
+        Some(self.sorted[rank - 1])
     }
 }
 
@@ -246,7 +292,7 @@ mod tests {
     use super::*;
     #[test]
     fn nearest_rank_percentiles() {
-        let report = Report {
+        let mut report = Report {
             elapsed: Duration::ZERO,
             completed: 3,
             failed: 0,
@@ -268,6 +314,19 @@ mod tests {
         assert_eq!(report.percentile(50), Some(Duration::from_millis(20)));
         assert_eq!(report.percentile(99), Some(Duration::from_millis(30)));
         assert_eq!(report.percentile(0), None);
+        let stats = report.latency_stats().unwrap();
+        assert_eq!(stats.min(), Duration::from_millis(10));
+        assert_eq!(stats.max(), Duration::from_millis(30));
+        assert_eq!(stats.median(), Duration::from_millis(20));
+        assert_eq!(stats.mean_ms, 20.0);
+        assert_eq!(stats.percentile(99), report.percentile(99));
+        report.latencies.push(Duration::from_millis(40));
+        assert_eq!(
+            report.latency_stats().unwrap().median(),
+            Duration::from_millis(25)
+        );
+        report.latencies.clear();
+        assert!(report.latency_stats().is_none());
     }
     #[tokio::test]
     async fn rejects_zero_requests() {
