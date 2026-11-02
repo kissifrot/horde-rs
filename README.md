@@ -66,7 +66,7 @@ horde --scenario examples/journey.json -n 100 -c 10 --json
 
 Scenarios must declare `"version": 1` and are validated against the bundled [version 1 JSON Schema](schemas/scenario-v1.schema.json) before execution. The optional `$schema` field helps compatible editors find the schema; Horde uses its bundled copy and does not fetch the URI. Horde also validates semantics that JSON Schema cannot express here, including unique step names, variable references, HTTP methods and the expanded URLs.
 
-Here `-n` is the total number of scenario iterations and `-c` is the maximum number of virtual users. Each user has its own cookie jar, retained across its iterations. Each step has a unique `name`, an absolute HTTP(S) `url`, an optional `method` (default `GET`), `headers`, string `body`, and `wait_ms` before the step. A failed request or 4xx/5xx stops that iteration; later steps are skipped. Redirects are not followed. The report shows completed and failed iterations and per-step counts and mean latency; iteration duration includes waits. The per-request `-t` timeout, `--json` and `-v` are supported; other single-URL options are rejected in scenario mode. Individual failures do not change the exit code.
+Here `-n` is the total number of scenario iterations and `-c` is the maximum number of virtual users. Each user has its own cookie jar, retained across its iterations. Each step has a unique `name`, an absolute HTTP(S) `url`, an optional `method` (default `GET`), `headers`, string `body`, and `wait_ms` before the step. A failed request or 4xx/5xx stops that iteration; later steps are skipped. Redirects are not followed unless `-L` is set; `--max-redirects` sets the per-step limit, and exceeding it fails the step. The report shows completed and failed iterations and per-step counts and mean latency; iteration duration includes waits. The per-request `-t` timeout, `--json` and `-v` are supported; other single-URL options are rejected in scenario mode. Individual failures do not change the exit code.
 
 With `-v`, stderr shows each user's scenario start, waits, step results and final outcome with relative timestamps. URLs, headers, bodies, cookies and variable values are omitted; step names are shown. JSON remains on stdout. Logging can affect timing and throughput.
 
@@ -79,7 +79,16 @@ python3 examples/login_server.py
 ./target/release/horde --scenario examples/login.json -n 10 -c 2 -v
 ```
 
-The example opens a form, submits demo credentials and accesses a protected page using the session cookie. The server listens only on loopback and is for demonstration, not production. The form body uses literal substitution: URL-encode special characters in values yourself. Real login flows that require CSRF tokens or redirects need additional scenario features not yet implemented.
+The example opens a form, submits demo credentials and accesses a protected page using the session cookie. The server listens only on loopback and is for demonstration, not production. The form body uses literal substitution: URL-encode special characters in values yourself. Real login flows that require CSRF tokens need additional scenario features not yet implemented.
+
+For a redirect between a site and a separate authentication service, use the two-service demo:
+
+```sh
+python3 examples/federated_login_server.py
+./target/release/horde --scenario examples/federated-login.json -n 10 -c 2 -L -v
+```
+
+The services use different loopback hostnames to demonstrate separate cookies. They use demo credentials and a simplified one-time ticket; this is not an OAuth or OpenID Connect implementation. `-L` is required to follow the redirects.
 
 ### Connections and redirects
 

@@ -1,5 +1,5 @@
 use clap::Parser;
-use horde_rs::scenario::{Counts, Scenario, run_scenario_with_options};
+use horde_rs::scenario::{Counts, Scenario, run_scenario_with_redirects};
 use horde_rs::{LatencyStats, TestPlan, run};
 use reqwest::{
     Method, Url,
@@ -25,7 +25,7 @@ struct Args {
     #[arg(required_unless_present = "scenario", conflicts_with = "scenario")]
     url: Option<Url>,
     /// Run a JSON scenario instead of testing a single URL.
-    #[arg(long, conflicts_with_all = ["method", "headers", "user_agent", "body_file", "duration", "rate", "bounded_latency", "no_connection_reuse", "max_failure_rate", "max_p95_ms", "follow_redirects", "max_redirects"])]
+    #[arg(long, conflicts_with_all = ["method", "headers", "user_agent", "body_file", "duration", "rate", "bounded_latency", "no_connection_reuse", "max_failure_rate", "max_p95_ms"])]
     scenario: Option<PathBuf>,
     /// Total number of requests.
     #[arg(short = 'n', long)]
@@ -94,12 +94,14 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
     }
     if let Some(path) = &args.scenario {
         let scenario = Scenario::from_json(&std::fs::read(path)?)?;
-        let report = run_scenario_with_options(
+        let report = run_scenario_with_redirects(
             scenario,
             args.requests.unwrap_or(1),
             args.concurrency,
             Duration::from_secs(args.timeout),
             args.verbose,
+            args.follow_redirects
+                .then(|| args.max_redirects.map_or(10, NonZeroUsize::get)),
         )
         .await?;
         fn mean(count: &Counts) -> Option<f64> {

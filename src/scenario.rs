@@ -191,8 +191,23 @@ pub async fn run_scenario_with_options(
     timeout: Duration,
     verbose: bool,
 ) -> Result<ScenarioReport, RunError> {
+    run_scenario_with_redirects(scenario, iterations, users, timeout, verbose, None).await
+}
+
+/// Run a scenario with an optional maximum number of redirects per step.
+pub async fn run_scenario_with_redirects(
+    scenario: Scenario,
+    iterations: usize,
+    users: usize,
+    timeout: Duration,
+    verbose: bool,
+    max_redirects: Option<usize>,
+) -> Result<ScenarioReport, RunError> {
     if iterations == 0 || users == 0 || timeout.is_zero() {
         return Err("iterations, users and timeout must be greater than zero".into());
+    }
+    if max_redirects == Some(0) {
+        return Err("max redirects must be greater than zero".into());
     }
     let scenario = Arc::new(scenario);
     let next = Arc::new(AtomicUsize::new(0));
@@ -205,7 +220,10 @@ pub async fn run_scenario_with_options(
             .cookie_store(true)
             .timeout(timeout)
             .user_agent(concat!("Horde/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(match max_redirects {
+                Some(limit) => reqwest::redirect::Policy::limited(limit),
+                None => reqwest::redirect::Policy::none(),
+            })
             .build()?;
         tasks.spawn(async move {
             let mut totals = Counts::default();
@@ -245,6 +263,7 @@ pub async fn run_scenario_with_options(
                     let mut timeout_error = false;
                     let mut connection_error = false;
                     let mut body_error = false;
+                    let mut redirect_error = false;
                     let mut other_error = false;
                     let failed = match request.send().await {
                         Ok(response) => {
@@ -263,7 +282,8 @@ pub async fn run_scenario_with_options(
                         Err(error) => {
                             timeout_error = error.is_timeout();
                             connection_error = error.is_connect();
-                            other_error = !timeout_error && !connection_error;
+                            redirect_error = error.is_redirect();
+                            other_error = !timeout_error && !connection_error && !redirect_error;
                             true
                         },
                     };
@@ -276,7 +296,7 @@ pub async fn run_scenario_with_options(
                         if failed {
                             let _ = write!(stderr, " errors=");
                             let mut separator = "";
-                            for (_, label) in [(http_error, "http"), (timeout_error, "timeout"), (connection_error, "connection"), (body_error, "body"), (other_error, "other")].into_iter().filter(|(active, _)| *active) {
+                            for (_, label) in [(http_error, "http"), (timeout_error, "timeout"), (connection_error, "connection"), (body_error, "body"), (redirect_error, "redirect"), (other_error, "other")].into_iter().filter(|(active, _)| *active) {
                                 let _ = write!(stderr, "{separator}{label}");
                                 separator = ",";
                             }

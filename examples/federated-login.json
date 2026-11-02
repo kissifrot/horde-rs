@@ -1,0 +1,32 @@
+{
+  "$schema": "../schemas/scenario-v1.schema.json",
+  "version": 1,
+  "name": "Sign in via an authentication service",
+  "variables": {
+    "site_url": "http://localhost:8081",
+    "auth_url": "http://127.0.0.1:8082",
+    "username": "grunt",
+    "password": "zugzug"
+  },
+  "steps": [
+    {
+      "name": "Open sign-in page",
+      "url": "{{site_url}}/login"
+    },
+    {
+      "name": "Submit credentials",
+      "url": "{{auth_url}}/authenticate",
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body": "username={{username}}&password={{password}}",
+      "wait_ms": 300
+    },
+    {
+      "name": "Continue on the site",
+      "url": "{{site_url}}/protected",
+      "wait_ms": 300
+    }
+  ]
+}
