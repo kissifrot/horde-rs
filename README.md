@@ -91,6 +91,8 @@ Each user has its own cookie jar, retained across its iterations. Each step has 
 
 With `-v`, stderr shows each user's scenario start, waits, step results and final outcome with relative timestamps. URLs, headers, bodies, cookies and variable values are omitted; step names are shown. JSON remains on stdout. Logging can affect timing and throughput.
 
+Invalid scenario files are rejected before the run. Errors identify the file and, when available, a JSON path or step and field; JSON syntax errors include a line and column. With `-v`, variable preparation and extraction failures also identify the affected field or extraction variable and a reason without printing its value or the response body. File paths, step names, field names and variable names may appear in diagnostics and must not contain secrets.
+
 Define values under `variables` and refer to them as `{{name}}` in step URLs, header values and bodies. Values can be literal strings or explicitly loaded from the process environment:
 
 ```json

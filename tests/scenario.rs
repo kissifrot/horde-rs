@@ -816,6 +816,8 @@ fn extracted_values_do_not_leak_into_the_next_iteration() {
     assert_eq!(report["steps"][1]["completed"], 1);
     let log = String::from_utf8_lossy(&output.stderr);
     assert!(log.contains("errors=extraction"), "{log}");
+    assert!(log.contains("extraction_variable=\"token\""), "{log}");
+    assert!(log.contains("response header missing"), "{log}");
     assert_eq!(report["steps"][0]["failure_details"]["extraction"], 1);
     assert!(!log.contains("first"), "{log}");
 }
@@ -843,7 +845,7 @@ fn invalid_dynamic_url_counts_as_variable_failure_without_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .arg("--scenario")
         .arg(&path)
-        .arg("--json")
+        .args(["--json", "-v"])
         .output()
         .unwrap();
     std::fs::remove_file(path).unwrap();
@@ -853,6 +855,12 @@ fn invalid_dynamic_url_counts_as_variable_failure_without_status() {
     assert_eq!(report["steps"][1]["failure_details"]["variable"], 1);
     assert_eq!(report["steps"][1]["status_codes"], serde_json::json!({}));
     assert!(report["steps"][1]["latency_ms"]["p95"].as_f64().is_some());
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        log.contains("field=url") && log.contains("expanded URL"),
+        "{log}"
+    );
+    assert!(!log.contains("not-a-url"), "{log}");
 }
 
 #[test]
@@ -988,5 +996,8 @@ fn extraction_accepts_limit_and_rejects_larger_bodies() {
             String::from_utf8_lossy(&output.stderr).contains("errors=extraction"),
             expected_failure
         );
+        if expected_failure {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("2 MiB extraction limit"));
+        }
     }
 }

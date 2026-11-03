@@ -13,6 +13,22 @@ use std::{
     time::Duration,
 };
 
+struct ScenarioDiagnostic(String);
+
+impl std::fmt::Display for ScenarioDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Debug for ScenarioDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl Error for ScenarioDiagnostic {}
+
 /// For the Horde! Run an HTTP load test from this machine.
 #[derive(Parser)]
 #[command(
@@ -105,7 +121,11 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         return Err("max step p95 must be a finite, non-negative number of milliseconds".into());
     }
     if let Some(path) = &args.scenario {
-        let scenario = Scenario::from_json(&std::fs::read(path)?)?;
+        let input = std::fs::read(path).map_err(|error| {
+            ScenarioDiagnostic(format!("cannot read scenario {}: {error}", path.display()))
+        })?;
+        let scenario = Scenario::from_json(&input)
+            .map_err(|error| ScenarioDiagnostic(format!("scenario {}: {error}", path.display())))?;
         let mut report = run_scenario_config(
             scenario,
             args.requests.unwrap_or(if args.duration.is_some() {

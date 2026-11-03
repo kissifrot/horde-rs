@@ -18,6 +18,73 @@ use std::{
 
 type RunError = Box<dyn Error + Send + Sync>;
 
+fn json_syntax_reason(error: &serde_json::Error) -> &'static str {
+    if error.is_eof() {
+        return "unexpected end of input";
+    }
+    let message = error.to_string();
+    for (prefix, reason) in [
+        ("expected value", "expected a JSON value"),
+        ("expected `:`", "expected ':' after an object key"),
+        ("expected `,` or `]`", "expected ',' or ']' in an array"),
+        ("expected `,` or `}`", "expected ',' or '}' in an object"),
+        ("key must be a string", "object keys must be strings"),
+        ("trailing comma", "trailing commas are not allowed"),
+        (
+            "trailing characters",
+            "unexpected characters after the JSON document",
+        ),
+        ("invalid escape", "invalid string escape"),
+    ] {
+        if message.starts_with(prefix) {
+            return reason;
+        }
+    }
+    "invalid JSON syntax"
+}
+
+fn schema_error(
+    error: &jsonschema::ValidationError<'_>,
+    document: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> String {
+    use jsonschema::error::ValidationErrorKind as Kind;
+    let path = error.instance_path().to_string();
+    let location = if path.is_empty() { "/" } else { &path };
+    let reason = match error.kind() {
+        Kind::AdditionalProperties { unexpected } => format!("unexpected field(s): {unexpected:?}"),
+        Kind::Required { property } => format!("missing required field {}", property.as_str().unwrap_or("<unknown>")),
+        Kind::Type { .. } => {
+            let expected = schema.pointer(&error.schema_path().to_string());
+            let expected = match expected {
+                Some(serde_json::Value::String(value)) => value.clone(),
+                Some(serde_json::Value::Array(values)) => values.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>().join(" or "),
+                _ => "the type required by the schema".to_owned(),
+            };
+            format!("incorrect type; expected {expected}")
+        }
+        Kind::OneOfNotValid { .. } if path.starts_with("/variables/") => "expected a string or an object containing only a valid environment variable name in 'env'".to_owned(),
+        Kind::OneOfNotValid { .. } if path.contains("/extract/") => {
+            match document.pointer(&path).and_then(|value| value.get("from")).and_then(serde_json::Value::as_str) {
+                Some("header") => "header extraction requires only 'from' and 'name'",
+                Some("json") => "JSON extraction requires only 'from' and 'pointer'",
+                Some("html") => "HTML extraction requires only 'from', 'selector' and 'attribute'",
+                _ => "extraction requires 'from' set to 'header', 'json' or 'html' and its required fields",
+            }.to_owned()
+        }
+        Kind::Not { .. } => "choose only one of 'body', 'form' or 'json_body'".to_owned(),
+        Kind::PropertyNames { .. } => "invalid field name".to_owned(),
+        Kind::Pattern { .. } => "value does not match the required format".to_owned(),
+        Kind::MinLength { .. } => "value must not be empty".to_owned(),
+        Kind::MinItems { .. } => "array must not be empty".to_owned(),
+        Kind::MinProperties { .. } => "object must not be empty".to_owned(),
+        Kind::Minimum { .. } | Kind::Maximum { .. } => "number is outside the permitted range".to_owned(),
+        Kind::UniqueItems => "array items must be unique".to_owned(),
+        _ => "value does not satisfy the scenario schema".to_owned(),
+    };
+    format!("invalid scenario at {location}: {reason}")
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScenarioFile {
@@ -433,45 +500,100 @@ fn validate_url(value: &str) -> Result<Url, RunError> {
     Ok(url)
 }
 
+#[derive(Debug)]
+struct PrepareError {
+    field: &'static str,
+    reason: &'static str,
+}
+
 impl Step {
     fn prepare(
         &self,
         variables: &BTreeMap<String, String>,
-    ) -> Result<(Url, HeaderMap, Option<Bytes>), RunError> {
+    ) -> Result<(Url, HeaderMap, Option<Bytes>), PrepareError> {
         let url = match &self.dynamic_url {
-            Some(template) => validate_url(&template.render(variables)?)?,
+            Some(template) => {
+                let rendered = template.render(variables).map_err(|_| PrepareError {
+                    field: "url",
+                    reason: "variable unavailable",
+                })?;
+                validate_url(&rendered).map_err(|_| PrepareError {
+                    field: "url",
+                    reason: "expanded URL must be absolute HTTP or HTTPS",
+                })?
+            }
             None => self.url.clone().expect("validated static URL"),
         };
         let mut headers = self.headers.clone();
         for (name, template) in &self.dynamic_headers {
             headers.insert(
                 name.clone(),
-                HeaderValue::from_str(&template.render(variables)?)?,
+                HeaderValue::from_str(&template.render(variables).map_err(|_| PrepareError {
+                    field: "headers",
+                    reason: "variable unavailable",
+                })?)
+                .map_err(|_| PrepareError {
+                    field: "headers",
+                    reason: "expanded header value is invalid",
+                })?,
             );
         }
         let body = match (&self.form, &self.json_body, &self.dynamic_body) {
-            (Some(fields), _, _) => Some(render_form(fields, variables)?),
-            (_, Some(json), _) => Some(Bytes::from(serde_json::to_vec(&json.render(variables)?)?)),
-            (_, _, Some(template)) => Some(Bytes::from(template.render(variables)?)),
+            (Some(fields), _, _) => {
+                Some(render_form(fields, variables).map_err(|_| PrepareError {
+                    field: "form",
+                    reason: "could not render form variables",
+                })?)
+            }
+            (_, Some(json), _) => {
+                let value = json.render(variables).map_err(|_| PrepareError {
+                    field: "json_body",
+                    reason: "could not render JSON variables",
+                })?;
+                Some(Bytes::from(serde_json::to_vec(&value).map_err(|_| {
+                    PrepareError {
+                        field: "json_body",
+                        reason: "could not encode JSON body",
+                    }
+                })?))
+            }
+            (_, _, Some(template)) => {
+                Some(Bytes::from(template.render(variables).map_err(|_| {
+                    PrepareError {
+                        field: "body",
+                        reason: "variable unavailable",
+                    }
+                })?))
+            }
             _ => self.body.clone(),
         };
         Ok((url, headers, body))
     }
 }
 
-fn extract_values(
-    sources: &BTreeMap<String, Extract>,
+#[derive(Debug)]
+struct ExtractionError<'a> {
+    variable: Option<&'a str>,
+    reason: &'static str,
+}
+
+fn extract_values<'a>(
+    sources: &'a BTreeMap<String, Extract>,
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<BTreeMap<String, String>, RunError> {
+) -> Result<BTreeMap<String, String>, ExtractionError<'a>> {
     let mut result = BTreeMap::new();
     let json = if sources
         .values()
         .any(|source| matches!(source, Extract::Json(_)))
     {
         Some(
-            serde_json::from_slice::<serde_json::Value>(body)
-                .map_err(|_| "response is not valid JSON")?,
+            serde_json::from_slice::<serde_json::Value>(body).map_err(|_| ExtractionError {
+                variable: sources.iter().find_map(|(name, source)| {
+                    matches!(source, Extract::Json(_)).then_some(name.as_str())
+                }),
+                reason: "response is not valid JSON",
+            })?,
         )
     } else {
         None
@@ -481,7 +603,12 @@ fn extract_values(
         .any(|source| matches!(source, Extract::Html { .. }))
     {
         Some(scraper::Html::parse_document(
-            std::str::from_utf8(body).map_err(|_| "HTML is not UTF-8")?,
+            std::str::from_utf8(body).map_err(|_| ExtractionError {
+                variable: sources.iter().find_map(|(name, source)| {
+                    matches!(source, Extract::Html { .. }).then_some(name.as_str())
+                }),
+                reason: "HTML is not UTF-8",
+            })?,
         ))
     } else {
         None
@@ -490,24 +617,38 @@ fn extract_values(
         let value = match source {
             Extract::Header(header) => headers
                 .get(header)
-                .ok_or("response header missing")?
+                .ok_or(ExtractionError {
+                    variable: Some(name),
+                    reason: "response header missing",
+                })?
                 .to_str()
-                .map_err(|_| "response header is not text")?,
+                .map_err(|_| ExtractionError {
+                    variable: Some(name),
+                    reason: "response header is not text",
+                })?,
             Extract::Json(pointer) => json
                 .as_ref()
                 .and_then(|value| value.pointer(pointer))
                 .and_then(|value| value.as_str())
-                .ok_or("JSON pointer does not identify a string")?,
+                .ok_or(ExtractionError {
+                    variable: Some(name),
+                    reason: "JSON pointer does not identify a string",
+                })?,
             Extract::Html {
                 selector,
                 attribute,
             } => {
-                let selector =
-                    scraper::Selector::parse(selector).map_err(|_| "invalid HTML selector")?;
+                let selector = scraper::Selector::parse(selector).map_err(|_| ExtractionError {
+                    variable: Some(name),
+                    reason: "invalid HTML selector",
+                })?;
                 html.as_ref()
                     .and_then(|document| document.select(&selector).next())
                     .and_then(|element| element.value().attr(attribute))
-                    .ok_or("HTML attribute missing")?
+                    .ok_or(ExtractionError {
+                        variable: Some(name),
+                        reason: "HTML element or attribute missing",
+                    })?
             }
         };
         result.insert(name.clone(), value.to_owned());
@@ -518,7 +659,14 @@ fn extract_values(
 impl Scenario {
     /// Parse and validate a JSON scenario, resolving declared environment variables before requests.
     pub fn from_json(input: &[u8]) -> Result<Self, RunError> {
-        let document: serde_json::Value = serde_json::from_slice(input)?;
+        let document: serde_json::Value = serde_json::from_slice(input).map_err(|error| {
+            format!(
+                "invalid JSON at line {}, column {}: {}",
+                error.line(),
+                error.column(),
+                json_syntax_reason(&error)
+            )
+        })?;
         match document.get("version").and_then(serde_json::Value::as_u64) {
             Some(1) => {}
             Some(version) => {
@@ -528,16 +676,21 @@ impl Scenario {
             }
             None => return Err("scenario version must be the integer 1".into()),
         }
+        static SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+        let schema = SCHEMA.get_or_init(|| {
+            serde_json::from_str(include_str!("../schemas/scenario-v1.schema.json"))
+                .expect("embedded scenario schema is valid JSON")
+        });
         static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
         let validator = VALIDATOR.get_or_init(|| {
-            let schema = serde_json::from_str(include_str!("../schemas/scenario-v1.schema.json"))
-                .expect("embedded scenario schema is valid JSON");
-            jsonschema::validator_for(&schema).expect("embedded scenario schema is valid")
+            jsonschema::validator_for(schema).expect("embedded scenario schema is valid")
         });
         validator
             .validate(&document)
-            .map_err(|error| format!("invalid scenario at {}: {error}", error.instance_path()))?;
-        let file: ScenarioFile = serde_json::from_slice(input)?;
+            .map_err(|error| schema_error(&error, &document, schema))?;
+        let file: ScenarioFile = serde_json::from_slice(input).map_err(|error| {
+            format!("scenario contains a value with an unsupported representation at line {}, column {}", error.line(), error.column())
+        })?;
         debug_assert_eq!(file.version, 1);
         if file.name.trim().is_empty() || file.steps.is_empty() {
             return Err("scenario name and steps must not be empty".into());
@@ -554,10 +707,16 @@ impl Scenario {
                     VariableFile::Environment(source) => {
                         std::env::var(&source.env).map_err(|error| match error {
                             std::env::VarError::NotPresent => {
-                                format!("environment variable {} is not set", source.env)
+                                format!(
+                                    "variable {name:?}: environment variable {} is not set",
+                                    source.env
+                                )
                             }
                             std::env::VarError::NotUnicode(_) => {
-                                format!("environment variable {} is not valid UTF-8", source.env)
+                                format!(
+                                    "variable {name:?}: environment variable {} is not valid UTF-8",
+                                    source.env
+                                )
                             }
                         })?
                     }
@@ -568,36 +727,52 @@ impl Scenario {
         let mut names = std::collections::HashSet::new();
         let mut available = std::collections::HashSet::new();
         let mut steps = Vec::with_capacity(file.steps.len());
-        for step in file.steps {
+        for (index, step) in file.steps.into_iter().enumerate() {
+            let context = |field: &str, reason: &str| {
+                format!(
+                    "step {} {:?}, field {field:?}: {reason}",
+                    index + 1,
+                    step.name
+                )
+            };
             if step.name.trim().is_empty() || !names.insert(step.name.clone()) {
-                return Err("step names must be nonempty and unique".into());
+                return Err(context("name", "step names must be nonempty and unique").into());
             }
-            let url_template = Template::compile(&step.url, &variables, &available)?;
+            let url_template = Template::compile(&step.url, &variables, &available)
+                .map_err(|error| context("url", &error.to_string()))?;
             let (url, dynamic_url) = if url_template.dynamic {
                 (None, Some(url_template))
             } else {
                 (
-                    Some(validate_url(&url_template.render(&BTreeMap::new())?)?),
+                    Some(
+                        validate_url(&url_template.render(&BTreeMap::new())?).map_err(|_| {
+                            context("url", "expected an absolute HTTP or HTTPS URL")
+                        })?,
+                    ),
                     None,
                 )
             };
             let mut headers = HeaderMap::new();
             let mut dynamic_headers = Vec::new();
             for (key, value) in step.headers {
-                let key = HeaderName::from_bytes(key.as_bytes())?;
-                let value = Template::compile(&value, &variables, &available)?;
+                let key = HeaderName::from_bytes(key.as_bytes())
+                    .map_err(|_| context("headers", "invalid header name"))?;
+                let value = Template::compile(&value, &variables, &available)
+                    .map_err(|error| context("headers", &error.to_string()))?;
                 if value.dynamic {
                     dynamic_headers.push((key, value));
                 } else {
                     headers.insert(
                         key,
-                        HeaderValue::from_str(&value.render(&BTreeMap::new())?)?,
+                        HeaderValue::from_str(&value.render(&BTreeMap::new())?)
+                            .map_err(|_| context("headers", "invalid header value"))?,
                     );
                 }
             }
             let (mut body, dynamic_body) = match step.body {
                 Some(value) => {
-                    let template = Template::compile(&value, &variables, &available)?;
+                    let template = Template::compile(&value, &variables, &available)
+                        .map_err(|error| context("body", &error.to_string()))?;
                     if template.dynamic {
                         (None, Some(template))
                     } else {
@@ -613,7 +788,11 @@ impl Scenario {
                 let fields: Vec<_> = fields
                     .into_iter()
                     .map(|(name, value)| {
-                        Ok((name, Template::compile(&value, &variables, &available)?))
+                        Ok((
+                            name,
+                            Template::compile(&value, &variables, &available)
+                                .map_err(|error| context("form", &error.to_string()))?,
+                        ))
                     })
                     .collect::<Result<_, RunError>>()?;
                 default_content_type = Some("application/x-www-form-urlencoded");
@@ -624,7 +803,8 @@ impl Scenario {
                 }
             }
             if let Some(value) = step.json_body {
-                let template = JsonTemplate::compile(value, &variables, &available)?;
+                let template = JsonTemplate::compile(value, &variables, &available)
+                    .map_err(|error| context("json_body", &error.to_string()))?;
                 default_content_type = Some("application/json");
                 if template.dynamic() {
                     json_body = Some(template);
@@ -644,27 +824,45 @@ impl Scenario {
                 let final_url = expect
                     .final_url
                     .map(|url| -> Result<Url, RunError> {
-                        let url: Url = expand(&url, &variables)?.parse()?;
+                        let expanded = expand(&url, &variables)
+                            .map_err(|error| context("expect.final_url", &error.to_string()))?;
+                        let url: Url = expanded.parse().map_err(|_| {
+                            context("expect.final_url", "expected an absolute HTTP or HTTPS URL")
+                        })?;
                         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-                            return Err("expected final URL must use HTTP or HTTPS".into());
+                            return Err(context(
+                                "expect.final_url",
+                                "expected an absolute HTTP or HTTPS URL",
+                            )
+                            .into());
                         }
                         Ok(url)
                     })
                     .transpose()?;
                 let body_contains = expect
                     .body_contains
-                    .map(|body| expand(&body, &variables))
+                    .map(|body| {
+                        expand(&body, &variables)
+                            .map_err(|error| context("expect.body_contains", &error.to_string()))
+                    })
                     .transpose()?;
                 if body_contains.as_ref().is_some_and(String::is_empty) {
-                    return Err(
-                        "expected body text must not be empty after variable substitution".into(),
-                    );
+                    return Err(context(
+                        "expect.body_contains",
+                        "expected body text must not be empty after variable substitution",
+                    )
+                    .into());
                 }
                 let mut expected_headers = HeaderMap::new();
                 for (name, value) in expect.headers {
                     expected_headers.insert(
-                        HeaderName::from_bytes(name.as_bytes())?,
-                        HeaderValue::from_str(&expand(&value, &variables)?)?,
+                        HeaderName::from_bytes(name.as_bytes())
+                            .map_err(|_| context("expect.headers", "invalid header name"))?,
+                        HeaderValue::from_str(
+                            &expand(&value, &variables)
+                                .map_err(|error| context("expect.headers", &error.to_string()))?,
+                        )
+                        .map_err(|_| context("expect.headers", "invalid header value"))?,
                     );
                 }
                 Expect {
@@ -679,12 +877,17 @@ impl Scenario {
             let mut extract = BTreeMap::new();
             for (name, source) in step.extract {
                 if variables.contains_key(&name) || !available.insert(name.clone()) {
-                    return Err(format!("duplicate scenario variable: {name}").into());
+                    return Err(context(
+                        "extract",
+                        &format!("duplicate scenario variable: {name}"),
+                    )
+                    .into());
                 }
                 let source = match source {
-                    ExtractFile::Header { name } => {
-                        Extract::Header(HeaderName::from_bytes(name.as_bytes())?)
-                    }
+                    ExtractFile::Header { name } => Extract::Header(
+                        HeaderName::from_bytes(name.as_bytes())
+                            .map_err(|_| context("extract", "invalid header name"))?,
+                    ),
                     ExtractFile::Json { pointer } => {
                         if !pointer.is_empty()
                             && (!pointer.starts_with('/')
@@ -692,7 +895,11 @@ impl Scenario {
                                     !escape.starts_with('0') && !escape.starts_with('1')
                                 }))
                         {
-                            return Err("invalid JSON pointer".into());
+                            return Err(context(
+                                "extract",
+                                &format!("invalid JSON pointer for variable {name:?}"),
+                            )
+                            .into());
                         }
                         Extract::Json(pointer)
                     }
@@ -700,7 +907,12 @@ impl Scenario {
                         selector,
                         attribute,
                     } => {
-                        scraper::Selector::parse(&selector).map_err(|_| "invalid HTML selector")?;
+                        scraper::Selector::parse(&selector).map_err(|_| {
+                            context(
+                                "extract",
+                                &format!("invalid HTML selector for variable {name:?}"),
+                            )
+                        })?;
                         Extract::Html {
                             selector,
                             attribute,
@@ -709,11 +921,15 @@ impl Scenario {
                 };
                 extract.insert(name, source);
             }
+            let method = step
+                .method
+                .parse()
+                .map_err(|_| context("method", "invalid HTTP method"))?;
             steps.push(Step {
                 name: step.name,
                 url,
                 dynamic_url,
-                method: step.method.parse()?,
+                method,
                 headers,
                 dynamic_headers,
                 body,
@@ -1058,10 +1274,10 @@ pub async fn run_scenario_config(
                     let step_started = Instant::now();
                     let (target_url, headers, request_body) = match step.prepare(&variables) {
                         Ok(prepared) => prepared,
-                        Err(_) => {
+                        Err(error) => {
                             if verbose {
                                 use std::io::Write;
-                                let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} failed errors=variable", started.elapsed().as_secs_f64(), step.name);
+                                let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} failed errors=variable field={} reason={:?}", started.elapsed().as_secs_f64(), step.name, error.field, error.reason);
                             }
                             steps[index].record(step_started.elapsed(), true, None, &[(true, "variable")], bounded_latency);
                             run_failed = true;
@@ -1089,6 +1305,7 @@ pub async fn run_scenario_config(
                     let mut header_assertion_error = false;
                     let mut body_assertion_error = false;
                     let mut extraction_error = false;
+                    let mut extraction_detail = None;
                     let mut other_error = false;
                     let result = if let Some(limit) = max_redirects {
                         match request.build() {
@@ -1123,6 +1340,10 @@ pub async fn run_scenario_config(
                                             const MAX_EXTRACT_BODY: usize = 2 * 1024 * 1024;
                                             if chunk.len() > MAX_EXTRACT_BODY.saturating_sub(captured.len()) {
                                                 extraction_error = true;
+                                                extraction_detail = Some(ExtractionError {
+                                                    variable: None,
+                                                    reason: "response body exceeds the 2 MiB extraction limit",
+                                                });
                                                 break;
                                             }
                                             captured.extend_from_slice(&chunk);
@@ -1148,7 +1369,7 @@ pub async fn run_scenario_config(
                             if !step.extract.is_empty() && !http_error && !body_error && !url_assertion_error && !header_assertion_error && !body_assertion_error && !extraction_error {
                                 match extract_values(&step.extract, &headers, &captured) {
                                     Ok(extracted) => variables.extend(extracted),
-                                    Err(_) => extraction_error = true,
+                                    Err(error) => { extraction_error = true; extraction_detail = Some(error); }
                                 }
                             }
                             http_error || body_error || url_assertion_error || header_assertion_error || body_assertion_error || extraction_error
@@ -1175,6 +1396,12 @@ pub async fn run_scenario_config(
                                 let _ = write!(stderr, "{separator}{label}");
                                 separator = ",";
                             }
+                        }
+                        if let Some(detail) = extraction_detail {
+                            if let Some(variable) = detail.variable {
+                                let _ = write!(stderr, " extraction_variable={variable:?}");
+                            }
+                            let _ = write!(stderr, " extraction_reason={:?}", detail.reason);
                         }
                         let _ = writeln!(stderr);
                     }
