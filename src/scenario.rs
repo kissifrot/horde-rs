@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -257,6 +257,25 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn scenario_rejects_out_of_range_rate_in_library_options() {
+        for rate in [0, 1_000_000_001] {
+            let scenario = Scenario::from_json(br#"{"version":1,"name":"rate","steps":[{"name":"one","url":"http://127.0.0.1/"}]}"#).unwrap();
+            let result = run_scenario_config(
+                scenario,
+                1,
+                1,
+                Duration::from_secs(1),
+                ScenarioOptions {
+                    rate: Some(rate),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(result.is_err());
+        }
     }
 
     #[test]
@@ -751,6 +770,8 @@ pub struct ScenarioOptions {
     pub user_agent: Option<String>,
     /// Stop starting new iterations after this duration; active iterations finish.
     pub duration: Option<Duration>,
+    /// Maximum target rate of iteration starts per second across all users.
+    pub rate: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -825,6 +846,7 @@ pub async fn run_scenario_with_referer(
             bounded_latency: false,
             user_agent: None,
             duration: None,
+            rate: None,
         },
     )
     .await
@@ -845,6 +867,7 @@ pub async fn run_scenario_config(
         bounded_latency,
         user_agent,
         duration,
+        rate,
     } = options;
     if iterations == 0 || users == 0 || timeout.is_zero() {
         return Err("iterations, users and timeout must be greater than zero".into());
@@ -855,6 +878,9 @@ pub async fn run_scenario_config(
     if duration.is_some_and(|duration| duration.is_zero()) {
         return Err("duration must be greater than zero".into());
     }
+    if rate.is_some_and(|rate| !(1..=1_000_000_000).contains(&rate)) {
+        return Err("rate must be between 1 and 1000000000 iterations per second".into());
+    }
     let user_agent = reqwest::header::HeaderValue::from_str(
         user_agent
             .as_deref()
@@ -864,9 +890,11 @@ pub async fn run_scenario_config(
     let next = Arc::new(AtomicUsize::new(0));
     let mut tasks = tokio::task::JoinSet::new();
     let started = Instant::now();
+    let next_start = rate.map(|_| Arc::new(Mutex::new(started)));
     for user_id in 1..=users.min(iterations) {
         let scenario = Arc::clone(&scenario);
         let next = Arc::clone(&next);
+        let next_start = next_start.clone();
         let client = Client::builder()
             .cookie_store(true)
             .timeout(timeout)
@@ -881,6 +909,18 @@ pub async fn run_scenario_config(
                     (n < iterations).then(|| n + 1)
                 }) {
                 let iteration = index + 1;
+                if let (Some(rate), Some(next_start)) = (rate, &next_start) {
+                    let scheduled = {
+                        let mut next_time = next_start.lock().unwrap();
+                        let scheduled = (*next_time).max(Instant::now());
+                        *next_time = scheduled + Duration::from_secs_f64(1.0 / f64::from(rate));
+                        scheduled
+                    };
+                    if duration.is_some_and(|duration| scheduled.duration_since(started) >= duration) {
+                        break;
+                    }
+                    tokio::time::sleep_until(scheduled.into()).await;
+                }
                 let run_started = Instant::now();
                 if duration.is_some_and(|duration| run_started.duration_since(started) >= duration) {
                     break;

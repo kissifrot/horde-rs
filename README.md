@@ -31,7 +31,7 @@ Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 | `-A, --user-agent <USER_AGENT>` | Set `User-Agent`; overrides `-H` for single-URL tests. Scenario step headers take precedence. | `Horde/<version>` (e.g. `Horde/0.1.0`) |
 | `--body-file <BODY_FILE>` | Read a request body from a file and reuse it for every request. | No body |
 | `--duration <DURATION>` | Stop starting new requests or scenario iterations after this many seconds; must be positive. | No duration limit |
-| `--rate <RATE>` | Target rate of logical requests per second, from 1 to 1,000,000,000. | Unlimited |
+| `--rate <RATE>` | Target starts per second for logical requests or scenario iterations, from 1 to 1,000,000,000. | Unlimited |
 | `-v, --verbose` | Log the start and result of every request to stderr. | Disabled |
 | `--bounded-latency` | Use bounded-memory HDR histograms for approximate percentiles. | Disabled (exact samples) |
 | `--no-connection-reuse` | Disable reuse of HTTP connections. | Reuse enabled |
@@ -48,7 +48,7 @@ Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 
 Each worker sends requests sequentially. Use `--duration` to stop starting requests after a time limit; in-flight requests finish. With both `--duration` and `-n`, the first limit reached applies. Without either, Horde sends one request. The timeout covers each request, including redirects and the response body.
 
-`--rate` spaces logical request starts across all workers. Concurrency, response time and scheduling affect the achieved rate. Redirects are not separately rate-limited, and waiting for a rate slot is excluded from latency and timeout.
+For single-URL tests, `--rate` spaces logical request starts across all workers. Concurrency, response time and scheduling affect the achieved rate. Redirects are not separately rate-limited, and waiting for a rate slot is excluded from latency and timeout.
 
 To send a body, select a method and provide a file:
 
@@ -69,6 +69,10 @@ horde --scenario examples/journey.json -n 100 -c 10 --json
 Scenarios must declare `"version": 1` and are validated against the bundled [version 1 JSON Schema](schemas/scenario-v1.schema.json) before execution. The optional `$schema` field helps compatible editors find the schema; Horde uses its bundled copy and does not fetch the URI. Horde also validates semantics that JSON Schema cannot express here, including unique step names, variable references, HTTP methods and the expanded URLs.
 
 Here `-n` is the total number of scenario iterations and `-c` is the maximum number of virtual users. With `--duration`, Horde stops starting iterations at the deadline but lets active iterations finish, including their waits and remaining steps. With both `-n` and `--duration`, the first limit reached applies; with `--duration` alone there is no explicit iteration limit. Without either, Horde runs one iteration. Use `--bounded-latency` to limit latency storage for long tests.
+
+`--rate` sets a shared target for starting scenario iterations per second, not a limit on individual HTTP requests. Each user runs one iteration at a time; if all users are busy, the achieved rate can be lower. Steps and redirects are not independently rate-limited. Time waiting for a start slot is excluded from scenario and step latencies. No iteration starts after the duration limit, including one waiting for a slot.
+
+The report shows the target start rate when set and completed iterations per second. The latter is completed iterations divided by total elapsed time, including time spent finishing active iterations after the duration limit; it is not the observed start rate. JSON reports these values as `scenarios.target_starts_per_second` and `scenarios.completed_per_second`.
 
 Each user has its own cookie jar, retained across its iterations. Each step has a unique `name`, an absolute HTTP(S) `url`, an optional `method` (default `GET`), `headers`, request body, and `wait_ms` before the step. By default, a step requires a 2xx response. A failed request or assertion stops that iteration; later steps are skipped. Redirects are not followed unless `-L` is set; `--max-redirects` sets the per-step limit. The report shows iteration duration and per-step counts, final HTTP statuses, failure categories and latency percentiles. Iteration duration includes waits; step latency excludes waits but includes assertions and extraction. Error categories can overlap. Skipped steps have no latency sample or HTTP status. Individual failures do not change the exit code unless a CI threshold is set.
 

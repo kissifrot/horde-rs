@@ -25,7 +25,7 @@ struct Args {
     #[arg(required_unless_present = "scenario", conflicts_with = "scenario")]
     url: Option<Url>,
     /// Run a JSON scenario instead of testing a single URL.
-    #[arg(long, conflicts_with_all = ["method", "headers", "body_file", "rate", "no_connection_reuse", "max_p95_ms"])]
+    #[arg(long, conflicts_with_all = ["method", "headers", "body_file", "no_connection_reuse", "max_p95_ms"])]
     scenario: Option<PathBuf>,
     /// Derive Referer between scenario steps (requires --scenario).
     #[arg(long, requires = "scenario")]
@@ -54,7 +54,7 @@ struct Args {
     /// Stop starting requests or scenario iterations after this many seconds.
     #[arg(long)]
     duration: Option<NonZeroU64>,
-    /// Target rate in logical requests per second (1 to 1000000000).
+    /// Target starts per second for requests or scenario iterations (1 to 1000000000).
     #[arg(long)]
     rate: Option<u32>,
     /// Log request progress to stderr (can affect performance).
@@ -126,6 +126,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
                 duration: args
                     .duration
                     .map(|seconds| Duration::from_secs(seconds.get())),
+                rate: args.rate,
             },
         )
         .await?;
@@ -147,6 +148,11 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
             .collect();
         let failure_rate = (report.scenarios.completed > 0)
             .then(|| report.scenarios.failed as f64 * 100.0 / report.scenarios.completed as f64);
+        let completed_per_second = if report.elapsed.is_zero() {
+            0.0
+        } else {
+            report.scenarios.completed as f64 / report.elapsed.as_secs_f64()
+        };
         let failure_passed = args
             .max_failure_rate
             .map(|limit| failure_rate.is_some_and(|value| value <= limit));
@@ -177,7 +183,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         if args.json {
             let steps: Vec<_> = report.steps.iter().zip(&step_stats).map(|((name, count), stats)| serde_json::json!({"name": name, "completed": count.completed, "failed": count.failed, "mean_latency_ms": mean(count), "latency_ms": {"p50": percentile(stats, 50), "p90": percentile(stats, 90), "p95": percentile(stats, 95), "p99": percentile(stats, 99), "p100": percentile(stats, 100)}, "status_codes": count.status_codes, "failure_details": count.failure_details})).collect();
             let checks: Vec<_> = step_checks.iter().map(|(name, observed, passed)| serde_json::json!({"name": name, "observed": observed, "passed": passed})).collect();
-            let output = serde_json::json!({"schema_version": 1, "type": "scenario", "name": report.name, "elapsed_seconds": report.elapsed.as_secs_f64(), "latency_method": if args.bounded_latency { "hdr_histogram_upper_bound_3_significant_digits" } else { "exact" }, "scenarios": {"completed": report.scenarios.completed, "failed": report.scenarios.failed, "mean_duration_ms": mean(&report.scenarios), "duration_ms": {"p50": percentile(&scenario_stats, 50), "p95": percentile(&scenario_stats, 95), "p99": percentile(&scenario_stats, 99)}}, "steps": steps, "thresholds": {"failure_rate_percent": args.max_failure_rate.map(|limit| serde_json::json!({"limit":limit,"observed":failure_rate,"passed":failure_passed})), "step_p95_ms": args.max_step_p95_ms.map(|limit| serde_json::json!({"limit":limit,"passed":step_passed,"steps":checks}))}});
+            let output = serde_json::json!({"schema_version": 1, "type": "scenario", "name": report.name, "elapsed_seconds": report.elapsed.as_secs_f64(), "latency_method": if args.bounded_latency { "hdr_histogram_upper_bound_3_significant_digits" } else { "exact" }, "scenarios": {"completed": report.scenarios.completed, "failed": report.scenarios.failed, "target_starts_per_second": args.rate, "completed_per_second": completed_per_second, "mean_duration_ms": mean(&report.scenarios), "duration_ms": {"p50": percentile(&scenario_stats, 50), "p95": percentile(&scenario_stats, 95), "p99": percentile(&scenario_stats, 99)}}, "steps": steps, "thresholds": {"failure_rate_percent": args.max_failure_rate.map(|limit| serde_json::json!({"limit":limit,"observed":failure_rate,"passed":failure_passed})), "step_p95_ms": args.max_step_p95_ms.map(|limit| serde_json::json!({"limit":limit,"passed":step_passed,"steps":checks}))}});
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
             println!(
@@ -187,6 +193,10 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
                 report.scenarios.failed,
                 report.elapsed.as_secs_f64()
             );
+            if let Some(rate) = args.rate {
+                println!("Target starts/sec:   {rate}");
+            }
+            println!("Completed/sec:       {completed_per_second:.2}");
             if let Some(value) = mean(&report.scenarios) {
                 println!("Mean scenario time:  {value:.2} ms");
             }

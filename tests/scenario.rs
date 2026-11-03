@@ -10,6 +10,131 @@ use std::{
 };
 
 #[test]
+fn scenario_rate_is_global_and_respects_duration_and_iteration_limits() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::clone(&stop);
+    let server = thread::spawn(move || {
+        while !done.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0; 4096];
+                    assert!(stream.read(&mut request).unwrap() > 0);
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    });
+    let path =
+        std::env::temp_dir().join(format!("horde-scenario-rate-{}.json", std::process::id()));
+    let scenario = serde_json::json!({"version":1,"name":"rate","steps":[
+        {"name":"first", "url":format!("http://{address}/")},
+        {"name":"second", "url":format!("http://{address}/next")}
+    ]});
+    std::fs::write(&path, serde_json::to_vec(&scenario).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .arg("--scenario")
+        .arg(&path)
+        .args(["-n", "3", "-c", "3", "--rate", "2", "--json"])
+        .output()
+        .unwrap();
+    let limited = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .arg("--scenario")
+        .arg(&path)
+        .args([
+            "-n",
+            "100",
+            "-c",
+            "4",
+            "--rate",
+            "1",
+            "--duration",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let invalid = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .arg("--scenario")
+        .arg(&path)
+        .args(["--rate", "0"])
+        .output()
+        .unwrap();
+    let text_report = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .arg("--scenario")
+        .arg(&path)
+        .args(["-n", "1", "--rate", "2"])
+        .output()
+        .unwrap();
+    let slow_scenario = serde_json::json!({"version":1,"name":"slow","steps":[
+        {"name":"first", "url":format!("http://{address}/"), "wait_ms":600}
+    ]});
+    std::fs::write(&path, serde_json::to_vec(&slow_scenario).unwrap()).unwrap();
+    let saturated = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .arg("--scenario")
+        .arg(&path)
+        .args(["-n", "2", "-c", "1", "--rate", "10", "--json"])
+        .output()
+        .unwrap();
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["scenarios"]["completed"], 3);
+    assert_eq!(report["scenarios"]["failed"], 0);
+    assert_eq!(report["steps"][0]["completed"], 3);
+    assert_eq!(report["steps"][1]["completed"], 3);
+    assert_eq!(report["scenarios"]["target_starts_per_second"], 2);
+    let elapsed = report["elapsed_seconds"].as_f64().unwrap();
+    assert!(elapsed >= 0.9, "{report}");
+    let throughput = report["scenarios"]["completed_per_second"]
+        .as_f64()
+        .unwrap();
+    assert!((throughput - 3.0 / elapsed).abs() < 1e-9);
+    assert!(
+        limited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&limited.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&limited.stdout).unwrap();
+    assert_eq!(report["scenarios"]["completed"], 1);
+    assert_eq!(report["steps"][1]["completed"], 1);
+    assert!(!invalid.status.success());
+    assert!(text_report.status.success());
+    let text_report = String::from_utf8_lossy(&text_report.stdout);
+    assert!(
+        text_report.contains("Target starts/sec:   2"),
+        "{text_report}"
+    );
+    assert!(text_report.contains("Completed/sec:"), "{text_report}");
+    assert!(saturated.status.success());
+    let saturated: serde_json::Value = serde_json::from_slice(&saturated.stdout).unwrap();
+    assert_eq!(saturated["scenarios"]["completed"], 2);
+    assert!(saturated["elapsed_seconds"].as_f64().unwrap() >= 1.2);
+    assert!(
+        saturated["scenarios"]["completed_per_second"]
+            .as_f64()
+            .unwrap()
+            < 10.0
+    );
+}
+
+#[test]
 fn scenario_duration_respects_iteration_limits_and_finishes_active_steps() {
     for (case, wait_ms, limit, minimum, maximum) in [
         ("duration_only", 300, None, 2, usize::MAX),
@@ -58,6 +183,9 @@ fn scenario_duration_respects_iteration_limits_and_finishes_active_steps() {
         ]);
         if let Some(limit) = limit {
             command.args(["-n", &limit.to_string()]);
+        }
+        if case == "duration_limit" {
+            command.args(["--rate", "2"]);
         }
         let output = command.output().unwrap();
         stop.store(true, Ordering::Relaxed);
