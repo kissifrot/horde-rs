@@ -80,7 +80,12 @@ Here `-n` is the total number of scenario iterations and `-c` is the maximum num
 
 With a fixed number of users, a slow service can reduce the number of iterations started. Reported latencies cover executed iterations and steps; they do not measure delay for iterations that could not start while all users were busy.
 
-The report shows the target start rate when set and completed iterations per second. The latter is completed iterations divided by total elapsed time, including time spent finishing active iterations after the duration limit; it is not the observed start rate. JSON reports these values as `scenarios.target_starts_per_second` and `scenarios.completed_per_second`.
+The report shows the target start rate when set, the observed start rate and completed iterations per second. The start rate includes failed iterations and uses one of two windows:
+
+- If the duration limit is reached first, divide the number started by the configured duration. This is the full allowed start window, even when no further slot can be used and the run finishes earlier.
+- If the iteration limit is reached first, divide the number of intervals between starts (`started - 1`) by the elapsed time between the first and last starts. With fewer than two starts or a zero-length interval, the rate is unavailable.
+
+The completed rate divides completed iterations by total elapsed time, including time spent finishing active iterations after the duration limit. JSON reports the rates under `scenarios.target_starts_per_second`, `scenarios.started_per_second` and `scenarios.completed_per_second`. `scenarios.start_measurement` includes the number started, `window_seconds` and `method` (`duration` or `iteration_limit`).
 
 Each user has its own cookie jar, retained across its iterations. Each step has a unique `name`, an absolute HTTP(S) `url`, an optional `method` (default `GET`), `headers`, request body, and `wait_ms` before the step. By default, a step requires a 2xx response. A failed request or assertion stops that iteration; later steps are skipped. Redirects are not followed unless `-L` is set; `--max-redirects` sets the per-step limit. The report shows iteration duration and per-step counts, final HTTP statuses, failure categories and latency percentiles. Iteration duration includes waits; step latency excludes waits but includes assertions and extraction. Error categories can overlap. Skipped steps have no latency sample or HTTP status. Individual failures do not change the exit code unless a CI threshold is set.
 

@@ -1,5 +1,5 @@
 use clap::Parser;
-use horde_rs::scenario::{Counts, Scenario, ScenarioOptions, run_scenario_config};
+use horde_rs::scenario::{Counts, Scenario, ScenarioOptions, StartWindow, run_scenario_config};
 use horde_rs::{LatencyStats, TestPlan, run};
 use reqwest::{
     Method, Url,
@@ -153,6 +153,10 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         } else {
             report.scenarios.completed as f64 / report.elapsed.as_secs_f64()
         };
+        let start_window_method = match report.starts.method {
+            StartWindow::Duration => "duration",
+            StartWindow::IterationLimit => "iteration_limit",
+        };
         let failure_passed = args
             .max_failure_rate
             .map(|limit| failure_rate.is_some_and(|value| value <= limit));
@@ -183,7 +187,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         if args.json {
             let steps: Vec<_> = report.steps.iter().zip(&step_stats).map(|((name, count), stats)| serde_json::json!({"name": name, "completed": count.completed, "failed": count.failed, "mean_latency_ms": mean(count), "latency_ms": {"p50": percentile(stats, 50), "p90": percentile(stats, 90), "p95": percentile(stats, 95), "p99": percentile(stats, 99), "p100": percentile(stats, 100)}, "status_codes": count.status_codes, "failure_details": count.failure_details})).collect();
             let checks: Vec<_> = step_checks.iter().map(|(name, observed, passed)| serde_json::json!({"name": name, "observed": observed, "passed": passed})).collect();
-            let output = serde_json::json!({"schema_version": 1, "type": "scenario", "name": report.name, "elapsed_seconds": report.elapsed.as_secs_f64(), "latency_method": if args.bounded_latency { "hdr_histogram_upper_bound_3_significant_digits" } else { "exact" }, "scenarios": {"completed": report.scenarios.completed, "failed": report.scenarios.failed, "target_starts_per_second": args.rate, "completed_per_second": completed_per_second, "mean_duration_ms": mean(&report.scenarios), "duration_ms": {"p50": percentile(&scenario_stats, 50), "p95": percentile(&scenario_stats, 95), "p99": percentile(&scenario_stats, 99)}}, "steps": steps, "thresholds": {"failure_rate_percent": args.max_failure_rate.map(|limit| serde_json::json!({"limit":limit,"observed":failure_rate,"passed":failure_passed})), "step_p95_ms": args.max_step_p95_ms.map(|limit| serde_json::json!({"limit":limit,"passed":step_passed,"steps":checks}))}});
+            let output = serde_json::json!({"schema_version": 1, "type": "scenario", "name": report.name, "elapsed_seconds": report.elapsed.as_secs_f64(), "latency_method": if args.bounded_latency { "hdr_histogram_upper_bound_3_significant_digits" } else { "exact" }, "scenarios": {"completed": report.scenarios.completed, "failed": report.scenarios.failed, "target_starts_per_second": args.rate, "started_per_second": report.starts.per_second, "start_measurement": {"started": report.starts.started, "window_seconds": report.starts.window.as_secs_f64(), "method": start_window_method}, "completed_per_second": completed_per_second, "mean_duration_ms": mean(&report.scenarios), "duration_ms": {"p50": percentile(&scenario_stats, 50), "p95": percentile(&scenario_stats, 95), "p99": percentile(&scenario_stats, 99)}}, "steps": steps, "thresholds": {"failure_rate_percent": args.max_failure_rate.map(|limit| serde_json::json!({"limit":limit,"observed":failure_rate,"passed":failure_passed})), "step_p95_ms": args.max_step_p95_ms.map(|limit| serde_json::json!({"limit":limit,"passed":step_passed,"steps":checks}))}});
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
             println!(
@@ -196,6 +200,16 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
             if let Some(rate) = args.rate {
                 println!("Target starts/sec:   {rate}");
             }
+            let start_rate = report
+                .starts
+                .per_second
+                .map_or_else(|| "n/a".to_owned(), |rate| format!("{rate:.2}"));
+            println!("Started/sec:         {start_rate}");
+            println!(
+                "Start window:        {:.3} s ({start_window_method}, {} started)",
+                report.starts.window.as_secs_f64(),
+                report.starts.started
+            );
             println!("Completed/sec:       {completed_per_second:.2}");
             if let Some(value) = mean(&report.scenarios) {
                 println!("Mean scenario time:  {value:.2} ms");

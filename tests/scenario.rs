@@ -100,6 +100,16 @@ fn scenario_rate_is_global_and_respects_duration_and_iteration_limits() {
     assert_eq!(report["steps"][0]["completed"], 3);
     assert_eq!(report["steps"][1]["completed"], 3);
     assert_eq!(report["scenarios"]["target_starts_per_second"], 2);
+    assert_eq!(
+        report["scenarios"]["start_measurement"]["method"],
+        "iteration_limit"
+    );
+    assert_eq!(report["scenarios"]["start_measurement"]["started"], 3);
+    let window = report["scenarios"]["start_measurement"]["window_seconds"]
+        .as_f64()
+        .unwrap();
+    let started_rate = report["scenarios"]["started_per_second"].as_f64().unwrap();
+    assert!((started_rate - 2.0 / window).abs() < 1e-9);
     let elapsed = report["elapsed_seconds"].as_f64().unwrap();
     assert!(elapsed >= 0.9, "{report}");
     let throughput = report["scenarios"]["completed_per_second"]
@@ -114,6 +124,16 @@ fn scenario_rate_is_global_and_respects_duration_and_iteration_limits() {
     let report: serde_json::Value = serde_json::from_slice(&limited.stdout).unwrap();
     assert_eq!(report["scenarios"]["completed"], 1);
     assert_eq!(report["steps"][1]["completed"], 1);
+    assert_eq!(
+        report["scenarios"]["start_measurement"]["method"],
+        "duration"
+    );
+    assert_eq!(report["scenarios"]["start_measurement"]["started"], 1);
+    assert_eq!(
+        report["scenarios"]["start_measurement"]["window_seconds"],
+        1.0
+    );
+    assert_eq!(report["scenarios"]["started_per_second"], 1.0);
     assert!(!invalid.status.success());
     assert!(text_report.status.success());
     let text_report = String::from_utf8_lossy(&text_report.stdout);
@@ -122,6 +142,10 @@ fn scenario_rate_is_global_and_respects_duration_and_iteration_limits() {
         "{text_report}"
     );
     assert!(text_report.contains("Completed/sec:"), "{text_report}");
+    assert!(
+        text_report.contains("Started/sec:         n/a"),
+        "{text_report}"
+    );
     assert!(saturated.status.success());
     let saturated: serde_json::Value = serde_json::from_slice(&saturated.stdout).unwrap();
     assert_eq!(saturated["scenarios"]["completed"], 2);
@@ -202,6 +226,18 @@ fn scenario_duration_respects_iteration_limits_and_finishes_active_steps() {
         assert_eq!(report["scenarios"]["failed"], 0);
         assert_eq!(report["steps"][0]["completed"], completed);
         assert_eq!(report["steps"][1]["completed"], completed);
+        assert_eq!(
+            report["scenarios"]["start_measurement"]["started"],
+            completed
+        );
+        assert_eq!(
+            report["scenarios"]["start_measurement"]["method"],
+            if case == "iteration_limit" {
+                "iteration_limit"
+            } else {
+                "duration"
+            }
+        );
         if case == "duration_limit" {
             assert!(report["elapsed_seconds"].as_f64().unwrap() >= 1.2);
         }
@@ -408,6 +444,8 @@ fn failed_step_stops_scenario_and_reports_skipped_steps() {
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["scenarios"]["failed"], 1);
+    assert_eq!(report["scenarios"]["start_measurement"]["started"], 1);
+    assert!(report["scenarios"]["started_per_second"].is_null());
     assert_eq!(report["steps"][0]["failed"], 1);
     assert_eq!(report["steps"][0]["status_codes"]["500"], 1);
     assert_eq!(report["steps"][0]["failure_details"]["status"], 1);

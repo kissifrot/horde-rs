@@ -255,6 +255,33 @@ use crate::redirect::referer as step_referer;
 mod tests {
     use super::*;
 
+    #[test]
+    fn start_rate_uses_duration_or_intervals() {
+        let first = Instant::now();
+        let last = first + Duration::from_secs(1);
+        let count_limit =
+            measure_starts(3, 3, Some(Duration::from_secs(60)), Some(first), Some(last));
+        assert_eq!(count_limit.method, StartWindow::IterationLimit);
+        assert_eq!(count_limit.started, 3);
+        assert_eq!(count_limit.window, Duration::from_secs(1));
+        assert_eq!(count_limit.per_second, Some(2.0));
+        let duration_limit = measure_starts(
+            90,
+            100,
+            Some(Duration::from_secs(60)),
+            Some(first),
+            Some(last),
+        );
+        assert_eq!(duration_limit.method, StartWindow::Duration);
+        assert_eq!(duration_limit.per_second, Some(1.5));
+        let one = measure_starts(1, 1, None, Some(first), Some(first));
+        assert_eq!(one.per_second, None);
+        let simultaneous = measure_starts(2, 2, None, Some(first), Some(first));
+        assert_eq!(simultaneous.per_second, None);
+        let none = measure_starts(0, 10, Some(Duration::from_secs(1)), None, None);
+        assert_eq!(none.per_second, Some(0.0));
+    }
+
     #[tokio::test]
     async fn scenario_rejects_zero_duration_in_library_options() {
         let scenario = Scenario::from_json(br#"{"version":1,"name":"duration","steps":[{"name":"one","url":"http://127.0.0.1/"}]}"#).unwrap();
@@ -809,7 +836,57 @@ pub struct ScenarioReport {
     pub name: String,
     pub elapsed: Duration,
     pub scenarios: Counts,
+    /// Actual iteration start rate and the window used to calculate it.
+    pub starts: ScenarioStartMeasurement,
     pub steps: Vec<(String, Counts)>,
+}
+
+/// The window used to measure iteration starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartWindow {
+    /// The configured duration, ending at the deadline.
+    Duration,
+    /// The interval between the first and last starts when the iteration limit is reached.
+    IterationLimit,
+}
+
+/// The number of starts, measurement window and observed rate.
+#[derive(Debug)]
+pub struct ScenarioStartMeasurement {
+    pub started: usize,
+    pub window: Duration,
+    pub method: StartWindow,
+    /// Starts per second, or None when fewer than two starts define an interval.
+    pub per_second: Option<f64>,
+}
+
+fn measure_starts(
+    started: usize,
+    limit: usize,
+    duration: Option<Duration>,
+    first: Option<Instant>,
+    last: Option<Instant>,
+) -> ScenarioStartMeasurement {
+    if started < limit
+        && let Some(window) = duration
+    {
+        return ScenarioStartMeasurement {
+            started,
+            window,
+            method: StartWindow::Duration,
+            per_second: Some(started as f64 / window.as_secs_f64()),
+        };
+    }
+    let window = first
+        .zip(last)
+        .map_or(Duration::ZERO, |(first, last)| last.duration_since(first));
+    ScenarioStartMeasurement {
+        started,
+        window,
+        method: StartWindow::IterationLimit,
+        per_second: (started >= 2 && !window.is_zero())
+            .then(|| (started - 1) as f64 / window.as_secs_f64()),
+    }
 }
 
 /// Run a fixed number of scenario iterations, keeping one cookie jar per virtual user.
@@ -935,6 +1012,8 @@ pub async fn run_scenario_config(
             let mut totals = Counts::default();
             let mut steps = vec![Counts::default(); scenario.steps.len()];
             let mut previous_url: Option<Url> = None;
+            let mut first_start = None;
+            let mut last_start = None;
             while let Ok(index) = next.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                     (n < iterations).then(|| n + 1)
                 }) {
@@ -955,6 +1034,8 @@ pub async fn run_scenario_config(
                 if duration.is_some_and(|duration| run_started.duration_since(started) >= duration) {
                     break;
                 }
+                first_start.get_or_insert(run_started);
+                last_start = Some(run_started);
                 if verbose {
                     use std::io::Write;
                     let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] started", started.elapsed().as_secs_f64());
@@ -1110,26 +1191,42 @@ pub async fn run_scenario_config(
                 }
                 totals.record(run_started.elapsed(), run_failed, None, &[], bounded_latency);
             }
-            (totals, steps)
+            (totals, steps, first_start, last_start)
         });
     }
     let mut report = ScenarioReport {
         name: scenario.name.clone(),
         elapsed: Duration::ZERO,
         scenarios: Counts::default(),
+        starts: measure_starts(0, iterations, duration, None, None),
         steps: scenario
             .steps
             .iter()
             .map(|step| (step.name.clone(), Counts::default()))
             .collect(),
     };
+    let mut first_start: Option<Instant> = None;
+    let mut last_start: Option<Instant> = None;
     while let Some(task) = tasks.join_next().await {
-        let (totals, steps) = task?;
+        let (totals, steps, worker_first, worker_last) = task?;
+        if let Some(first) = worker_first {
+            first_start = Some(first_start.map_or(first, |current| current.min(first)));
+        }
+        if let Some(last) = worker_last {
+            last_start = Some(last_start.map_or(last, |current| current.max(last)));
+        }
         report.scenarios.merge(totals)?;
         for ((_, aggregate), step) in report.steps.iter_mut().zip(steps) {
             aggregate.merge(step)?;
         }
     }
     report.elapsed = started.elapsed();
+    report.starts = measure_starts(
+        report.scenarios.completed,
+        iterations,
+        duration,
+        first_start,
+        last_start,
+    );
     Ok(report)
 }
