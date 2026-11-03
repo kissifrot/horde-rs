@@ -24,7 +24,7 @@ Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 | `--scenario <FILE>` | Run a JSON scenario instead of a single URL. | Disabled |
 | `--validate` | Validate a scenario without sending requests; requires `--scenario`. | Disabled |
 | `--auto-referer` | Derive `Referer` between scenario steps; requires `--scenario`. | Disabled |
-| `-n, --requests <REQUESTS>` | Total requests, or scenario iterations; must be positive. | `1` |
+| `-n, --requests <REQUESTS>` | Total requests, or scenario iterations; must be positive. | `1` without `--duration` |
 | `-c, --concurrency <CONCURRENCY>` | Maximum concurrent requests or virtual users; must be positive. | `1` |
 | `-t, --timeout <TIMEOUT>` | Timeout per request, in seconds; must be positive. | `30` |
 | `-X, --method <METHOD>` | HTTP method for single-URL tests. | `GET` |
@@ -57,7 +57,7 @@ To send a body, select a method and provide a file:
 horde -X POST --body-file payload.json -H 'Content-Type: application/json' https://example.com/
 ```
 
-The file is read once and reused. The method is not changed automatically. Redirects follow the HTTP client's method and body rules; for example, 307 preserves them.
+The file is read once and reused. The method is not changed automatically. When following redirects, 307 and 308 preserve the method and body; 301 and 302 change POST to GET, and 303 uses GET except for HEAD. A switch to GET drops the request body.
 
 ### User journeys
 
@@ -120,19 +120,23 @@ An optional `extract` object defines variables for later steps, for example `"cs
 
 Extracted values belong to one user and iteration, and are discarded before the next iteration. Names must be unique and cannot replace static variables; only later steps may reference them. They are not logged in verbose output. See [examples/federated-login.json](examples/federated-login.json) for a form with a per-session CSRF token.
 
-For a runnable login example, start the local demo server in one terminal and run the scenario in another:
+With the local demo server running, try the login scenario:
 
 ```sh
-python3 examples/login_server.py
 ./target/release/horde --scenario examples/login.json -n 10 -c 2 -v
 ```
 
 The example opens a form, submits demo credentials and accesses a protected page using the session cookie. The server listens only on loopback and is for demonstration, not production. Its raw form body uses literal substitution; `form` can be used to encode special characters automatically.
 
-For a redirect between a site and a separate authentication service, use the two-service demo:
+For a redirect between a site and a separate authentication service, start the two-service demo in one terminal:
 
 ```sh
 python3 examples/federated_login_server.py
+```
+
+Then run the scenario in another terminal:
+
+```sh
 ./target/release/horde --scenario examples/federated-login.json -n 10 -c 2 -L -v
 ```
 
@@ -150,13 +154,13 @@ For separate scenario steps, `--auto-referer` derives the header from the previo
 
 ## Work complete: the report
 
-The report shows completed and failed requests, throughput, response bytes, HTTP status counts and latency statistics. Completed requests include failures. Response bytes include partial bodies; latency ends when the body is read or an error occurs.
+For single-URL tests, the report shows completed and failed requests, throughput, response bytes, HTTP status counts and latency statistics. Completed requests include failures. Response bytes include partial bodies; latency ends when the body is read or an error occurs. Scenario reports provide iteration and per-step statistics as described above.
 
-Failures include HTTP 4xx/5xx, timeouts, connection errors, body-read errors and redirect-limit errors. Failure categories can overlap, but each failed request is counted only once. A completed run exits successfully by default even if requests fail; invalid configuration and internal errors return a nonzero code.
+For single-URL tests, failures include HTTP 4xx/5xx, timeouts, connection errors, body-read errors and redirect-limit errors. Failure categories can overlap, but each failed request is counted only once. A completed run exits successfully by default even if requests or scenarios fail; invalid configuration and internal errors return a nonzero code.
 
-Status counts use the final response when redirects are followed. A status is counted when its headers arrive, even if the body later fails. A request with no final response has no status. Redirect counts include decisions to follow redirects even if a later request fails.
+Status counts use the final response when redirects are followed. A status is counted when its headers arrive, even if the body later fails. A request with no final response has no status. In single-URL reports, redirect counts include decisions to follow redirects even if a later request fails.
 
-`Connections opened` counts successful connections throughout the run, including those for redirects or subsequently failed requests. It is not the number still open at the end; failed connection and TLS setup attempts are excluded. Proxy connections are counted at the connector level.
+In single-URL reports, `Connections opened` counts successful connections throughout the run, including those for redirects or subsequently failed requests. It is not the number still open at the end; failed connection and TLS setup attempts are excluded. Proxy connections are counted at the connector level.
 
 Latencies include failures. Percentiles use the nearest-rank method; for an even number of samples the median is the midpoint of the two central values, so it can differ from p50. Exact mode stores every sample, and its memory use grows with the request count.
 
@@ -195,7 +199,7 @@ python3 benchmarks/local.py --requests 10000 --repeats 5 --output /tmp/horde-ben
 
 The Python harness compiles a Rust HTTP/1.1 loopback server, warms up, then measures serial, concurrent, no-reuse, rate-limited and same-origin redirect workloads (one or three redirects per request). It also measures one-step and three-step scenarios, including assertions and header extraction, with exact and bounded latency statistics. Single-URL throughput is in logical requests/s; scenario throughput is in iterations/s. Each run, median throughput, binary hashes and environment metadata are recorded; on Linux, the harness also records server CPU and, when GNU `time` is available, client CPU and peak RSS. Use `--binary` or `--server-binary` to select prebuilt binaries, or `python3 benchmarks/local.py --server` to run the server separately. A custom server must implement the same redirect paths and responses.
 
-The server handles up to 128 connections and shares resources with Horde. Either can become a bottleneck; CPU frequency, scheduling and background activity also affect results. Compare repeated runs on the same machine with the same binaries and settings, then profile suspected bottlenecks separately. Results from different server binaries, including the former Python server, are not directly comparable.
+The server handles up to 128 connections and shares resources with Horde. Either can become a bottleneck; CPU frequency, scheduling and background activity also affect results. Compare repeated runs on the same machine with the same binaries and settings, then profile suspected bottlenecks separately.
 
 GitHub Actions runs five repetitions per workload on pushes and pull requests. The job summary shows medians and ranges; detailed JSON is retained for 90 days as `horde-benchmark-results`. For pull requests, the exact base commit is measured sequentially on the same runner with the pull request's harness. The summary compares compatible workloads; a positive percentage means higher throughput in the pull request. Scenario definitions are hashed to avoid comparing different workloads. `binary_revision` identifies each binary and `git_commit` identifies the harness checkout. If the base cannot run a scenario workload, that workload is marked not comparable; the pull request benchmark must still succeed.
 
