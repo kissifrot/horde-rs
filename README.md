@@ -78,7 +78,19 @@ Each user has its own cookie jar, retained across its iterations. Each step has 
 
 With `-v`, stderr shows each user's scenario start, waits, step results and final outcome with relative timestamps. URLs, headers, bodies, cookies and variable values are omitted; step names are shown. JSON remains on stdout. Logging can affect timing and throughput.
 
-Define string values under `variables` and refer to them as `{{name}}` in step URLs, header values and bodies. Names contain letters, digits and underscores. Substitution in URLs, headers and raw bodies is literal; use the structured body options below for form or JSON encoding. Unknown variables or malformed placeholders reject the scenario before any requests. Avoid committing secrets in scenario files.
+Define values under `variables` and refer to them as `{{name}}` in step URLs, header values and bodies. Values can be literal strings or explicitly loaded from the process environment:
+
+```json
+"variables": {
+  "base_url": "https://example.com",
+  "username": { "env": "HORDE_USERNAME" },
+  "password": { "env": "HORDE_PASSWORD" }
+}
+```
+
+Horde resolves environment variables once when loading the scenario; missing or non-UTF-8 values stop the run before any requests. Environment variable names must start with a letter or underscore and contain only letters, digits and underscores. Scenario variable names contain letters, digits and underscores. Values are omitted from reports and verbose logs. Avoid committing secrets in scenario files; environment variables are not a secret store and their visibility depends on the host and CI system.
+
+Substitution in URLs, headers and raw bodies is literal; use the structured body options below for form or JSON encoding. Unknown variables or malformed placeholders reject the scenario before any requests.
 
 For a request body, choose one of `body` (a raw string), `form` (an object of string fields) or `json_body` (an object or array). Form values are URL-encoded after substitution; JSON string values are escaped during serialization and other JSON types are preserved. Field and object names are literal. Horde sets the appropriate content type for `form` and `json_body` unless the step specifies one. Static structured bodies are prepared once.
 

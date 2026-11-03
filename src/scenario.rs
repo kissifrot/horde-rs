@@ -26,8 +26,21 @@ struct ScenarioFile {
     version: u64,
     name: String,
     #[serde(default)]
-    variables: BTreeMap<String, String>,
+    variables: BTreeMap<String, VariableFile>,
     steps: Vec<StepFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum VariableFile {
+    Literal(String),
+    Environment(EnvironmentVariable),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentVariable {
+    env: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -476,7 +489,7 @@ fn extract_values(
 }
 
 impl Scenario {
-    /// Parse and validate a JSON scenario before making any requests.
+    /// Parse and validate a JSON scenario, resolving declared environment variables before requests.
     pub fn from_json(input: &[u8]) -> Result<Self, RunError> {
         let document: serde_json::Value = serde_json::from_slice(input)?;
         match document.get("version").and_then(serde_json::Value::as_u64) {
@@ -505,6 +518,26 @@ impl Scenario {
         if file.variables.keys().any(|name| !valid_variable_name(name)) {
             return Err("variable names must contain only letters, digits or underscores".into());
         }
+        let variables: BTreeMap<String, String> = file
+            .variables
+            .into_iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    VariableFile::Literal(value) => value,
+                    VariableFile::Environment(source) => {
+                        std::env::var(&source.env).map_err(|error| match error {
+                            std::env::VarError::NotPresent => {
+                                format!("environment variable {} is not set", source.env)
+                            }
+                            std::env::VarError::NotUnicode(_) => {
+                                format!("environment variable {} is not valid UTF-8", source.env)
+                            }
+                        })?
+                    }
+                };
+                Ok((name, value))
+            })
+            .collect::<Result<_, String>>()?;
         let mut names = std::collections::HashSet::new();
         let mut available = std::collections::HashSet::new();
         let mut steps = Vec::with_capacity(file.steps.len());
@@ -512,7 +545,7 @@ impl Scenario {
             if step.name.trim().is_empty() || !names.insert(step.name.clone()) {
                 return Err("step names must be nonempty and unique".into());
             }
-            let url_template = Template::compile(&step.url, &file.variables, &available)?;
+            let url_template = Template::compile(&step.url, &variables, &available)?;
             let (url, dynamic_url) = if url_template.dynamic {
                 (None, Some(url_template))
             } else {
@@ -525,7 +558,7 @@ impl Scenario {
             let mut dynamic_headers = Vec::new();
             for (key, value) in step.headers {
                 let key = HeaderName::from_bytes(key.as_bytes())?;
-                let value = Template::compile(&value, &file.variables, &available)?;
+                let value = Template::compile(&value, &variables, &available)?;
                 if value.dynamic {
                     dynamic_headers.push((key, value));
                 } else {
@@ -537,7 +570,7 @@ impl Scenario {
             }
             let (mut body, dynamic_body) = match step.body {
                 Some(value) => {
-                    let template = Template::compile(&value, &file.variables, &available)?;
+                    let template = Template::compile(&value, &variables, &available)?;
                     if template.dynamic {
                         (None, Some(template))
                     } else {
@@ -553,10 +586,7 @@ impl Scenario {
                 let fields: Vec<_> = fields
                     .into_iter()
                     .map(|(name, value)| {
-                        Ok((
-                            name,
-                            Template::compile(&value, &file.variables, &available)?,
-                        ))
+                        Ok((name, Template::compile(&value, &variables, &available)?))
                     })
                     .collect::<Result<_, RunError>>()?;
                 default_content_type = Some("application/x-www-form-urlencoded");
@@ -567,7 +597,7 @@ impl Scenario {
                 }
             }
             if let Some(value) = step.json_body {
-                let template = JsonTemplate::compile(value, &file.variables, &available)?;
+                let template = JsonTemplate::compile(value, &variables, &available)?;
                 default_content_type = Some("application/json");
                 if template.dynamic() {
                     json_body = Some(template);
@@ -587,7 +617,7 @@ impl Scenario {
                 let final_url = expect
                     .final_url
                     .map(|url| -> Result<Url, RunError> {
-                        let url: Url = expand(&url, &file.variables)?.parse()?;
+                        let url: Url = expand(&url, &variables)?.parse()?;
                         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
                             return Err("expected final URL must use HTTP or HTTPS".into());
                         }
@@ -596,7 +626,7 @@ impl Scenario {
                     .transpose()?;
                 let body_contains = expect
                     .body_contains
-                    .map(|body| expand(&body, &file.variables))
+                    .map(|body| expand(&body, &variables))
                     .transpose()?;
                 if body_contains.as_ref().is_some_and(String::is_empty) {
                     return Err(
@@ -607,7 +637,7 @@ impl Scenario {
                 for (name, value) in expect.headers {
                     expected_headers.insert(
                         HeaderName::from_bytes(name.as_bytes())?,
-                        HeaderValue::from_str(&expand(&value, &file.variables)?)?,
+                        HeaderValue::from_str(&expand(&value, &variables)?)?,
                     );
                 }
                 Expect {
@@ -621,7 +651,7 @@ impl Scenario {
             };
             let mut extract = BTreeMap::new();
             for (name, source) in step.extract {
-                if file.variables.contains_key(&name) || !available.insert(name.clone()) {
+                if variables.contains_key(&name) || !available.insert(name.clone()) {
                     return Err(format!("duplicate scenario variable: {name}").into());
                 }
                 let source = match source {

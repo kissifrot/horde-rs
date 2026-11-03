@@ -41,15 +41,18 @@ fn login_example_requires_authentication_and_keeps_sessions() {
     let mut scenario: serde_json::Value =
         serde_json::from_str(include_str!("../examples/login.json")).unwrap();
     scenario["variables"]["base_url"] = base.into();
+    scenario["variables"]["username"] = serde_json::json!({"env":"HORDE_TEST_LOGIN_USER"});
+    scenario["variables"]["password"] = serde_json::json!({"env":"HORDE_TEST_LOGIN_PASSWORD"});
     let path =
         std::env::temp_dir().join(format!("horde-login-example-{}.json", std::process::id()));
     for (password, expected_failures, protected_completed) in [("zugzug", 0, 2), ("wrong", 2, 0)] {
-        scenario["variables"]["password"] = password.into();
         std::fs::write(&path, serde_json::to_vec(&scenario).unwrap()).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+            .env("HORDE_TEST_LOGIN_USER", "grunt")
+            .env("HORDE_TEST_LOGIN_PASSWORD", password)
             .arg("--scenario")
             .arg(&path)
-            .args(["-n", "2", "-c", "2", "--json"])
+            .args(["-n", "2", "-c", "2", "--json", "--verbose"])
             .output()
             .unwrap();
         assert!(
@@ -60,6 +63,8 @@ fn login_example_requires_authentication_and_keeps_sessions() {
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["scenarios"]["failed"], expected_failures);
         assert_eq!(report["steps"][2]["completed"], protected_completed);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(password));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(password));
     }
     std::fs::remove_file(path).unwrap();
 }

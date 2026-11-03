@@ -530,6 +530,9 @@ fn versioned_schema_matches_scenario_validation() {
         serde_json::json!({"version":1,"name":"x", "steps":[{"name":"a", "url":"http://localhost/", "typo":true}]}),
         serde_json::json!({"version":1,"name":"x", "steps":[{"name":"a", "url":"http://localhost/", "wait_ms":-1}]}),
         serde_json::json!({"version":1,"name":"x", "variables":{"invalid-name":"x"}, "steps":[{"name":"a", "url":"http://localhost/"}]}),
+        serde_json::json!({"version":1,"name":"x", "variables":{"secret":{"env":"bad-name"}}, "steps":[{"name":"a", "url":"http://localhost/"}]}),
+        serde_json::json!({"version":1,"name":"x", "variables":{"secret":{"env":""}}, "steps":[{"name":"a", "url":"http://localhost/"}]}),
+        serde_json::json!({"version":1,"name":"x", "variables":{"secret":{"env":"OK", "default":"no"}}, "steps":[{"name":"a", "url":"http://localhost/"}]}),
     ] {
         assert!(!validator.is_valid(&document), "{document}");
         assert!(

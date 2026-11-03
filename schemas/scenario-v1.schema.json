@@ -11,7 +11,12 @@
     "variables": {
       "type": "object",
       "propertyNames": { "pattern": "^[A-Za-z0-9_]+$" },
-      "additionalProperties": { "type": "string" }
+      "additionalProperties": {
+        "oneOf": [
+          { "type": "string" },
+          { "type": "object", "additionalProperties": false, "required": ["env"], "properties": { "env": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" } } }
+        ]
+      }
     },
     "steps": {
       "type": "array",
