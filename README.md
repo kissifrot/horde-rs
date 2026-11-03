@@ -22,6 +22,7 @@ Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 | --- | --- | --- |
 | `<URL>` | Target HTTP or HTTPS URL; required unless using `--scenario`. | — |
 | `--scenario <FILE>` | Run a JSON scenario instead of a single URL. | Disabled |
+| `--validate` | Validate a scenario without sending requests; requires `--scenario`. | Disabled |
 | `--auto-referer` | Derive `Referer` between scenario steps; requires `--scenario`. | Disabled |
 | `-n, --requests <REQUESTS>` | Total requests, or scenario iterations; must be positive. | `1` |
 | `-c, --concurrency <CONCURRENCY>` | Maximum concurrent requests or virtual users; must be positive. | `1` |
@@ -92,6 +93,8 @@ Each user has its own cookie jar, retained across its iterations. Each step has 
 With `-v`, stderr shows each user's scenario start, waits, step results and final outcome with relative timestamps. URLs, headers, bodies, cookies and variable values are omitted; step names are shown. JSON remains on stdout. Logging can affect timing and throughput.
 
 Invalid scenario files are rejected before the run. Errors identify the file and, when available, a JSON path or step and field; JSON syntax errors include a line and column. With `-v`, variable preparation and extraction failures also identify the affected field or extraction variable and a reason without printing its value or the response body. File paths, step names, field names and variable names may appear in diagnostics and must not contain secrets.
+
+Use `horde --scenario examples/journey.json --validate` to check a scenario without sending HTTP requests. Horde performs the same loading and validation as a normal run, including resolving required environment variables. Success exits with code 0; errors are reported on stderr with a nonzero exit code. With `--json`, success prints `{"schema_version":1,"type":"scenario_validation","valid":true}`. Execution options such as concurrency, duration and thresholds cannot be combined with `--validate`. Validation does not check server responses, assertions against live responses or dynamic extraction values.
 
 Define values under `variables` and refer to them as `{{name}}` in step URLs, header values and bodies. Values can be literal strings or explicitly loaded from the process environment:
 

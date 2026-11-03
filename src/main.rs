@@ -43,6 +43,9 @@ struct Args {
     /// Run a JSON scenario instead of testing a single URL.
     #[arg(long, conflicts_with_all = ["method", "headers", "body_file", "no_connection_reuse", "max_p95_ms"])]
     scenario: Option<PathBuf>,
+    /// Validate a scenario without making HTTP requests.
+    #[arg(long, requires = "scenario", conflicts_with_all = ["auto_referer", "requests", "concurrency", "timeout", "user_agent", "duration", "rate", "verbose", "bounded_latency", "max_failure_rate", "max_step_p95_ms", "follow_redirects", "max_redirects"])]
+    validate: bool,
     /// Derive Referer between scenario steps (requires --scenario).
     #[arg(long, requires = "scenario")]
     auto_referer: bool,
@@ -126,6 +129,17 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         })?;
         let scenario = Scenario::from_json(&input)
             .map_err(|error| ScenarioDiagnostic(format!("scenario {}: {error}", path.display())))?;
+        if args.validate {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version": 1, "type": "scenario_validation", "valid": true})
+                );
+            } else {
+                println!("Scenario is valid.");
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         let mut report = run_scenario_config(
             scenario,
             args.requests.unwrap_or(if args.duration.is_some() {
