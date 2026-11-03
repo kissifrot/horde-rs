@@ -26,15 +26,15 @@ Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 | `-n, --requests <REQUESTS>` | Total requests, or scenario iterations; must be positive. | `1` |
 | `-c, --concurrency <CONCURRENCY>` | Maximum concurrent requests or virtual users; must be positive. | `1` |
 | `-t, --timeout <TIMEOUT>` | Timeout per request, in seconds; must be positive. | `30` |
-| `-X, --method <METHOD>` | HTTP method. | `GET` |
-| `-H, --header <HEADERS>` | HTTP header as `Name: value`; may be repeated. | None |
+| `-X, --method <METHOD>` | HTTP method for single-URL tests. | `GET` |
+| `-H, --header <HEADERS>` | HTTP header as `Name: value`; may be repeated; single-URL tests only. | None |
 | `-A, --user-agent <USER_AGENT>` | Set `User-Agent`; overrides `-H` for single-URL tests. Scenario step headers take precedence. | `Horde/<version>` (e.g. `Horde/0.1.0`) |
-| `--body-file <BODY_FILE>` | Read a request body from a file and reuse it for every request. | No body |
+| `--body-file <BODY_FILE>` | Read a request body from a file and reuse it for every request; single-URL tests only. | No body |
 | `--duration <DURATION>` | Stop starting new requests or scenario iterations after this many seconds; must be positive. | No duration limit |
 | `--rate <RATE>` | Target starts per second for logical requests or scenario iterations, from 1 to 1,000,000,000. | Unlimited |
 | `-v, --verbose` | Log the start and result of every request to stderr. | Disabled |
 | `--bounded-latency` | Use bounded-memory HDR histograms for approximate percentiles. | Disabled (exact samples) |
-| `--no-connection-reuse` | Disable reuse of HTTP connections. | Reuse enabled |
+| `--no-connection-reuse` | Disable reuse of HTTP connections for single-URL tests. | Reuse enabled |
 | `--max-failure-rate <PERCENT>` | Maximum failed request or scenario percentage, from 0 to 100. | Disabled |
 | `--max-p95-ms <MILLISECONDS>` | Maximum p95 request latency for a single-URL test. | Disabled |
 | `--max-step-p95-ms <MILLISECONDS>` | Maximum p95 latency for every scenario step; requires `--scenario`. | Disabled |
@@ -60,10 +60,16 @@ The file is read once and reused. The method is not changed automatically. Redir
 
 ### User journeys
 
-Use `--scenario` to run an ordered sequence of HTTP steps, as in [examples/journey.json](examples/journey.json):
+Use `--scenario` to run an ordered sequence of HTTP steps. To run [examples/journey.json](examples/journey.json), start the local demo server in one terminal:
 
 ```sh
-horde --scenario examples/journey.json -n 100 -c 10 --json
+python3 examples/login_server.py
+```
+
+Then run the scenario in another terminal:
+
+```sh
+./target/release/horde --scenario examples/journey.json -n 100 -c 10 --json
 ```
 
 Scenarios must declare `"version": 1` and are validated against the bundled [version 1 JSON Schema](schemas/scenario-v1.schema.json) before execution. The optional `$schema` field helps compatible editors find the schema; Horde uses its bundled copy and does not fetch the URI. Horde also validates semantics that JSON Schema cannot express here, including unique step names, variable references, HTTP methods and the expanded URLs.
@@ -71,6 +77,8 @@ Scenarios must declare `"version": 1` and are validated against the bundled [ver
 Here `-n` is the total number of scenario iterations and `-c` is the maximum number of virtual users. With `--duration`, Horde stops starting iterations at the deadline but lets active iterations finish, including their waits and remaining steps. With both `-n` and `--duration`, the first limit reached applies; with `--duration` alone there is no explicit iteration limit. Without either, Horde runs one iteration. Use `--bounded-latency` to limit latency storage for long tests.
 
 `--rate` sets a shared target for starting scenario iterations per second, not a limit on individual HTTP requests. Each user runs one iteration at a time; if all users are busy, the achieved rate can be lower. Steps and redirects are not independently rate-limited. Time waiting for a start slot is excluded from scenario and step latencies. No iteration starts after the duration limit, including one waiting for a slot.
+
+With a fixed number of users, a slow service can reduce the number of iterations started. Reported latencies cover executed iterations and steps; they do not measure delay for iterations that could not start while all users were busy.
 
 The report shows the target start rate when set and completed iterations per second. The latter is completed iterations divided by total elapsed time, including time spent finishing active iterations after the duration limit; it is not the observed start rate. JSON reports these values as `scenarios.target_starts_per_second` and `scenarios.completed_per_second`.
 
@@ -166,7 +174,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-The library separates the test plan, local execution and report from the CLI. Distributed mode is not implemented and no remote listener is enabled. See the [proposed distributed design](docs/distributed.md) for agent security, result aggregation and implementation steps.
+The library separates the test plan, local execution and report from the CLI. Distributed mode is not implemented and no remote listener is enabled.
 
 ### Local performance benchmark
 

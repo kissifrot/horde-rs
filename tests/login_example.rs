@@ -14,7 +14,7 @@ impl Drop for DemoServer {
 }
 
 #[test]
-fn login_example_requires_authentication_and_keeps_sessions() {
+fn local_examples_cover_journey_authentication_and_session_isolation() {
     let mut server = DemoServer(
         Command::new("python3")
             .args(["examples/login_server.py", "--port", "0"])
@@ -66,5 +66,25 @@ fn login_example_requires_authentication_and_keeps_sessions() {
         assert!(!String::from_utf8_lossy(&output.stdout).contains(password));
         assert!(!String::from_utf8_lossy(&output.stderr).contains(password));
     }
+    let mut journey: serde_json::Value =
+        serde_json::from_str(include_str!("../examples/journey.json")).unwrap();
+    journey["variables"]["base_url"] = base.into();
+    std::fs::write(&path, serde_json::to_vec(&journey).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .arg("--scenario")
+        .arg(&path)
+        .args(["-n", "2", "-c", "2", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["scenarios"]["completed"], 2);
+    assert_eq!(report["scenarios"]["failed"], 0);
+    assert_eq!(report["steps"][0]["status_codes"]["200"], 2);
+    assert_eq!(report["steps"][1]["status_codes"]["200"], 2);
     std::fs::remove_file(path).unwrap();
 }

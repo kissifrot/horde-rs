@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback-only demo server for login.json; not a production server."""
+"""Loopback-only demo server for the journey and login examples; not for production."""
 import argparse
 import hmac
 import secrets
@@ -25,7 +25,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
-        if path == "/login":
+        if path == "/":
+            self.respond(200, '<a href="/next">Next page</a>')
+        elif path == "/next":
+            self.respond(200, "Next page")
+        elif path == "/login":
             self.respond(200, '<form method="post" action="/login"><input name="username"><input name="password" type="password"><button>Log in</button></form>')
         elif path == "/protected":
             jar = cookies.SimpleCookie()
