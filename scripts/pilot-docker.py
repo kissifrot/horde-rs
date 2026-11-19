@@ -3,7 +3,7 @@
 
 import argparse
 from contextlib import ExitStack
-from datetime import datetime
+from datetime import datetime, timezone
 import ipaddress
 import json
 import os
@@ -238,14 +238,17 @@ def pilot(binary):
                   "--requests", str(budget), "--concurrency", "2", "--rate", "4",
                   "--deadline", "30", "--max-failure-rate", "0")
 
-        def collect(name, expected_exit):
+        def collect_output(name, expected_exit):
             container = f"{prefix}-{name}"
             exit_code = docker("wait", container, timeout=40).stdout.strip()
             result = logs(name)
             require(exit_code == str(expected_exit), f"{name} exited with {exit_code}",
                     result.stdout + result.stderr)
             remove("rm", container)
-            return json.loads(result.stdout)
+            return result.stdout
+
+        def collect(name, expected_exit):
+            return json.loads(collect_output(name, expected_exit))
 
         def preflight(name, leaf, roots, states, inventory_file="grunts.json", *, source_ip=None):
             before = target_connections()
@@ -273,6 +276,51 @@ def pilot(binary):
                     and metrics["status_codes"] == {"200": completed}, "Unexpected totals", metrics)
             require(0 < report["latency_ms"]["p95"] <= report["latency_ms"]["p99"],
                     "Unexpected merged percentiles", report["latency_ms"])
+
+        def controller_stop(signal_name, expected_exit, latest_request_limit):
+            name = f"controller-{signal_name.lower()}"
+            start_grunts(name, ("new", "new"), ("new",), ("new",))
+            start_controller(name, 40)
+            wait_for(lambda: all(target_connections().values()), "workload on both Grunts", timeout=5)
+            signal_sent_at = datetime.now(timezone.utc)
+            observe_until = time.monotonic() + 7.0
+            docker("kill", "--signal", signal_name, f"{prefix}-{name}")
+            output = collect_output(name, expected_exit)
+            if signal_name == "SIGINT":
+                report = json.loads(output)
+                require(report["partial"] and report["interruption"] == "sigint"
+                        and report["thresholds"]["failure_rate"] == "not_evaluable"
+                        and {agent["address"]: agent["status"] for agent in report["agents"]}
+                        == dict.fromkeys(addresses.values(), "cancelled"),
+                        "Expected both Grunts to acknowledge cancellation after SIGINT", report)
+            else:
+                require(not output.strip(), "Killed controller unexpectedly emitted a report", output)
+                report = None
+
+            # Observe targets independently of the controller's exit status and stdout.
+            time.sleep(max(0.0, observe_until - time.monotonic()))
+            observed_at = datetime.now(timezone.utc)
+            targets = {}
+            for role in GRUNTS:
+                arrivals = timestamps(grunt_names[role], "pilot-http: connection")
+                require(0 < len(arrivals) < 20 and arrivals[0] <= signal_sent_at,
+                        f"{role} must start but leave part of its budget unused", len(arrivals))
+                last_request = (arrivals[-1] - signal_sent_at).total_seconds()
+                quiet_seconds = (observed_at - arrivals[-1]).total_seconds()
+                require(last_request <= latest_request_limit and quiet_seconds >= 3.0,
+                        f"{role} did not stop within the expected time", (last_request, quiet_seconds))
+                targets[role] = {
+                    "target_connections": len(arrivals),
+                    "last_request_seconds_from_signal": last_request,
+                    "quiet_seconds": quiet_seconds,
+                }
+            ready = preflight(f"{name}-preflight", "new", ("new",), ("ready", "ready"))
+            stopped_counts = {role: target["target_connections"] for role, target in targets.items()}
+            require(target_connections() == stopped_counts,
+                    "A Grunt resumed workload during the post-stop preflight", targets)
+            print(f"{signal_name} passed: both Grunts stopped at {stopped_counts}.", flush=True)
+            return {"exit_code": expected_exit, "controller_report": report, "targets": targets,
+                    "post_stop_preflight": ready}
 
         try:
             both_ready = ("ready", "ready")
@@ -422,6 +470,11 @@ def pilot(binary):
             require(recovered == {"grunt-a": 1, "grunt-b": 1},
                     "Unexpected workload after restart", recovered)
             print("Capacity diagnostics and controlled Grunt restart passed.", flush=True)
+
+            stopped_controllers = {
+                "sigint": controller_stop("SIGINT", 130, latest_request_limit=1.5),
+                "sigkill": controller_stop("SIGKILL", 137, latest_request_limit=4.0),
+            }
         except Exception:
             for container in containers:
                 result = docker("logs", container, check=False)
@@ -454,6 +507,7 @@ def pilot(binary):
                 "grunt_exit_code": int(exit_code),
                 "recovery": {"controller_report": recovery, "target_connections": recovered},
             },
+            "controller_stop": stopped_controllers,
         }
 
 

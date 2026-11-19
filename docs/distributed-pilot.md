@@ -267,6 +267,15 @@ ports are published.
   both saturation reasons and their HTTP effects, stops B with SIGTERM,
   and verifies that only B's epoch changes. A fresh two-request run then
   completes with one request on each Grunt.
+- The controller stop scenarios send `SIGINT` and `SIGKILL` with both
+  Grunts running. `SIGINT` must exit 130 with a partial report confirming
+  both cancellations. `SIGKILL` must exit 137 with no controller report.
+  For both signals, the Docker pilot observes the HTTP fixtures for seven
+  seconds after sending the signal. Each Grunt must leave part of its
+  20-request share unused and remain quiet for at least three seconds.
+  The last HTTP connection must occur by 1.5 seconds after `SIGINT` or
+  four seconds after `SIGKILL`. The pilot finishes with an authenticated
+  preflight to verify that both Grunts are still reachable.
 
 The script removes its containers, network, image and temporary
 credentials on exit, including on failure, SIGINT or SIGTERM. It writes
