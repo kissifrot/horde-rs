@@ -636,6 +636,7 @@ dependencies = [
  "clap",
  "futures-util",
  "hdrhistogram",
+ "ipnet",
  "jsonschema",
  "reqwest",
  "scraper",

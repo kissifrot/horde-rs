@@ -280,6 +280,12 @@ async fn run_impl(
     if !plan.reuse_connections {
         builder = builder.pool_max_idle_per_host(0);
     }
+    #[cfg(feature = "distributed-offline")]
+    if let Some(options) = &control {
+        builder = builder
+            .no_proxy()
+            .dns_resolver(Arc::new(options.policy.clone()));
+    }
     let client = builder.build()?;
     let next = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
@@ -320,6 +326,8 @@ async fn run_impl(
         let worker_gate = gate.clone();
         #[cfg(feature = "distributed-offline")]
         let worker_cancel = control.as_ref().map(|options| options.cancel.clone());
+        #[cfg(feature = "distributed-offline")]
+        let worker_policy = control.as_ref().map(|options| options.policy.clone());
         #[cfg(feature = "distributed-offline")]
         let worker_stop_tx = stop_signal.as_ref().map(|(tx, _)| tx.clone());
         #[cfg(feature = "distributed-offline")]
@@ -419,7 +427,15 @@ async fn run_impl(
                 }
                 let result = if plan.follow_redirects {
                     match request.build() {
-                        Ok(request) => redirect::send(&client, request, plan.max_redirects, plan.timeout, Some(&redirects_followed)).await,
+                        Ok(request) => {
+                            #[cfg(feature = "distributed-offline")]
+                            let allowed = |request: &reqwest::Request| worker_policy.as_ref().is_none_or(|policy| {
+                                policy.allows_url(request.url()) && policy.allows_headers(request.headers())
+                            });
+                            #[cfg(not(feature = "distributed-offline"))]
+                            let allowed = |_: &reqwest::Request| true;
+                            redirect::send_checked(&client, request, plan.max_redirects, plan.timeout, Some(&redirects_followed), allowed).await
+                        }
                         Err(error) => Err(redirect::RedirectError::Request(error)),
                     }
                 } else {

@@ -23,6 +23,12 @@ Each agent has local allowlists for target schemes, hostnames, ports and resolve
 
 Set finite local limits for concurrent runs, requests, concurrency, request rate, duration, per-request timeout, redirect count, body and header sizes, result size and memory. The agent rejects plans exceeding its limits; the controller cannot raise them. Each run has a finite duration and is cancellable. An agent must not execute arbitrary local file reads: request bodies, if supported, are bounded data in the plan.
 
+### In-process Grunt policy
+
+With `distributed-offline`, `run_local` requires a trusted `GruntPolicy`. Its allowed origins are exact scheme, hostname and port tuples. Literal IP addresses must also match an allowed CIDR. For a hostname, the HTTP connector receives the checked OS resolver answers directly and rejects the whole answer set if any address is outside policy. It keeps the URL hostname for HTTP Host and TLS verification. Every redirect is checked before it is followed. A reused connection already uses a checked destination. The Grunt client disables environment and system proxies.
+
+The local caller supplies `AgentLimits` for samples, concurrency, rate and duration. The policy also checks request timeout, redirects, explicit headers, request body and worst-case encoded histogram size before starting. Clones of the same policy share admission limits for active runs and histogram count-array memory. The memory reservation covers active collectors and their merge array. Retained results, connection buffers and other process allocations are outside this accounting, and a future transport still needs its own framing, session and queued-result limits.
+
 ## Run lifecycle and results
 
 The protocol needs explicit versioned operations to submit, inspect and cancel a run. Give each run an unpredictable identifier scoped to the authenticated controller. Define duplicate submissions, disconnects, cancellation, expiry and restart behavior before implementation; retries must not accidentally execute the same load twice. A controller cannot inspect or cancel another identity's run without local authorization.

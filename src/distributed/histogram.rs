@@ -12,6 +12,14 @@ const V2_HEADER: usize = 40;
 /// Largest possible version-1 envelope, independently of receiver limits.
 pub const MAX_ENVELOPE_BYTES: usize = ENVELOPE + V2_HEADER + 9 * SLOTS;
 
+pub(super) const COUNT_ARRAY_BYTES: usize = SLOTS * std::mem::size_of::<u64>();
+
+pub(super) fn max_bytes_for_samples(samples: u64) -> usize {
+    // Each occupied bucket has one count and at most one preceding zero run.
+    // The serializer emits one zero for an empty histogram.
+    ENVELOPE + V2_HEADER + 9 * (SLOTS as u64).min(samples.saturating_mul(2).max(1)) as usize
+}
+
 /// Limits are supplied by the receiver, never by the encoded histogram.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodeLimits {

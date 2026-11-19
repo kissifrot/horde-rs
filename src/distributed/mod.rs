@@ -2,10 +2,12 @@
 #![forbid(unsafe_code)]
 
 mod histogram;
+mod policy;
 mod result;
 pub use histogram::{
     DecodeLimits, DistributedHistogram, MAX_ENVELOPE_BYTES, decode_histogram, encode_histogram,
 };
+pub use policy::{GruntPolicy, ResourceLimits};
 pub use result::{CompletedResult, CompletionReason, ResultMetrics};
 
 /// Outcome of a single local agent run; partial runs never expose metrics.
@@ -25,6 +27,7 @@ pub(crate) struct LocalControl {
     pub budget: Budget,
     pub limits: AgentLimits,
     pub cancel: tokio::sync::watch::Receiver<bool>,
+    pub policy: GruntPolicy,
 }
 
 pub use crate::Cancellation;
@@ -70,9 +73,11 @@ pub async fn run_local(
     mut plan: crate::TestPlan,
     budget: Budget,
     limits: AgentLimits,
+    policy: &GruntPolicy,
     cancel: Cancellation,
 ) -> Result<LocalOutcome, Box<dyn std::error::Error + Send + Sync>> {
     preflight(budget, limits, plan.timeout)?;
+    let _reservation = policy.reserve(&plan, budget, limits)?;
     plan.requests = match budget.requests {
         Some(n) => usize::try_from(n)?,
         None => usize::MAX,
@@ -88,6 +93,7 @@ pub async fn run_local(
             budget,
             limits,
             cancel: receiver,
+            policy: policy.clone(),
         }),
         None,
     )

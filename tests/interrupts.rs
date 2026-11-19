@@ -214,7 +214,10 @@ fn grunt_signal_fixture() {
     runtime.block_on(async {
         use horde_rs::{
             TestPlan,
-            distributed::{AgentLimits, Budget, LocalOutcome, StopReason, run_local},
+            distributed::{
+                AgentLimits, Budget, GruntPolicy, LocalOutcome, MAX_ENVELOPE_BYTES, ResourceLimits,
+                StopReason, run_local,
+            },
         };
         let cancel = horde_rs::Cancellation::new();
         let signals = signals::install(cancel.clone()).unwrap();
@@ -246,8 +249,24 @@ fn grunt_signal_fixture() {
             max_rate_per_second: 10,
             max_duration: Duration::from_secs(15),
         };
+        let policy = GruntPolicy::new(
+            vec![plan.url.clone()],
+            vec!["127.0.0.1/32".parse().unwrap()],
+            ResourceLimits {
+                max_active_runs: 1,
+                max_active_histogram_bytes: 1024 * 1024,
+                max_histogram_bytes: MAX_ENVELOPE_BYTES,
+                max_request_timeout: Duration::from_secs(10),
+                max_redirects: 0,
+                max_body_bytes: 0,
+                max_header_bytes: 0,
+            },
+        )
+        .unwrap();
         assert!(matches!(
-            run_local(plan, budget, limits, cancel).await.unwrap(),
+            run_local(plan, budget, limits, &policy, cancel)
+                .await
+                .unwrap(),
             LocalOutcome::Partial {
                 reason: StopReason::Cancelled
             }

@@ -4,8 +4,8 @@ mod common;
 use horde_rs::{
     TestPlan,
     distributed::{
-        self, AgentLimits, AgentStatus, Aggregate, Budget, DecodeLimits, LocalOutcome, StopReason,
-        ThresholdResult,
+        self, AgentLimits, AgentStatus, Aggregate, Budget, DecodeLimits, GruntPolicy, LocalOutcome,
+        ResourceLimits, StopReason, ThresholdResult,
     },
 };
 use reqwest::{Method, Url, header::HeaderMap};
@@ -35,6 +35,37 @@ fn plan(port: u16, timeout: Duration) -> TestPlan {
         max_redirects: 10,
     }
 }
+fn resources() -> ResourceLimits {
+    ResourceLimits {
+        max_active_runs: 2,
+        max_active_histogram_bytes: 8 * 1024 * 1024,
+        max_histogram_bytes: distributed::MAX_ENVELOPE_BYTES,
+        max_request_timeout: Duration::from_secs(10),
+        max_redirects: 10,
+        max_body_bytes: 1024,
+        max_header_bytes: 1024,
+    }
+}
+
+fn policy(urls: Vec<Url>, resources: ResourceLimits) -> GruntPolicy {
+    GruntPolicy::new(
+        urls,
+        vec!["127.0.0.1/32".parse().unwrap(), "::1/128".parse().unwrap()],
+        resources,
+    )
+    .unwrap()
+}
+
+async fn run_local(
+    plan: TestPlan,
+    budget: Budget,
+    limits: AgentLimits,
+    cancel: distributed::Cancellation,
+) -> Result<LocalOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    let policy = policy(vec![plan.url.clone()], resources());
+    distributed::run_local(plan, budget, limits, &policy, cancel).await
+}
+
 fn budget() -> Budget {
     Budget {
         requests: Some(1),
@@ -74,7 +105,7 @@ async fn duration_drains_the_started_request() {
             .unwrap();
     });
     let rx = distributed::Cancellation::new();
-    let result = distributed::run_local(
+    let result = run_local(
         plan(port, Duration::from_secs(1)),
         Budget {
             requests: None,
@@ -129,7 +160,7 @@ async fn deadline_aborts_and_joins_request_with_partial_body() {
     });
     let rx = distributed::Cancellation::new();
     let started = Instant::now();
-    let result = distributed::run_local(
+    let result = run_local(
         plan(port, Duration::from_secs(3)),
         budget(),
         limits(Duration::from_millis(180)),
@@ -177,7 +208,7 @@ async fn cancellation_aborts_and_joins_request_with_partial_body() {
     });
     let tx = distributed::Cancellation::new();
     let rx = tx.clone();
-    let task = tokio::spawn(distributed::run_local(
+    let task = tokio::spawn(run_local(
         plan(port, Duration::from_secs(3)),
         budget(),
         limits(Duration::from_secs(4)),
@@ -207,7 +238,7 @@ async fn cancel_before_start_never_opens_connection() {
     server.set_nonblocking(true).unwrap();
     let rx = distributed::Cancellation::new();
     rx.cancel();
-    let result = distributed::run_local(
+    let result = run_local(
         plan(port, Duration::from_secs(1)),
         budget(),
         limits(Duration::from_secs(2)),
@@ -244,7 +275,7 @@ async fn request_timeout_before_deadline_is_a_completed_failure() {
         let _ = stream.read(&mut byte);
     });
     let rx = distributed::Cancellation::new();
-    let result = distributed::run_local(
+    let result = run_local(
         plan(port, Duration::from_millis(80)),
         budget(),
         limits(Duration::from_secs(2)),
@@ -288,7 +319,7 @@ async fn cancelled_during_rate_wait_does_not_launch_reserved_request() {
     });
     let tx = distributed::Cancellation::new();
     let rx = tx.clone();
-    let task = tokio::spawn(distributed::run_local(
+    let task = tokio::spawn(run_local(
         plan(port, Duration::from_secs(3)),
         Budget {
             requests: Some(2),
@@ -328,7 +359,7 @@ async fn duration_stops_a_reserved_rate_slot_and_counts_actual_starts() {
             .unwrap();
     });
     let rx = distributed::Cancellation::new();
-    let result = distributed::run_local(
+    let result = run_local(
         plan(port, Duration::from_secs(1)),
         Budget {
             requests: Some(2),
@@ -369,7 +400,7 @@ async fn duration_only_run_marks_sample_cap_partial() {
             .unwrap();
     });
     let rx = distributed::Cancellation::new();
-    let result = distributed::run_local(
+    let result = run_local(
         plan(port, Duration::from_secs(1)),
         Budget {
             requests: None,
@@ -425,7 +456,7 @@ async fn deadline_cancels_a_redirect_chain_and_closes_the_connection() {
     let rx = distributed::Cancellation::new();
     let mut p = plan(port, Duration::from_secs(3));
     p.follow_redirects = true;
-    let result = distributed::run_local(p, budget(), limits(Duration::from_millis(200)), rx)
+    let result = run_local(p, budget(), limits(Duration::from_millis(200)), rx)
         .await
         .unwrap();
     assert!(matches!(
@@ -460,10 +491,9 @@ async fn sample_cap_wakes_other_workers_waiting_for_rate_slots() {
     local_limits.max_concurrency = 3;
     local_limits.max_samples = 1;
     let started = Instant::now();
-    let result =
-        distributed::run_local(plan(port, Duration::from_secs(2)), budget, local_limits, rx)
-            .await
-            .unwrap();
+    let result = run_local(plan(port, Duration::from_secs(2)), budget, local_limits, rx)
+        .await
+        .unwrap();
     assert!(matches!(
         result,
         LocalOutcome::Partial {
@@ -503,7 +533,7 @@ async fn cancellation_before_response_headers_closes_connection() {
     });
     let tx = distributed::Cancellation::new();
     let rx = tx.clone();
-    let task = tokio::spawn(distributed::run_local(
+    let task = tokio::spawn(run_local(
         plan(port, Duration::from_secs(3)),
         budget(),
         limits(Duration::from_secs(4)),
@@ -583,7 +613,7 @@ async fn cancellation_joins_all_concurrent_in_flight_requests() {
     };
     let mut local_limits = limits(Duration::from_secs(5));
     local_limits.max_concurrency = 4;
-    let task = tokio::spawn(distributed::run_local(
+    let task = tokio::spawn(run_local(
         plan(port, Duration::from_secs(4)),
         budget,
         local_limits,
@@ -658,13 +688,13 @@ async fn two_grunts_split_budget_and_merge_observed_results() {
     let (slow_port, slow_server) = serve(20, true);
     let agent_limits = limits(Duration::from_secs(10));
     let (fast, slow) = tokio::join!(
-        distributed::run_local(
+        run_local(
             plan(fast_port, Duration::from_secs(3)),
             shares[0],
             agent_limits,
             distributed::Cancellation::new()
         ),
-        distributed::run_local(
+        run_local(
             plan(slow_port, Duration::from_secs(3)),
             shares[1],
             agent_limits,
@@ -763,13 +793,13 @@ async fn cancelled_grunt_keeps_aggregate_partial_without_contributing_metrics() 
     let agent_limits = limits(Duration::from_secs(8));
     let cancel = distributed::Cancellation::new();
     let (finished, cancelled, ()) = tokio::join!(
-        distributed::run_local(
+        run_local(
             plan(finished_port, Duration::from_secs(5)),
             share,
             agent_limits,
             distributed::Cancellation::new()
         ),
-        distributed::run_local(
+        run_local(
             plan(pending_port, Duration::from_secs(5)),
             cancelled_share,
             agent_limits,
@@ -827,4 +857,345 @@ async fn cancelled_grunt_keeps_aggregate_partial_without_contributing_metrics() 
         .unwrap();
     assert_eq!(thresholds.failure_rate, ThresholdResult::NotEvaluable);
     assert_eq!(thresholds.p95, ThresholdResult::NotEvaluable);
+}
+
+#[tokio::test]
+async fn grunt_rejects_unapproved_origin_and_ip_before_connecting() {
+    let target = listener();
+    let mut request = plan(target.local_addr().unwrap().port(), Duration::from_secs(1));
+    let allowed = policy(vec![request.url.clone()], resources());
+    request.url.set_scheme("https").unwrap();
+    let error = distributed::run_local(
+        request,
+        budget(),
+        limits(Duration::from_secs(2)),
+        &allowed,
+        distributed::Cancellation::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "Grunt target denied by policy");
+
+    let request = plan(target.local_addr().unwrap().port(), Duration::from_secs(1));
+    let denied_ip = GruntPolicy::new(
+        vec![request.url.clone()],
+        vec!["192.0.2.0/24".parse().unwrap()],
+        resources(),
+    )
+    .unwrap();
+    let error = distributed::run_local(
+        request,
+        budget(),
+        limits(Duration::from_secs(2)),
+        &denied_ip,
+        distributed::Cancellation::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "Grunt target denied by policy");
+    assert_no_connection(&target);
+}
+
+fn assert_no_connection(listener: &TcpListener) {
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn grunt_checks_every_redirect_origin() {
+    let first = listener();
+    let middle = listener();
+    let denied = listener();
+    let mut request = plan(first.local_addr().unwrap().port(), Duration::from_secs(2));
+    request.follow_redirects = true;
+    let middle_url = format!("http://{}/", middle.local_addr().unwrap());
+    let denied_url = format!("http://{}/", denied.local_addr().unwrap());
+    let local_policy = policy(
+        vec![request.url.clone(), middle_url.parse().unwrap()],
+        resources(),
+    );
+    let server = thread::spawn(move || {
+        for (listener, location) in [(first, middle_url), (middle, denied_url)] {
+            let (mut stream, _) = common::accept(&listener);
+            read_request(&mut stream);
+            write!(stream, "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        }
+    });
+    let result = distributed::run_local(
+        request,
+        budget(),
+        limits(Duration::from_secs(3)),
+        &local_policy,
+        distributed::Cancellation::new(),
+    )
+    .await
+    .unwrap();
+    let LocalOutcome::Complete { report, .. } = result else {
+        panic!("expected completed request attempt");
+    };
+    assert_eq!(report.other_failures, 1);
+    assert_eq!(report.redirects_followed, 1);
+    assert_eq!(report.connections_opened, 2);
+    assert_no_connection(&denied);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn approved_hostname_cannot_connect_to_unapproved_dns_addresses() {
+    let target = listener();
+    let mut request = plan(target.local_addr().unwrap().port(), Duration::from_secs(2));
+    request.url.set_host(Some("localhost")).unwrap();
+    let dns_policy = GruntPolicy::new(
+        vec![request.url.clone()],
+        vec!["192.0.2.0/24".parse().unwrap()],
+        resources(),
+    )
+    .unwrap();
+    let result = distributed::run_local(
+        request,
+        budget(),
+        limits(Duration::from_secs(3)),
+        &dns_policy,
+        distributed::Cancellation::new(),
+    )
+    .await
+    .unwrap();
+    let LocalOutcome::Complete { report, .. } = result else {
+        panic!("expected completed request attempt");
+    };
+    assert_eq!(report.connection_failures, 1);
+    assert_eq!(report.connections_opened, 0);
+    assert_no_connection(&target);
+}
+
+#[tokio::test]
+async fn grunt_rejects_oversized_plans_before_connecting() {
+    let listener = listener();
+    let base = plan(
+        listener.local_addr().unwrap().port(),
+        Duration::from_secs(1),
+    );
+    let config = ResourceLimits {
+        max_body_bytes: 1,
+        max_header_bytes: 5,
+        max_request_timeout: Duration::from_secs(1),
+        max_redirects: 1,
+        ..resources()
+    };
+    let local_policy = policy(vec![base.url.clone()], config);
+    let mut body = base.clone();
+    body.body = Some(bytes::Bytes::from_static(b"xx"));
+    let mut headers = base.clone();
+    headers.headers.append("xy", "z".parse().unwrap());
+    headers.headers.append("xy", "w".parse().unwrap());
+    for request in [
+        body,
+        headers,
+        TestPlan {
+            timeout: Duration::from_secs(2),
+            ..base.clone()
+        },
+        TestPlan {
+            follow_redirects: true,
+            max_redirects: 2,
+            ..base.clone()
+        },
+    ] {
+        let error = distributed::run_local(
+            request,
+            budget(),
+            limits(Duration::from_secs(3)),
+            &local_policy,
+            distributed::Cancellation::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Grunt request exceeds resource policy");
+    }
+    for (config, expected) in [
+        (
+            ResourceLimits {
+                max_histogram_bytes: 83,
+                ..config
+            },
+            "Grunt histogram result exceeds policy",
+        ),
+        (
+            ResourceLimits {
+                max_active_histogram_bytes: 1,
+                ..config
+            },
+            "Grunt histogram memory limit reached",
+        ),
+    ] {
+        let policy = policy(vec![base.url.clone()], config);
+        let error = distributed::run_local(
+            base.clone(),
+            budget(),
+            limits(Duration::from_secs(3)),
+            &policy,
+            distributed::Cancellation::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
+    assert_no_connection(&listener);
+}
+
+#[test]
+fn grunt_ignores_environment_proxy() {
+    use common::CommandTimeout;
+    let proxy = listener();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "grunt_proxy_fixture", "--ignored", "--nocapture"])
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env("all_proxy", &proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output_timeout()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_no_connection(&proxy);
+}
+
+#[tokio::test]
+#[ignore = "subprocess fixture for grunt_ignores_environment_proxy"]
+async fn grunt_proxy_fixture() {
+    let target = listener();
+    let port = target.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = common::accept(&target);
+        let mut reader = std::io::BufReader::new(&mut stream);
+        use std::io::BufRead;
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.starts_with("GET / HTTP/1.1"));
+        let expected_host = format!("host: localhost:{port}\r\n");
+        let mut received_host = false;
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            received_host |= line.eq_ignore_ascii_case(&expected_host);
+        }
+        assert!(received_host);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let mut request = plan(port, Duration::from_secs(2));
+    request.url.set_host(Some("localhost")).unwrap();
+    let result = run_local(
+        request,
+        budget(),
+        limits(Duration::from_secs(3)),
+        distributed::Cancellation::new(),
+    )
+    .await
+    .unwrap();
+    let LocalOutcome::Complete { report, .. } = result else {
+        panic!("expected completed request attempt");
+    };
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.status_codes.get(&200), Some(&1));
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn grunt_shares_run_and_histogram_limits_and_releases_them_after_cancellation() {
+    for (config, expected) in [
+        (
+            ResourceLimits {
+                max_active_runs: 1,
+                ..resources()
+            },
+            "Grunt active run limit reached",
+        ),
+        (
+            ResourceLimits {
+                max_active_histogram_bytes: 1024 * 1024,
+                ..resources()
+            },
+            "Grunt histogram memory limit reached",
+        ),
+    ] {
+        let target = listener();
+        let request = plan(target.local_addr().unwrap().port(), Duration::from_secs(2));
+        let grunt = policy(vec![request.url.clone()], config);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = common::accept(&target);
+            read_request(&mut socket);
+            started_tx.send(()).unwrap();
+            let mut byte = [0];
+            let closed = match socket.read(&mut byte) {
+                Ok(0) => true,
+                Err(err) => matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ),
+                _ => false,
+            };
+            assert!(closed);
+        });
+        let cancel = distributed::Cancellation::new();
+        let agent_limits = limits(Duration::from_secs(5));
+        let (outcome, rejected) = tokio::join!(
+            distributed::run_local(
+                request.clone(),
+                budget(),
+                agent_limits,
+                &grunt,
+                cancel.clone()
+            ),
+            async {
+                tokio::time::timeout(Duration::from_secs(2), started_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let refused = distributed::run_local(
+                    request.clone(),
+                    budget(),
+                    agent_limits,
+                    &grunt.clone(),
+                    distributed::Cancellation::new(),
+                )
+                .await;
+                cancel.cancel();
+                refused
+            }
+        );
+        assert_eq!(rejected.unwrap_err().to_string(), expected);
+        assert!(matches!(
+            outcome.unwrap(),
+            LocalOutcome::Partial {
+                reason: StopReason::Cancelled
+            }
+        ));
+        server.join().unwrap();
+
+        let outcome = distributed::run_local(request, budget(), agent_limits, &grunt, cancel)
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            LocalOutcome::Partial {
+                reason: StopReason::Cancelled
+            }
+        ));
+    }
 }

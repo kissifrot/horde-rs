@@ -26,6 +26,7 @@ pub(crate) enum RedirectError {
     Limit,
     Timeout,
     InvalidScheme,
+    DeniedByPolicy,
 }
 
 impl RedirectError {
@@ -40,10 +41,21 @@ impl RedirectError {
 /// Follow redirects while retaining a single timeout across all hops and the final body.
 pub(crate) async fn send(
     client: &Client,
+    request: Request,
+    limit: usize,
+    timeout: Duration,
+    followed: Option<&crate::counter::AtomicCounter>,
+) -> Result<Response, RedirectError> {
+    send_checked(client, request, limit, timeout, followed, |_| true).await
+}
+
+pub(crate) async fn send_checked(
+    client: &Client,
     mut request: Request,
     limit: usize,
     timeout: Duration,
     followed: Option<&crate::counter::AtomicCounter>,
+    allowed: impl Fn(&Request) -> bool,
 ) -> Result<Response, RedirectError> {
     let started = Instant::now();
     let mut count = 0;
@@ -85,10 +97,6 @@ pub(crate) async fn send(
         if count >= limit {
             return Err(RedirectError::Limit);
         }
-        count += 1;
-        if let Some(followed) = followed {
-            followed.increment();
-        }
         let previous = response.url();
         let headers = next_request.headers_mut();
         if previous.origin() != next.origin() {
@@ -124,6 +132,13 @@ pub(crate) async fn send(
             }
         }
         *next_request.url_mut() = next;
+        if !allowed(&next_request) {
+            return Err(RedirectError::DeniedByPolicy);
+        }
+        count += 1;
+        if let Some(followed) = followed {
+            followed.increment();
+        }
         request = next_request;
     }
 }

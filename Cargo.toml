@@ -10,7 +10,7 @@ name = "horde"
 path = "src/main.rs"
 
 [features]
-distributed-offline = ["hdrhistogram/serialization"]
+distributed-offline = ["hdrhistogram/serialization", "dep:ipnet", "tokio/net"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -25,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 jsonschema = { version = "0.60.2", default-features = false }
 scraper = { version = "0.29.0", default-features = false }
 serde_urlencoded = "0.7"
+ipnet = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util"] }
