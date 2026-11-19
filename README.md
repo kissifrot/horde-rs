@@ -252,8 +252,10 @@ Grunt a leaf certificate for its own identity.
 
 Both `controller` and `preflight` accept `--inventory grunts.json` in place
 of repeated `--grunt` flags. Preflight checks the authenticated control hello
-for each peer without generating HTTP traffic. See the
-[inventory format and preflight example](docs/distributed-pilot.md#run-and-verify).
+for each peer without generating HTTP traffic. `--config` loads local
+settings from JSON. The same controller configuration works with
+`preflight` and `controller`. Pass the request budget and rate on the CLI.
+See the [configuration and inventory examples](docs/distributed-pilot.md#start-each-grunt).
 
 The controller emits JSON with per-Grunt states, merged metrics and percentiles.
 It returns a nonzero exit code for partial runs or failed configured thresholds.

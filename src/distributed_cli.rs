@@ -36,40 +36,46 @@ pub(crate) enum Command {
 }
 
 #[derive(Args)]
-struct Identity {
-    /// Peer trust root (DER certificate).
-    #[arg(long)]
-    ca: PathBuf,
+struct IdentityArgs {
+    /// Peer trust root (DER certificate). Repeat for overlapping CA rotation.
+    #[arg(long, required_unless_present = "config")]
+    ca: Vec<PathBuf>,
     /// Local leaf certificate (DER).
-    #[arg(long)]
-    cert: PathBuf,
+    #[arg(long, required_unless_present = "config")]
+    cert: Option<PathBuf>,
     /// Local private key (PKCS#8 DER).
-    #[arg(long)]
-    key: PathBuf,
+    #[arg(long, required_unless_present = "config")]
+    key: Option<PathBuf>,
 }
 
 #[derive(Args)]
 pub(crate) struct GruntArgs {
+    /// Load local Grunt settings from a JSON file.
+    #[arg(long, conflicts_with_all = ["listen", "allow_controller_ip", "target", "controller_cert", "ca", "cert", "key"])]
+    config: Option<PathBuf>,
     /// Specific loopback or private address to listen on. Port zero selects an available port.
-    #[arg(long)]
-    listen: SocketAddr,
+    #[arg(long, required_unless_present = "config")]
+    listen: Option<SocketAddr>,
     /// Exact private IP of an allowed controller. Repeat to authorize multiple IPs.
     #[arg(long)]
     allow_controller_ip: Vec<IpAddr>,
     /// Locally selected HTTP(S) target with a literal loopback IP.
-    #[arg(long)]
-    target: reqwest::Url,
+    #[arg(long, required_unless_present = "config")]
+    target: Option<reqwest::Url>,
     /// Authorized controller leaf certificate (DER). Repeat for additional controllers.
-    #[arg(long, required = true)]
+    #[arg(long, required_unless_present = "config")]
     controller_cert: Vec<PathBuf>,
     #[command(flatten)]
-    identity: Identity,
+    identity: IdentityArgs,
 }
 
 #[derive(Args)]
 struct Peers {
+    /// Load the inventory path, control policy and TLS settings from a JSON file.
+    #[arg(long, conflicts_with_all = ["grunt", "inventory", "private_network", "server_name", "ca", "cert", "key"])]
+    config: Option<PathBuf>,
     /// Grunt socket address, optionally followed by =TLS_IDENTITY. Repeat in allocation order.
-    #[arg(long, required_unless_present = "inventory", value_name = "ADDRESS[=TLS_IDENTITY]", value_parser = parse_grunt)]
+    #[arg(long, required_unless_present_any = ["inventory", "config"], value_name = "ADDRESS[=TLS_IDENTITY]", value_parser = parse_grunt)]
     grunt: Vec<GruntSpec>,
     /// Read Grunt addresses and TLS identities from a JSON inventory.
     #[arg(long, conflicts_with = "grunt")]
@@ -81,7 +87,7 @@ struct Peers {
     #[arg(long)]
     server_name: Option<String>,
     #[command(flatten)]
-    identity: Identity,
+    identity: IdentityArgs,
 }
 
 #[derive(Args)]
@@ -116,6 +122,36 @@ pub(crate) struct ControllerArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Identity {
+    ca: Vec<PathBuf>,
+    cert: PathBuf,
+    key: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GruntConfig {
+    listen: SocketAddr,
+    #[serde(default)]
+    allow_controller_ip: Vec<IpAddr>,
+    #[serde(deserialize_with = "deserialize_target")]
+    target: reqwest::Url,
+    controller_cert: Vec<PathBuf>,
+    tls: Identity,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerConfig {
+    inventory: PathBuf,
+    #[serde(default)]
+    private_network: bool,
+    server_name: Option<String>,
+    tls: Identity,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Inventory {
     grunts: Vec<InventoryEntry>,
 }
@@ -127,16 +163,77 @@ struct InventoryEntry {
     tls_identity: Option<String>,
 }
 
+fn deserialize_target<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<reqwest::Url, D::Error> {
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path, kind: &str) -> Result<T, BoxError> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot open {kind} {}: {error}", path.display()))?;
+    serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|error| format!("invalid {kind} {}: {error}", path.display()).into())
+}
+
+impl IdentityArgs {
+    fn load(self) -> Result<Identity, BoxError> {
+        Ok(Identity {
+            ca: self.ca,
+            cert: self.cert.ok_or("missing --cert")?,
+            key: self.key.ok_or("missing --key")?,
+        })
+    }
+}
+
+impl GruntArgs {
+    fn load(self) -> Result<GruntConfig, BoxError> {
+        if let Some(path) = self.config {
+            let mut settings: GruntConfig = read_json(&path, "Grunt configuration")?;
+            let directory = path.parent().unwrap_or(Path::new("."));
+            settings.tls.resolve_paths(directory);
+            for cert in &mut settings.controller_cert {
+                *cert = directory.join(&*cert);
+            }
+            Ok(settings)
+        } else {
+            Ok(GruntConfig {
+                listen: self.listen.ok_or("missing --listen")?,
+                allow_controller_ip: self.allow_controller_ip,
+                target: self.target.ok_or("missing --target")?,
+                controller_cert: self.controller_cert,
+                tls: self.identity.load()?,
+            })
+        }
+    }
+}
+
 impl Peers {
     fn prepare(self) -> Result<(Controller, Vec<Grunt>), BoxError> {
+        let (inventory, private_network, server_name, tls) = if let Some(path) = self.config {
+            let settings: ControllerConfig = read_json(&path, "controller configuration")?;
+            let directory = path.parent().unwrap_or(Path::new("."));
+            let mut tls = settings.tls;
+            tls.resolve_paths(directory);
+            (
+                Some(directory.join(settings.inventory)),
+                settings.private_network,
+                settings.server_name,
+                tls,
+            )
+        } else {
+            (
+                self.inventory,
+                self.private_network,
+                self.server_name,
+                self.identity.load()?,
+            )
+        };
         let mut specs = self.grunt;
-        if let Some(path) = self.inventory {
-            let inventory: Inventory = serde_json::from_reader(std::io::BufReader::new(
-                std::fs::File::open(&path).map_err(|error| {
-                    format!("cannot open Grunt inventory {}: {error}", path.display())
-                })?,
-            ))
-            .map_err(|error| format!("invalid Grunt inventory {}: {error}", path.display()))?;
+        if let Some(path) = inventory {
+            let inventory: Inventory = read_json(&path, "Grunt inventory")?;
             for entry in inventory.grunts {
                 let identity = entry
                     .tls_identity
@@ -151,18 +248,14 @@ impl Peers {
                 });
             }
         }
-        let default = self.server_name.map(ServerName::try_from).transpose()?;
+        let default = server_name.map(ServerName::try_from).transpose()?;
         let grunts = specs
             .into_iter()
-            .map(|spec| spec.resolve(default.as_ref(), self.private_network))
+            .map(|spec| spec.resolve(default.as_ref(), private_network))
             .collect();
-        let controller = Controller::new(
-            self.identity.roots()?,
-            vec![certificate(&self.identity.cert)?],
-            self.identity.key()?,
-        )?;
+        let controller = Controller::new(tls.roots()?, vec![certificate(&tls.cert)?], tls.key()?)?;
         Ok((
-            if self.private_network {
+            if private_network {
                 controller.with_private_network()
             } else {
                 controller
@@ -213,9 +306,20 @@ impl GruntSpec {
 }
 
 impl Identity {
+    fn resolve_paths(&mut self, directory: &Path) {
+        for path in self.ca.iter_mut().chain([&mut self.cert, &mut self.key]) {
+            *path = directory.join(&*path);
+        }
+    }
+
     fn roots(&self) -> Result<RootCertStore, BoxError> {
+        if self.ca.is_empty() {
+            return Err("at least one peer CA certificate is required".into());
+        }
         let mut roots = RootCertStore::empty();
-        roots.add(certificate(&self.ca)?)?;
+        for ca in &self.ca {
+            roots.add(certificate(ca)?)?;
+        }
         Ok(roots)
     }
 
@@ -232,14 +336,14 @@ pub(crate) async fn run(command: Command) -> Result<ExitCode, BoxError> {
     let cancel = Cancellation::new();
     let signals = crate::signals::install(cancel.clone())?;
     match command {
-        Command::Grunt(args) => serve(args, signals).await,
+        Command::Grunt(args) => serve(args.load()?, signals).await,
         Command::Controller(args) => coordinate(args, cancel, signals).await,
         Command::Preflight(args) => preflight(args, cancel, signals).await,
     }
 }
 
 async fn serve(
-    args: GruntArgs,
+    args: GruntConfig,
     mut signals: tokio::sync::watch::Receiver<Option<crate::signals::Interrupt>>,
 ) -> Result<ExitCode, BoxError> {
     let listener_policy = ListenerPolicy::for_listener(args.listen, args.allow_controller_ip)?;
@@ -295,9 +399,9 @@ async fn serve(
         max_duration: Duration::from_secs(60),
     };
     let endpoint = Endpoint::with_listener_policy(
-        vec![certificate(&args.identity.cert)?],
-        args.identity.key()?,
-        args.identity.roots()?,
+        vec![certificate(&args.tls.cert)?],
+        args.tls.key()?,
+        args.tls.roots()?,
         args.controller_cert
             .iter()
             .map(|path| certificate(path))

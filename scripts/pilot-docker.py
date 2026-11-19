@@ -19,8 +19,6 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 GRUNTS = ("grunt-a", "grunt-b")
-IDENTITY = ["--ca", "/identity/ca.der", "--cert", "/identity/cert.der",
-            "--key", "/identity/key.der"]
 LABEL = "io.horde-rs.docker-pilot"
 
 
@@ -85,21 +83,41 @@ def allocate_peers(network):
     raise RuntimeError("Docker must allocate a private IPv4 subnet with room for three endpoints.")
 
 
-def issue_certificates(work, peers):
+def tls_config(leaf, roots):
+    return {
+        "cert": f"{leaf}/cert.der",
+        "key": f"{leaf}/key.der",
+        "ca": [f"{root}-ca.der" for root in roots],
+    }
+
+
+def issue_certificates(work, addresses, inventory_file):
     def tls(*args):
         run(sys.executable, ROOT / "scripts/pilot-tls.py", *args)
 
-    issuer = work / "issuer"
-    tls("init-ca", issuer)
-    for role, ip in peers.items():
-        identity = work / role
-        tls("request", role, identity)
-        san = [] if role == "controller" else ["--ip", ip]
-        tls("issue", role, *san, "--ca-dir", issuer, "--csr", identity / "request.pem",
-            "--out", identity / "cert.der")
-        shutil.copyfile(issuer / "ca.der", identity / "ca.der")
-        if role != "controller":
-            shutil.copyfile(work / "controller" / "cert.der", identity / "controller.der")
+    roles = ("controller", *GRUNTS)
+    for generation in ("old", "new"):
+        issuer = work / f"{generation}-issuer"
+        tls("init-ca", issuer)
+        for role in roles:
+            # The pilot uses isolated role directories to stand in for separate hosts.
+            role_dir = work / role
+            identity = role_dir / generation
+            if role == "controller":
+                tls("request", role, identity)
+                sign = ("issue", role)
+            else:
+                selection = ("--inventory", inventory_file, "--address", addresses[role])
+                tls("request-grunt", identity, *selection)
+                sign = ("issue-grunt", *selection)
+            csr = issuer / f"{role}.req.pem"
+            signed_leaf = issuer / f"{role}.der"
+            shutil.copyfile(identity / "request.pem", csr)
+            tls(*sign, "--ca-dir", issuer, "--csr", csr, "--out", signed_leaf)
+            shutil.copyfile(signed_leaf, identity / "cert.der")
+            shutil.copyfile(issuer / "ca.der", role_dir / f"{generation}-ca.der")
+            if role != "controller":
+                shutil.copyfile(issuer / "controller.der", role_dir / f"{generation}-controller.der")
 
 
 def wait_for(condition, description, timeout=10):
@@ -125,16 +143,22 @@ def pilot(binary):
         cleanup.callback(remove, "network", "rm", prefix)
         docker("network", "create", "--internal", "--label", LABEL, prefix)
         subnet, peers = allocate_peers(prefix)
-        issue_certificates(work, peers)
         addresses = {role: f"{peers[role]}:7071" for role in GRUNTS}
-        inventory = {"grunts": [{"address": addresses[role]} for role in GRUNTS]}
+        inventory = {"grunts": [{"address": addresses["grunt-a"]}, {
+            "address": addresses["grunt-b"], "tls_identity": "grunt-b.pilot.test",
+        }]}
+        for role in peers:
+            (work / role).mkdir(mode=0o700)
+        inventory_file = work / "controller" / "grunts.json"
         wrong_identity = "wrong-grunt.invalid"
         wrong_inventory = {"grunts": [inventory["grunts"][0], {
             "address": addresses["grunt-b"], "tls_identity": wrong_identity,
         }]}
         for file, data in (("grunts.json", inventory), ("wrong-grunts.json", wrong_inventory)):
             (work / "controller" / file).write_text(json.dumps(data))
+        issue_certificates(work, addresses, inventory_file)
         containers = []
+        grunt_names = {}
 
         def start(name, role, entrypoint, *args):
             container = f"{prefix}-{name}"
@@ -150,11 +174,39 @@ def pilot(binary):
             return docker("logs", f"{prefix}-{name}")
 
         def requests(role):
-            return logs(role).stdout.splitlines().count("pilot-http: 200")
+            return logs(grunt_names[role]).stdout.splitlines().count("pilot-http: 200")
+
+        def config_args(role, filename, settings):
+            (work / role / filename).write_text(json.dumps(settings))
+            return "--config", f"/identity/{filename}"
+
+        def controller_config(leaf, roots, inventory_file):
+            filename = f"controller-{leaf}-{'-'.join(roots)}-{inventory_file}"
+            return config_args("controller", filename, {
+                "inventory": inventory_file,
+                "private_network": True,
+                "tls": tls_config(leaf, roots),
+            })
+
+        def start_grunts(stage, leaves, roots, controllers):
+            for name in grunt_names.values():
+                remove("rm", "-f", f"{prefix}-{name}")
+            for role, leaf in zip(GRUNTS, leaves):
+                name = f"{stage}-{role}"
+                grunt_names[role] = name
+                config = config_args(role, f"{stage}.json", {
+                    "listen": addresses[role],
+                    "allow_controller_ip": [peers["controller"]],
+                    "target": "http://127.0.0.1:18080/",
+                    "controller_cert": [f"{controller}-controller.der" for controller in controllers],
+                    "tls": tls_config(leaf, roots),
+                })
+                start(name, role, "/pilot-http", "grunt", *config)
+                wait_for(lambda: addresses[role] in logs(name).stdout.splitlines(), f"{name} readiness")
 
         def start_controller(name, budget):
-            start(name, "controller", "/horde", "controller", "--private-network",
-                  "--inventory", "/identity/grunts.json", *IDENTITY,
+            start(name, "controller", "/horde", "controller",
+                  *controller_config("new", ("new",), "grunts.json"),
                   "--requests", str(budget), "--concurrency", "2", "--rate", "4",
                   "--deadline", "30", "--max-failure-rate", "0")
 
@@ -167,17 +219,16 @@ def pilot(binary):
             remove("rm", container)
             return json.loads(result.stdout)
 
-        def preflight(name, inventory_file, ready):
-            start(name, "controller", "/horde", "preflight", "--private-network",
-                  "--inventory", f"/identity/{inventory_file}", *IDENTITY)
+        def preflight(name, leaf, roots, states, inventory_file="grunts.json"):
+            start(name, "controller", "/horde", "preflight",
+                  *controller_config(leaf, roots, inventory_file))
+            ready = all(status == "ready" for status in states)
             report = collect(name, 0 if ready else 1)
             require(report["type"] == "distributed_preflight" and report["ready"] is ready,
                     "Unexpected preflight result", report)
-            require([(grunt["address"], grunt["status"]) for grunt in report["grunts"]] == [
-                (addresses["grunt-a"], "ready"),
-                (addresses["grunt-b"], "ready" if ready else "failed"),
-            ], "Unexpected preflight peer states", report)
-            connections = {role: logs(role).stdout.splitlines().count("pilot-http: connection")
+            require([(grunt["address"], grunt["status"]) for grunt in report["grunts"]]
+                    == list(zip(addresses.values(), states)), "Unexpected preflight peer states", report)
+            connections = {role: logs(grunt_names[role]).stdout.splitlines().count("pilot-http: connection")
                            for role in GRUNTS}
             require(connections == dict.fromkeys(GRUNTS, 0),
                     "Preflight reached a workload target", connections)
@@ -195,19 +246,36 @@ def pilot(binary):
                     "Unexpected merged percentiles", report["latency_ms"])
 
         try:
-            for role in GRUNTS:
-                start(role, role, "/pilot-http", "grunt", "--listen", addresses[role],
-                      "--allow-controller-ip", peers["controller"], "--target", "http://127.0.0.1:18080/",
-                      "--controller-cert", "/identity/controller.der", *IDENTITY)
-                wait_for(lambda: addresses[role] in logs(role).stdout.splitlines(), f"{role} readiness")
-
-            checked = preflight("preflight", "grunts.json", ready=True)
-            rejected = preflight("preflight-wrong-identity", "wrong-grunts.json", ready=False)
+            both_ready = ("ready", "ready")
+            both_failed = ("failed", "failed")
+            both_roots = ("old", "new")
+            start_grunts("initial", ("old", "old"), ("old",), ("old",))
+            checked = preflight("preflight", "old", ("old",), both_ready)
+            rejected = preflight("preflight-wrong-identity", "old", ("old",),
+                                 ("ready", "failed"), "wrong-grunts.json")
             failed = rejected["report"]["grunts"][1]
             require(failed["tls_identity"] == wrong_identity and "certificate" in (failed["error"] or ""),
                     "Expected Grunt B certificate rejection", failed)
             print("Preflight passed and identified the misconfigured Grunt; no target connections.",
                   flush=True)
+
+            start_grunts("overlap", ("new", "old"), both_roots, both_roots)
+            rotation = {
+                "overlap_old_controller": preflight("overlap-old", "old", both_roots, both_ready),
+                "overlap_new_controller": preflight("overlap-new", "new", both_roots, both_ready),
+            }
+            # Keeping both roots proves that removing a controller leaf alone denies it.
+            start_grunts("allowlist", ("new", "new"), both_roots, ("new",))
+            rotation["old_leaf_removed"] = preflight("old-leaf-removed", "old", both_roots, both_failed)
+            rotation["new_leaf_allowed"] = preflight("new-leaf-allowed", "new", both_roots, both_ready)
+
+            start_grunts("rotated", ("new", "new"), ("new",), ("new",))
+            rotation["new_ca_only"] = preflight("new-ca-only", "new", ("new",), both_ready)
+            rotation["old_ca_only"] = preflight("old-ca-only", "new", ("old",), both_failed)
+            rotation["old_controller_after_rotation"] = preflight(
+                "old-controller-after-rotation", "old", ("new",), both_failed
+            )
+            print("Two-CA rotation passed; retired controller leaf and old trust were refused.", flush=True)
 
             start_controller("nominal", 20)
             nominal = collect("nominal", 0)
@@ -218,7 +286,7 @@ def pilot(binary):
 
             start_controller("disconnect", 40)
             wait_for(lambda: requests("grunt-b") > counts["grunt-b"], "Grunt B workload")
-            docker("network", "disconnect", prefix, f"{prefix}-grunt-b")
+            docker("network", "disconnect", prefix, f"{prefix}-{grunt_names['grunt-b']}")
             fault = collect("disconnect", 1)
             after_drop = {role: requests(role) - counts[role] for role in GRUNTS}
             verify(fault, 20, ("complete", "missing"), partial=True)
@@ -238,6 +306,7 @@ def pilot(binary):
             "subnet": subnet,
             "roles": peers,
             "preflight": {"nominal": checked, "wrong_identity": rejected},
+            "certificate_rotation": rotation,
             "nominal": {"controller_report": nominal, "requests_per_target": counts},
             "link_disconnect": {"controller_report": fault, "requests_per_target": after_drop},
         }

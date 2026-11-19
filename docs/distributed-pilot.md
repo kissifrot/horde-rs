@@ -41,11 +41,12 @@ the Grunt addresses are known, run `ip -4 route get GRUNT_IP` on the
 controller and use the reported `src` value for that Grunt's
 `--allow-controller-ip`. Check both routes.
 
-If there is an existing internal CA, submit the CSRs to it using the
-roles and IP SANs below. For a dedicated pilot CA, the repository's
-`scripts/pilot-tls.py` helper uses OpenSSL 3. Run these commands on the
-indicated machines. Generate keys locally and send only the CSR to the
-machine that signs certificates.
+Prepare the [JSON inventory](#run-and-verify) first. Copy it to each
+Grunt and to the signer. The repository's `scripts/pilot-tls.py` helper
+uses OpenSSL 3. Run the request command on each endpoint so its private
+key stays there. Send only the resulting `request.pem` to the signer
+over an authenticated channel. An internal CA can sign these CSRs using
+its existing enrollment process.
 
 ```sh
 # CA machine, once
@@ -54,24 +55,25 @@ python3 scripts/pilot-tls.py init-ca "$HOME/horde-pilot-ca"
 # Controller
 python3 scripts/pilot-tls.py request controller "$HOME/horde-pilot"
 
-# Grunt A
-python3 scripts/pilot-tls.py request grunt-a "$HOME/horde-pilot"
-
-# Grunt B
-python3 scripts/pilot-tls.py request grunt-b "$HOME/horde-pilot"
+# On each Grunt, select its exact address from the inventory
+python3 scripts/pilot-tls.py request-grunt "$HOME/horde-pilot" \
+  --inventory grunts.json --address "${GRUNT_ADDRESS:?set the local Grunt socket address}"
 ```
 
-On the signer, save the three public CSRs as `controller.req.pem`,
-`grunt-a.req.pem`, and `grunt-b.req.pem`. Substitute the real IPs in
-`GRUNT_A_IP` and `GRUNT_B_IP`. Sign the controller for TLS client use
-and each Grunt for server use with its own IP SAN.
+On the pilot signer, save the three public CSRs as `controller.req.pem`,
+`grunt-a.req.pem`, and `grunt-b.req.pem`. Verify which authenticated
+endpoint submitted each CSR. Set `GRUNT_A_ADDRESS` and
+`GRUNT_B_ADDRESS` to their inventory addresses, including the ports.
+The signer takes the permitted IP or DNS SAN from its local inventory.
 
 ```sh
 python3 scripts/pilot-tls.py issue controller --ca-dir "$HOME/horde-pilot-ca" \
   --csr controller.req.pem --out controller.der
-python3 scripts/pilot-tls.py issue grunt-a --ip "$GRUNT_A_IP" --ca-dir "$HOME/horde-pilot-ca" \
+python3 scripts/pilot-tls.py issue-grunt --inventory grunts.json \
+  --address "$GRUNT_A_ADDRESS" --ca-dir "$HOME/horde-pilot-ca" \
   --csr grunt-a.req.pem --out grunt-a.der
-python3 scripts/pilot-tls.py issue grunt-b --ip "$GRUNT_B_IP" --ca-dir "$HOME/horde-pilot-ca" \
+python3 scripts/pilot-tls.py issue-grunt --inventory grunts.json \
+  --address "$GRUNT_B_ADDRESS" --ca-dir "$HOME/horde-pilot-ca" \
   --csr grunt-b.req.pem --out grunt-b.der
 ```
 
@@ -81,8 +83,8 @@ is valid for 30 days, with leaves issued for seven days. Keep
 `$HOME/horde-pilot` on all three machines. Place each signed leaf as
 `cert.der` beside that machine's generated `key.der`. Copy the public
 `controller.der` to both Grunts as `controller.der` for the explicit
-allowlist. With these IP SAN certificates, use bare IP socket addresses
-for `--grunt`, without an `=name` suffix.
+allowlist. Use the same inventory for issuance and control so the
+expected identities match the certificates.
 
 ## Start each Grunt
 
@@ -96,22 +98,27 @@ printf 'OK' > "$pilot_target/index.html"
 python3 -m http.server --bind 127.0.0.1 --directory "$pilot_target" 18080
 ```
 
-In another terminal on each Grunt, set `GRUNT_IP` to this machine's
-address and `CONTROLLER_SOURCE_IP` to the source address shown by the
-controller's route lookup. With the certificate files from the previous step:
+Save a local `grunt.json` beside the certificate files. Replace the
+listen address with this Grunt's inventory address and the allowed
+controller IP with the source address from the controller's route lookup.
+
+```json
+{
+  "listen": "10.20.0.21:7071",
+  "allow_controller_ip": ["10.20.0.10"],
+  "target": "http://127.0.0.1:18080/",
+  "controller_cert": ["controller.der"],
+  "tls": {"ca": ["ca.der"], "cert": "cert.der", "key": "key.der"}
+}
+```
 
 ```sh
-target/release/horde grunt \
-  --listen "${GRUNT_IP:?set the local Grunt IP}:7071" \
-  --allow-controller-ip "${CONTROLLER_SOURCE_IP:?set the controller source IP}" \
-  --target http://127.0.0.1:18080/ \
-  --ca "$HOME/horde-pilot/ca.der" --cert "$HOME/horde-pilot/cert.der" \
-  --key "$HOME/horde-pilot/key.der" --controller-cert "$HOME/horde-pilot/controller.der"
+target/release/horde grunt --config "$HOME/horde-pilot/grunt.json"
 ```
 
 Both processes should print their private listening address. For IPv6,
-enclose the IP in brackets in each socket address such as `--listen`
-and `--grunt`. Leave it unbracketed when signing and setting peer IPs.
+enclose the IP in brackets in socket addresses. Leave it unbracketed
+when setting peer IPs.
 
 ## Run and verify
 
@@ -127,39 +134,49 @@ Use the actual private socket addresses for your Grunts.
 }
 ```
 
-With `--private-network`, an omitted identity defaults to the address's
+In private network mode, an omitted identity defaults to the address's
 IP SAN. Set `tls_identity` when the certificate has a different IP or a
 DNS SAN. The DNS name is checked against the certificate. The connection
 uses the literal socket address from the inventory.
 
+Save `controller.json` beside the controller's credential files and
+`grunts.json`. Both commands use this same configuration.
+
+```json
+{
+  "inventory": "grunts.json",
+  "private_network": true,
+  "tls": {"ca": ["ca.der"], "cert": "cert.der", "key": "key.der"}
+}
+```
+
+Relative paths in either configuration are resolved from the directory
+containing that file. Absolute paths also work. The files reference the
+local private keys by path. `private_network` defaults to false and
+`server_name` is an optional fallback TLS identity.
+
 ```sh
-target/release/horde preflight --private-network --inventory grunts.json \
-  --ca "$HOME/horde-pilot/ca.der" --cert "$HOME/horde-pilot/cert.der" \
-  --key "$HOME/horde-pilot/key.der"
+target/release/horde preflight --config "$HOME/horde-pilot/controller.json"
 ```
 
 Preflight checks each peer through the authenticated protocol hello and
 prints a JSON report with the address, expected identity, status and any
 connection error. It exits zero when all peers are ready and one when a
 peer fails. It sends no run operations and generates no HTTP traffic.
-The `controller` command also accepts `--inventory grunts.json` in place
-of the repeated `--grunt` flags below. Inventory order is allocation order.
+Inventory order is allocation order. The file-based settings and their
+equivalent flags are mutually exclusive. The controller's request
+budget, concurrency, rate, deadline and thresholds are CLI options.
 
 From the controller machine, use a small budget first:
 
 ```sh
-target/release/horde controller --private-network \
-  --grunt "${GRUNT_A_IP:?set the Grunt A IP}:7071" \
-  --grunt "${GRUNT_B_IP:?set the Grunt B IP}:7071" \
-  --ca "$HOME/horde-pilot/ca.der" --cert "$HOME/horde-pilot/cert.der" \
-  --key "$HOME/horde-pilot/key.der" \
+target/release/horde controller --config "$HOME/horde-pilot/controller.json" \
   --requests 20 --concurrency 2 --rate 4 --deadline 30 \
   --max-failure-rate 0 > pilot-complete.json
 ```
 
-With these IP SAN certificates, the controller expects the listed IPs as
-the identities. If using certificates with DNS SANs, append each expected
-identity as an `=name` suffix. The success criteria are exit code 0,
+When using repeated `--grunt` flags, append an explicit identity as an
+`=name` suffix. The success criteria are exit code 0,
 two `complete` Grunts, `partial: false`, 20 started and completed requests,
 zero failures, 20 HTTP 200s, 40 body bytes from the fixture and populated
 merged p95/p99. Each Grunt should execute 10 requests. Count successes in each fixture’s access log to confirm the split. The aggregate report gives the combined counts and per-Grunt
@@ -201,12 +218,22 @@ python3 scripts/pilot-docker.py
 The script builds a temporary image from the local release binary and
 HTTP fixture. It allocates private IPs on an internal Docker network,
 issues fresh TLS certificates, and starts two Grunts and a controller.
+It launches the commands with per-role JSON configuration and passes
+the budget and rate directly to the controller.
 Each Grunt's HTTP fixture listens on its own loopback interface. No
 ports are published.
 
 - Preflight checks both Grunts, then repeats with an incorrect TLS identity
   for Grunt B. It must report A as ready and B as failed. Both loopback HTTP
   fixtures must observe zero connections in both cases.
+- Rotation uses two CAs, an IP SAN and a DNS SAN. During overlap, both
+  controller leaves must reach both Grunts, one with the new certificate
+  and one with the old. Removing the old controller leaf must deny it
+  even with both roots installed. With only the new root and leaf
+  configured, the new credentials must work and the old credentials and
+  old-root-only trust must fail. Each preflight checks for zero HTTP
+  connections. The pilot stages credentials in separate role directories
+  on the Docker host and copies only public CSRs to the signer directory.
 - The nominal run checks 10 requests per Grunt, 20 successful responses,
   40 body bytes and populated merged p95/p99.
 - The interruption run disconnects Grunt B from the Docker network
@@ -225,6 +252,23 @@ as the `horde-distributed-pilot` artifact.
 This exercises separate IPs and TLS identities on a single kernel.
 Routing, firewalls and physical link detection remain checks for the
 multi-host pilot.
+
+## Rotate a pilot CA
+
+Issue new leaves using new directories on each endpoint, starting with the
+same inventory. Distribute the new public CA while keeping the old one.
+List both trust roots in `tls.ca` in the Grunt and controller
+configurations. On each Grunt, list the old and new public controller
+leaves in `controller_cert`.
+Schedule Grunt restarts between runs because trust and leaves are read at
+startup. Replace the Grunt leaves in stages and use `preflight` with each
+controller credential to verify the overlap.
+
+Once the new credentials work everywhere, remove the old controller leaf
+from every Grunt's allowlist and verify that it cannot reach `hello` with
+both roots still installed. Then remove the old CA everywhere and check
+again with the new credentials. Retire the old private material on the
+endpoints and on the signer according to your local CA procedure.
 
 ## Evidence before the pilot
 

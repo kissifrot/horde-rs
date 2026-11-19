@@ -47,8 +47,8 @@ I/O. On interruption it sends cancellation concurrently on its active sessions
 and waits within a bounded grace for terminal states. Only validated complete
 results are merged, and partial results cannot pass thresholds. HTTP workload
 targets must be literal loopback addresses, and the transport rejects profiles
-that follow redirects. Certificate rotation and multi-machine validation
-remain separate work.
+that follow redirects. The Docker pilot verifies CA rotation with overlapping
+trust and controller leaf allowlists. Multi-machine validation remains open.
 
 Control transport defaults to loopback. The Grunt can be configured with an
 exact RFC 1918 or IPv6 ULA listen address and a nonempty list of exact private
@@ -79,12 +79,12 @@ per Grunt and distribute trust roots separately. A stable IP can be the
 identity when DNS is unavailable. If the address changes often, use an
 inventory identity in a DNS SAN and update the socket address separately.
 
-Plan for overlapping trust roots and controller leaf allowlists during
-rotation, plus a way to remove a compromised credential. The current
-Grunt matches exact controller leaves, so replacing a controller
-certificate also requires updating those allowlists. An inventory and
-renewal workflow would remove the need to manage hundreds of CLI flags
-and certificates by hand. Enrolling a fleet and running all its Grunts
+The pilot helper can generate a Grunt CSR and private key locally using
+one inventory entry. The CLI supports overlapping trust roots and
+controller leaf allowlists during rotation. The Grunt matches exact
+controller leaves, so replacing a controller certificate also requires
+updating those allowlists. Integration with automatic enrollment and
+renewal remains fleet work. Enrolling a fleet and running all its Grunts
 in one test are separate issues. The current controller accepts at most
 32 Grunts per run.
 
