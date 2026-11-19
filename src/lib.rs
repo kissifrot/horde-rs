@@ -4,6 +4,7 @@ mod counter;
 #[cfg(feature = "distributed-offline")]
 pub mod distributed;
 mod latency;
+mod pacing;
 mod redirect;
 pub mod scenario;
 use bytes::Bytes;
@@ -310,9 +311,14 @@ async fn run_impl(
     #[cfg(feature = "distributed-offline")]
     let stop_signal = gate.as_ref().map(|_| tokio::sync::watch::channel(false));
     let next_start = Arc::new(Mutex::new(start));
+    let worker_count = plan.concurrency.min(plan.requests);
+    let fast_pacer = plan
+        .rate
+        .and_then(|rate| pacing::FastPacer::new(rate, worker_count, start))
+        .map(Arc::new);
     let mut workers = tokio::task::JoinSet::new();
     let mut local_cancel_rx = local_cancel.as_ref().map(Cancellation::subscribe);
-    for worker_id in 1..=plan.concurrency.min(plan.requests) {
+    for worker_id in 1..=worker_count {
         if local_cancel
             .as_ref()
             .is_some_and(Cancellation::is_cancelled)
@@ -333,6 +339,7 @@ async fn run_impl(
         #[cfg(feature = "distributed-offline")]
         let mut worker_stop_rx = stop_signal.as_ref().map(|(_, rx)| rx.clone());
         let redirects_followed = Arc::clone(&redirects_followed);
+        let fast_pacer = fast_pacer.clone();
         let (client, plan, next, next_start) = (
             client.clone(),
             plan.clone(),
@@ -358,32 +365,35 @@ async fn run_impl(
                     Err(_) => break,
                 };
                 if let Some(rate) = plan.rate {
-                    let scheduled = {
-                        let mut next_time = next_start.lock().unwrap();
-                        let scheduled = (*next_time).max(Instant::now());
-                        *next_time = scheduled + Duration::from_secs_f64(1.0 / f64::from(rate));
-                        scheduled
+                    let pace = async {
+                        if let Some(pacer) = &fast_pacer {
+                            return pacer.wait(plan.duration).await;
+                        }
+                        let scheduled = {
+                            let mut next_time = next_start.lock().unwrap();
+                            let scheduled = (*next_time).max(Instant::now());
+                            *next_time = scheduled + Duration::from_nanos(1_000_000_000u64.div_ceil(u64::from(rate)));
+                            scheduled
+                        };
+                        if plan.duration.is_some_and(|duration| scheduled.duration_since(start) >= duration) {
+                            return false;
+                        }
+                        tokio::time::sleep_until(scheduled.into()).await;
+                        !plan.duration.is_some_and(|duration| start.elapsed() >= duration)
                     };
-                    if plan
-                        .duration
-                        .is_some_and(|duration| scheduled.duration_since(start) >= duration)
-                    {
-                        break;
-                    }
                     #[cfg(feature = "distributed-offline")]
-                    if let Some(stop) = &mut worker_stop_rx {
+                    let admitted = if let Some(stop) = &mut worker_stop_rx {
                         tokio::select! {
                             biased;
-                            _ = wait_for_cancel(stop) => break,
-                            _ = tokio::time::sleep_until(scheduled.into()) => {}
+                            _ = wait_for_cancel(stop) => false,
+                            admitted = pace => admitted,
                         }
-                    } else { tokio::time::sleep_until(scheduled.into()).await; }
+                    } else {
+                        pace.await
+                    };
                     #[cfg(not(feature = "distributed-offline"))]
-                    tokio::time::sleep_until(scheduled.into()).await;
-                    if plan
-                        .duration
-                        .is_some_and(|duration| start.elapsed() >= duration)
-                    {
+                    let admitted = pace.await;
+                    if !admitted {
                         break;
                     }
                 }

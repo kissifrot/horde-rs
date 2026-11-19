@@ -9,13 +9,13 @@ pub enum Interrupt {
     Terminate,
 }
 impl Interrupt {
-    fn code(self) -> u8 {
+    pub(crate) fn code(self) -> u8 {
         match self {
             Self::Interrupt => 130,
             Self::Terminate => 143,
         }
     }
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Interrupt => "sigint",
             Self::Terminate => "sigterm",

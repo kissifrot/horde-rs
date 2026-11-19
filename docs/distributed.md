@@ -2,7 +2,7 @@
 
 # Distributed mode: proposed design
 
-This document describes the planned distributed mode and the current offline and loopback implementations. The CLI does not open an agent listener or execute remote tests.
+This document describes the planned distributed mode and the current offline and loopback implementations. The explicit Grunt CLI command listens on loopback and executes a locally configured loopback workload.
 
 ## Roles and trust
 
@@ -31,7 +31,23 @@ Each message is a JSON object preceded by a four-byte unsigned length in network
 
 Replies are `state` with a `status`, or `error` with a `code`. Run IDs are scoped to the authenticated controller certificate. A reconnect with the same certificate can reattach before the configured grace expires. Once it expires, the Grunt cancels the run and keeps its terminal state. The run's own deadline still applies. A restarted endpoint rejects requests bearing the old epoch. Controllers must preserve the original epoch for retries. Terminal records remain for that epoch. When the bounded record table is full, new runs are refused while existing records remain available. Session count, TLS handshake and frame operations also have local limits.
 
-This slice exposes state only. Result and histogram transfer, listener and process management, certificate rotation and remote deployment remain separate work.
+The controller uses `submit_budget` with `profile` and a per-Grunt `budget`.
+The budget must fit the preconfigured profile and trusted local limits. A repeat
+for the same run must match the effective budget. The `collect` operation
+returns the current state until completion. A completed reply is a `result`
+containing `histogram_bytes`, followed by a length-prefixed metadata frame and
+exactly that many encoded histogram bytes. Result metadata is bounded to 32 KiB and the controller limits
+the histogram before allocation. The endpoint caps retained result storage at
+16 MiB of charged bytes, accounting for each encoded histogram plus a fixed
+metadata allowance. A result that cannot be retained is reported as failed.
+
+The controller opens one authenticated session per assigned Grunt and submits
+each share once. It does not reassign missing shares or resubmit after ambiguous
+I/O. On interruption it sends cancellation concurrently on its active sessions
+and waits within a bounded grace for terminal states. Only validated complete
+results are merged, and partial results cannot pass thresholds. The CLI accepts
+only loopback Grunt addresses and fixed literal loopback workload targets.
+Certificate rotation and remote deployment remain separate work.
 
 ## Target and resource policy
 
@@ -752,3 +768,370 @@ Units are requests/s except scenario iterations/s. One-step scenario only; redir
 ```
 
 Temporary binaries, local server and benchmark script were removed after recording the results here. No performance claims are made for distributed transport.
+
+## Loopback controller benchmark
+
+A release build with Rust 1.100.0 ran on an Intel Core Ultra 7 155U under Linux 7.0.0-43. Both modes sent HTTP GETs to the same Rust loopback server with connection reuse and bounded HDR latency. The shared budget was 16 concurrent requests and 1,800 starts/s. The controller split it across two Grunts, each with concurrency 8 and 900 starts/s. The client processes shared CPUs 0–3, and the server used CPUs 4–11. Each client process had two Tokio worker threads. Grunts and the HTTP server were already running. For each case, a warmup per mode preceded six measured pairs with alternating run order. Every measured run completed its full budget with HTTP 200 and zero failures.
+
+| Requests | Mode | Command wall time | End-to-end req/s | p50 HTTP | p95 HTTP | p99 HTTP |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 100 | Standalone | 59.6 ms | 1,678 | 0.066 ms | 0.218 ms | 0.300 ms |
+| 100 | Two Grunts | 84.5 ms | 1,184 | 0.064 ms | 0.150 ms | 0.238 ms |
+| 3,600 | Standalone | 2,003.8 ms | 1,797 | 0.064 ms | 0.153 ms | 0.214 ms |
+| 3,600 | Two Grunts | 2,026.5 ms | 1,776 | 0.060 ms | 0.150 ms | 0.207 ms |
+
+The table reports medians. End-to-end throughput is the budget divided by wall time from launching the command to receiving its JSON report. It includes controller startup, TLS, submission, result polling and collection. It excludes Grunt startup and does not isolate any one component. HTTP percentiles measure only request latency. The paired throughput change was −29.4% for 100 requests (range −30.1% to −28.6%) and −1.1% for 3,600 requests (−1.2% to −1.0%). The paired p95 and p99 changes crossed zero in the sustained case. The runs were paced, so these measurements characterize the cost at the chosen rate and say nothing about maximum capacity.
+
+Reproduce on the same CPU layout from the repository root:
+
+```sh
+cargo build --release --features distributed-transport --locked
+mkdir -p target/benchmarks
+python3 benchmarks/distributed.py --client-cpus 0-3 --server-cpus 4-11 \\
+  --output target/benchmarks/distributed-loopback.json
+```
+
+The JSON contains the raw reports, pair order, per-pair change ranges and the binary hashes.
+
+### Loopback saturation sweep
+
+The shipped CLI limits each Grunt to 1,000 starts/s. A sweep first measured
+the shipped release binary at 2,000 starts/s across two Grunts. To continue
+above that ceiling, we built a separate release binary under
+`target/benchmarks/saturation-build` from an isolated source copy. Its only
+source changes were `MAX_RATE = 150_000` and `MAX_SAMPLES = 100_000` per
+Grunt. The shipped binary, loopback restrictions, concurrency ceilings and
+destination policy stayed intact. Both modes in the high-rate sweep used that
+same experimental binary.
+
+The sweep reused the fast HTTP server and CPU layout above. Every rate had
+equal request quotas between modes, four pairs in alternating order, and a
+warmup per mode. The quota was 1.25 seconds' worth of starts, bounded to
+3,000–16,000 requests. Concurrency stayed at 16 total and the clients used
+bounded HDR latencies. The end-to-end rate includes CLI startup, report output
+and, for distributed runs, TLS and result collection. HTTP p95 and p99 exclude
+pacing waits and protocol exchanges. The sweep does not identify which CPU,
+scheduler or server resource limits throughput at the plateau.
+
+The shipped binary achieved 1,995 req/s standalone and 1,968 req/s with two
+Grunts at its 2,000 starts/s ceiling. In the experimental sweep, both modes
+still met 95% of the target at 9,000 starts/s, then fell below it at 10,000.
+From 60,000 to 300,000 starts/s, measured throughput grew only from 12,877
+to 13,098 req/s standalone and from 13,220 to 13,511 req/s with two Grunts.
+At 300,000 starts/s the paired median throughput advantage was 3.0% (range
+0.6% to 3.8%). The p99 median was lower with two Grunts at that step,
+with pairwise changes ranging from −15.2% to +5.5%.
+
+The following values are medians of four pairs. Every measured run completed
+its full request budget with HTTP 200 and zero failures.
+
+| Target starts/s | Requests | Standalone req/s | Two Grunts req/s | Standalone p95 / p99 (ms) | Two Grunts p95 / p99 (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,000 | 3,000 | 1,995 | 1,972 | 0.159 / 0.232 | 0.153 / 0.218 |
+| 8,000 | 10,000 | 7,912 | 7,924 | 0.130 / 0.185 | 0.112 / 0.156 |
+| 9,000 | 11,250 | 8,598 | 8,562 | 0.133 / 0.182 | 0.109 / 0.152 |
+| 10,000 | 12,500 | 9,162 | 9,318 | 0.134 / 0.184 | 0.110 / 0.155 |
+| 11,000 | 13,750 | 9,523 | 9,686 | 0.133 / 0.180 | 0.116 / 0.156 |
+| 12,000 | 15,000 | 9,875 | 10,109 | 0.131 / 0.170 | 0.118 / 0.157 |
+| 16,000 | 16,000 | 10,691 | 10,982 | 0.137 / 0.181 | 0.121 / 0.171 |
+| 20,000 | 16,000 | 11,310 | 11,486 | 0.143 / 0.185 | 0.121 / 0.162 |
+| 30,000 | 16,000 | 11,996 | 12,307 | 0.146 / 0.189 | 0.123 / 0.169 |
+| 60,000 | 16,000 | 12,877 | 13,220 | 0.151 / 0.191 | 0.124 / 0.166 |
+| 120,000 | 16,000 | 12,949 | 13,362 | 0.153 / 0.194 | 0.125 / 0.168 |
+| 300,000 | 16,000 | 13,098 | 13,511 | 0.152 / 0.192 | 0.123 / 0.166 |
+
+Reproduce the sweep from the repository root. This builds the experimental
+binary under `target/benchmarks` and preserves the normal release binary.
+
+```sh
+bench_source=target/benchmarks/saturation-source
+bench_build=target/benchmarks/saturation-build
+mkdir -p "$bench_source" "$bench_build"
+cp -a Cargo.toml Cargo.lock src schemas "$bench_source/"
+sed -i 's/const MAX_RATE: u64 = 1_000;/const MAX_RATE: u64 = 150_000;/; s/const MAX_SAMPLES: u64 = 10_000;/const MAX_SAMPLES: u64 = 100_000;/' "$bench_source/src/distributed_cli.rs"
+cargo build --manifest-path "$bench_source/Cargo.toml" --target-dir "$bench_build" \
+  --release --features distributed-transport --locked
+python3 benchmarks/distributed.py --binary "$bench_build/release/horde" \
+  --rates 2000 8000 12000 16000 20000 30000 60000 120000 300000 --max-requests 16000 \
+  --pairs 4 --client-cpus 0-3 --server-cpus 4-11 --output target/benchmarks/saturation-sweep.json
+python3 benchmarks/distributed.py --binary "$bench_build/release/horde" \
+  --rates 9000 10000 11000 --max-requests 16000 --pairs 4 --client-cpus 0-3 --server-cpus 4-11 \
+  --output target/benchmarks/saturation-knee.json
+```
+
+### Isolating the pacing wait
+
+A follow-up used the same HTTP server and CPU placement as the saturation
+sweep. Each run made 32,000 requests at total concurrency 16 with connection
+reuse and bounded HDR latencies. The nominal paced rate was 300,000 starts/s
+(150,000 per Grunt). We warmed up each combination and measured six rounds,
+rotating the order so each combination occupied each position once. All runs
+completed with HTTP 200 and zero failures.
+
+The benchmark-only binary, built from the isolated high-rate source copy,
+supports three paths. Normal pacing reserves a slot and waits for it.
+Reservation only retains the clock calculation and the shared slot mutex,
+then sends without waiting. Unpaced standalone omits `--rate`; unpaced
+Grunts skip both the reservation and wait while retaining admission, request
+budgets, TLS and result handling. The two experimental paths require a
+literal loopback target with redirects disabled.
+
+| Mode | Pacing path | Median end-to-end req/s | Median p95 / p99 HTTP (ms) |
+| --- | --- | ---: | ---: |
+| Standalone | Normal | 13,093 | 0.154 / 0.193 |
+| Standalone | Reservation only | 131,724 | 0.200 / 0.241 |
+| Standalone | Unpaced | 133,018 | 0.194 / 0.229 |
+| Two Grunts | Normal | 13,538 | 0.125 / 0.166 |
+| Two Grunts | Reservation only | 169,430 | 0.128 / 0.155 |
+| Two Grunts | Unpaced | 169,135 | 0.139 / 0.160 |
+
+Removing only the wait increased end-to-end throughput by a paired median
+factor of 10.1 standalone and 12.5 with two Grunts. After removing the wait,
+removing the reservation added no clear throughput gain. Standalone showed
+more run-to-run variation in the two unpaced variants. This isolates the
+await and wakeup path as the dominant cause of the 13,000 req/s plateau
+in this setup. Tokio 1.54.1 rounds timer deadlines to millisecond ticks,
+while the requested spacing was 3.3 µs standalone and 6.7 µs per Grunt.
+Each worker waits for its next slot before issuing a request. The configured
+request count and concurrency remained unchanged. HTTP percentiles exclude
+the pacing wait and reflect the different achieved rates in the table.
+
+The raw reports are in `target/benchmarks/pacing-ablation.json`, and the
+isolated source change is in `target/benchmarks/pacing-ablation.diff`.
+Run the experiment again with the same CPU layout using:
+
+```sh
+python3 benchmarks/pacing.py --binary target/benchmarks/pacing-build/release/horde \
+  --client-cpus 0-3 --server-cpus 4-11 --output target/benchmarks/pacing-ablation.json
+```
+
+### Sub-millisecond pacing follow-up
+
+The single-URL runner now uses a shared atomic admission clock when the
+interval is shorter than 1 ms. Each admission advances the clock from the
+observed current time, without carrying credit for missed starts. Waiting
+workers yield to Tokio and the local Grunt stop signal can interrupt that
+wait. Intervals of 1 ms and above continue to park on the timer. The wait
+remains outside HTTP latency, and scenario iteration pacing is unchanged.
+Cooperative waiting can increase CPU use. This sweep measured throughput
+and HTTP latency, without profiling CPU use.
+
+We ran the old and new binaries sequentially as two blocks, on the
+same hardware and CPU layout as above. Within each block, four pairs per
+rate alternated standalone and distributed order. Both binaries used the
+same isolated higher ceilings above. The usual CLI ceilings were not
+changed. All runs completed the same request budget at each step, with
+HTTP 200 and no failures. The table reports medians.
+
+| Target starts/s | Mode | Before req/s | After req/s | Before p95 / p99 (ms) | After p95 / p99 (ms) |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 2,000 | Standalone | 1,995 | 1,996 | 0.167 / 0.233 | 0.089 / 0.131 |
+| 2,000 | Two Grunts | 1,969 | 1,969 | 0.146 / 0.212 | 0.140 / 0.202 |
+| 9,000 | Standalone | 8,614 | 8,965 | 0.128 / 0.169 | 0.037 / 0.098 |
+| 9,000 | Two Grunts | 8,565 | 8,857 | 0.111 / 0.148 | 0.049 / 0.097 |
+| 12,000 | Standalone | 9,841 | 11,951 | 0.135 / 0.174 | 0.038 / 0.081 |
+| 12,000 | Two Grunts | 10,015 | 11,795 | 0.113 / 0.152 | 0.048 / 0.091 |
+| 30,000 | Standalone | 11,541 | 29,593 | 0.246 / 1.133 | 0.034 / 0.051 |
+| 30,000 | Two Grunts | 12,163 | 28,642 | 0.120 / 0.164 | 0.039 / 0.059 |
+| 60,000 | Standalone | 12,875 | 58,013 | 0.153 / 0.194 | 0.029 / 0.039 |
+| 60,000 | Two Grunts | 13,218 | 54,230 | 0.121 / 0.162 | 0.036 / 0.054 |
+| 120,000 | Standalone | 12,957 | 102,263 | 0.155 / 0.194 | 0.040 / 0.056 |
+| 120,000 | Two Grunts | 13,381 | 97,936 | 0.124 / 0.165 | 0.039 / 0.073 |
+| 300,000 | Standalone | 13,083 | 113,924 | 0.152 / 0.191 | 0.189 / 0.230 |
+| 300,000 | Two Grunts | 13,487 | 115,810 | 0.124 / 0.167 | 0.149 / 0.199 |
+
+The earlier throughput plateau moved from about 13,000 req/s to 114,000
+req/s standalone and 116,000 req/s across two Grunts at the highest
+measured setting. At 60,000 starts/s both modes gained roughly fourfold
+while HTTP p95 and p99 fell. At 300,000 starts/s, HTTP tail latency rose
+relative to the old timer path as achieved throughput increased. These percentiles are at equal configured load and
+different achieved throughput.
+
+The two raw files are `target/benchmarks/pacer-before.json` and
+`target/benchmarks/pacer-after.json`. Both were produced by
+`benchmarks/distributed.py` with
+`--rates 2000 9000 12000 30000 60000 120000 300000 --max-requests 16000 --pairs 4 --client-cpus 0-3 --server-cpus 4-11`.
+
+### CPU cost at matched rates
+
+We compared the same two release benchmarks as above at 2,000, 4,000 and
+8,000 starts/s. The old and new binaries used equal request budgets at each
+rate (4,000, 8,000 and 16,000 requests), with total concurrency 16 and the same
+loopback target. Four rounds per rate rotated the order of the four
+mode/version combinations. All 48 measured runs completed without HTTP
+errors. Within each comparison, achieved throughput changed by less than 1%.
+
+CPU time includes user and system time. For standalone it comes from
+`getrusage(RUSAGE_CHILDREN)` around the command. For distributed it also
+includes the two persistent Grunts' process CPU deltas from
+`/proc/<pid>/stat`, at 100 ticks per second. The HTTP server's CPU time
+is recorded separately. Average logical cores equal summed client CPU
+seconds divided by command wall seconds.
+
+| Target starts/s | Mode | Before → after req/s | Before → after CPU µs/request | Before → after average logical cores |
+| ---: | --- | ---: | ---: | ---: |
+| 2,000 | Standalone | 1,997 → 1,997 | 49.7 → 1,000.8 | 0.10 → 2.00 |
+| 2,000 | Two Grunts | 1,979 → 1,980 | 52.3 → 52.3 | 0.10 → 0.10 |
+| 4,000 | Standalone | 3,992 → 3,992 | 36.6 → 500.4 | 0.15 → 2.00 |
+| 4,000 | Two Grunts | 3,957 → 3,983 | 50.7 → 1,000.3 | 0.20 → 3.98 |
+| 8,000 | Standalone | 7,920 → 7,980 | 27.2 → 250.3 | 0.22 → 2.00 |
+| 8,000 | Two Grunts | 7,911 → 7,921 | 38.1 → 494.3 | 0.30 → 3.90 |
+
+At 2,000 starts/s total, the Grunts receive 1,000 each and still park on the
+millisecond timer. The new path uses nearly every available worker thread
+while waiting. With two Grunts at 8,000 starts/s, their combined median CPU
+time rose from 0.595 to 7.895 seconds per run, while the controller stayed
+around 0.014 seconds. The matched-rate data show the CPU cost of the
+sub-millisecond path where the old timer could already sustain the workload.
+
+```sh
+python3 benchmarks/pacer_cpu.py --before target/benchmarks/pacer-before \
+  --after target/benchmarks/pacer-optimized-build/release/horde \
+  --client-cpus 0-3 --server-cpus 4-11 --output target/benchmarks/pacer-cpu.json
+```
+
+### Hybrid pacing at matched budgets
+
+The hybrid scheduler selects the timer up to 1,000 starts/s or 500 starts/s
+per configured worker, using the number of workers that the run can create.
+Above both thresholds it keeps the cooperative shared admission clock. The
+500 starts/s estimate leaves about 2 ms per worker for coarse timer wakeups
+and HTTP work and does not predict achieved throughput. With 16 workers, the
+cutover is above 8,000 starts/s. Two Grunts with eight workers each reach
+the same aggregate cutover when assigned equal shares.
+
+We compared the hybrid scheduler with its predecessor, which used cooperative
+waiting for every sub-millisecond interval. The same CPU affinity, process CPU
+accounting and HTTP target were used as above. Each of the six rates used
+four rounds rotating order. Each run made two seconds' worth of requests,
+capped at 16,000. All 96 measured runs completed with zero failures. The
+table shows medians.
+
+| Target starts/s | Mode | Before → after req/s | Before → after CPU µs/request | Before → after p95 / p99 (ms) |
+| ---: | --- | ---: | ---: | ---: |
+| 2,000 | Standalone | 1,997 → 1,996 | 1000.7 → 51.4 | 0.091 / 0.160 → 0.147 / 0.241 |
+| 2,000 | Two Grunts | 1,979 → 1,979 | 56.2 → 61.1 | 0.140 / 0.220 → 0.126 / 0.222 |
+| 4,000 | Standalone | 3,989 → 3,990 | 500.4 → 37.6 | 0.058 / 0.116 → 0.128 / 0.223 |
+| 4,000 | Two Grunts | 3,980 → 3,955 | 998.6 → 51.8 | 0.074 / 0.132 → 0.115 / 0.204 |
+| 8,000 | Standalone | 7,980 → 7,941 | 250.2 → 28.0 | 0.045 / 0.098 → 0.128 / 0.174 |
+| 8,000 | Two Grunts | 7,883 → 7,912 | 498.0 → 39.4 | 0.058 / 0.115 → 0.107 / 0.152 |
+| 12,000 | Standalone | 11,953 → 11,949 | 166.9 → 166.9 | 0.039 / 0.074 → 0.039 / 0.080 |
+| 12,000 | Two Grunts | 11,845 → 11,862 | 332.8 → 331.7 | 0.050 / 0.092 → 0.051 / 0.086 |
+| 60,000 | Standalone | 57,962 → 57,971 | 33.9 → 33.9 | 0.031 / 0.055 → 0.032 / 0.052 |
+| 60,000 | Two Grunts | 54,366 → 54,503 | 67.2 → 67.2 | 0.040 / 0.073 → 0.041 / 0.065 |
+| 300,000 | Standalone | 95,765 → 95,794 | 20.4 → 20.3 | 0.231 / 0.284 → 0.233 / 0.288 |
+| 300,000 | Two Grunts | 127,785 → 142,092 | 23.2 → 23.2 | 0.140 / 0.183 → 0.122 / 0.149 |
+
+At 4,000 and 8,000 starts/s the hybrid scheduler reduced CPU time per
+request by 89% to 95%, with less than 1% change in observed throughput.
+Moderate-rate HTTP percentiles increased when moving back to the timer.
+At 12,000 starts/s and above the fast path remains active. At 60,000
+starts/s, throughput changed by less than 0.3% for either mode, and CPU
+cost per request was nearly identical. At 300,000 starts/s the two Grunt
+samples varied between rounds. Both modes retained the large throughput
+gain over the original timer-only scheduler.
+
+```sh
+python3 benchmarks/pacer_cpu.py --before target/benchmarks/pacer-optimized-build/release/horde   --after target/benchmarks/pacer-hybrid-build/release/horde   --rates 2000 4000 8000 12000 60000 300000   --client-cpus 0-3 --server-cpus 4-11 --output target/benchmarks/pacer-hybrid.json
+```
+
+### Checking the hybrid cutoff across worker counts
+
+We measured 4, 8 and 16 total workers, split evenly in two-Grunt runs.
+Targets were 80%, 100% and 120% of 500 starts/s per worker. Each quota
+matched one second at the target rate. We used the same loopback server,
+CPU affinity and CPU accounting as above, with four rounds per case.
+Each comparison launched the CLI at the same rate and budget. All 168
+measured runs finished with HTTP 200 and no failures. Table entries are
+medians, with end-to-end throughput and client CPU time per request.
+
+| Total workers | Target starts/s | Mode | Previous → hybrid req/s | CPU µs/request | HTTP p95 / p99 (ms) |
+| ---: | ---: | --- | ---: | ---: | ---: |
+| 4 | 1,600 | Standalone | 1,596 → 1,595 | 1249.0 → 54.0 | 0.102 / 0.161 → 0.142 / 0.240 |
+| 4 | 1,600 | Two Grunts | 1,558 → 1,558 | 56.3 → 59.4 | 0.140 / 0.221 → 0.141 / 0.241 |
+| 4 | 2,000 | Standalone | 1,994 → 1,991 | 999.2 → 52.4 | 0.072 / 0.128 → 0.142 / 0.227 |
+| 4 | 2,000 | Two Grunts | 1,951 → 1,950 | 59.9 → 62.2 | 0.123 / 0.200 → 0.126 / 0.204 |
+| 4 | 2,400 | Standalone | 2,393 → 2,392 | 832.4 → 831.8 | 0.065 / 0.120 → 0.068 / 0.125 |
+| 4 | 2,400 | Two Grunts | 2,348 → 2,375 | 1645.5 → 1649.3 | 0.088 / 0.140 → 0.081 / 0.127 |
+| 8 | 3,200 | Standalone | 3,190 → 3,188 | 625.5 → 42.1 | 0.068 / 0.129 → 0.136 / 0.230 |
+| 8 | 3,200 | Two Grunts | 3,166 → 3,119 | 1246.4 → 57.5 | 0.079 / 0.138 → 0.130 / 0.262 |
+| 8 | 4,000 | Standalone | 3,986 → 3,980 | 500.4 → 37.8 | 0.057 / 0.114 → 0.122 / 0.212 |
+| 8 | 4,000 | Two Grunts | 3,936 → 3,898 | 1001.1 → 53.7 | 0.066 / 0.116 → 0.120 / 0.248 |
+| 8 | 4,800 | Standalone | 4,783 → 4,783 | 416.9 → 416.8 | 0.055 / 0.110 → 0.061 / 0.125 |
+| 8 | 4,800 | Two Grunts | 4,761 → 4,659 | 831.2 → 831.1 | 0.067 / 0.123 → 0.067 / 0.130 |
+| 16 | 6,400 | Standalone | 6,366 → 6,369 | 313.1 → 31.7 | 0.052 / 0.102 → 0.125 / 0.198 |
+| 16 | 6,400 | Two Grunts | 6,312 → 6,236 | 623.4 → 43.8 | 0.063 / 0.115 → 0.108 / 0.170 |
+| 16 | 8,000 | Standalone | 7,966 → 7,906 | 250.6 → 28.8 | 0.056 / 0.243 → 0.138 / 0.203 |
+| 16 | 8,000 | Two Grunts | 7,937 → 7,784 | 499.3 → 39.3 | 0.060 / 0.115 → 0.112 / 0.168 |
+| 16 | 9,600 | Standalone | 9,556 → 9,549 | 208.7 → 208.9 | 0.038 / 0.094 → 0.035 / 0.082 |
+| 16 | 9,600 | Two Grunts | 9,395 → 9,481 | 417.1 → 416.7 | 0.049 / 0.095 → 0.054 / 0.107 |
+
+At the cutoff, hybrid reached between 97.3% and 99.6% of target in
+all six mode and concurrency combinations. CPU fell where the hybrid
+switched back to the timer, with higher HTTP tail percentiles in most
+of those comparisons. Both versions already used the timer for two
+Grunts at 2,000 starts/s total and four workers. The 1,000 starts/s
+per-process floor applies independently to each Grunt.
+
+We also ran the timer-only reference at 120% of the cutoff. It met
+over 96% of target with four workers, about 95% with eight and
+about 93% with sixteen. This puts 500 starts/s per worker on the
+conservative side at lower concurrency in this setup. The curve
+depends on concurrency, response time and scheduling. The HTTP
+percentiles exclude pacing waits.
+
+| Total workers | Target starts/s | Mode | Timer → hybrid req/s | CPU µs/request | HTTP p95 / p99 (ms) |
+| ---: | ---: | --- | ---: | ---: | ---: |
+| 4 | 2,400 | Standalone | 2,322 → 2,392 | 48.2 → 831.8 | 0.150 / 0.225 → 0.068 / 0.125 |
+| 4 | 2,400 | Two Grunts | 2,342 → 2,375 | 60.2 → 1649.3 | 0.132 / 0.205 → 0.081 / 0.127 |
+| 8 | 4,800 | Standalone | 4,553 → 4,783 | 35.4 → 416.8 | 0.120 / 0.213 → 0.061 / 0.125 |
+| 8 | 4,800 | Two Grunts | 4,560 → 4,659 | 48.0 → 831.1 | 0.111 / 0.194 → 0.067 / 0.130 |
+| 16 | 9,600 | Standalone | 8,946 → 9,549 | 26.4 → 208.9 | 0.129 / 0.174 → 0.035 / 0.082 |
+| 16 | 9,600 | Two Grunts | 8,903 → 9,481 | 37.0 → 416.7 | 0.109 / 0.145 → 0.054 / 0.107 |
+
+```sh
+python3 benchmarks/pacer_cpu.py   --before target/benchmarks/pacer-optimized-build/release/horde   --after target/benchmarks/pacer-hybrid-build/release/horde   --timer-reference target/benchmarks/pacer-before --worker-matrix 4 8 16   --client-cpus 0-3 --server-cpus 4-11 --output target/benchmarks/pacer-worker-matrix.json
+```
+
+### Tuning the cutoff for small worker pools
+
+Each process computes its timer cutoff from its local worker count. The
+per-worker allowance is 600 starts/s for up to two workers, 550 for three
+or four, 525 for five to seven, and 500 from eight onward. The minimum
+timer cutoff is 1,000 starts/s per process. At four total workers the
+timer now runs through 2,200 starts/s standalone or 2,400 starts/s across
+two equal Grunts. At sixteen total workers the cutoff remains 8,000
+starts/s in both modes.
+
+We compared the previous hybrid binary with the tuned one at equal
+concurrency, rate and request budgets, using the same server, CPU
+accounting and affinity as above. There were four rounds per case,
+with a one-second nominal budget and alternating order.
+All 96 measured runs completed with HTTP 200 and zero failures.
+
+| Total workers | Target starts/s | Mode | Before → after req/s | CPU µs/request | HTTP p95 / p99 (ms) |
+| ---: | ---: | --- | ---: | ---: | ---: |
+| 4 | 2,200 | Standalone | 2,193 → 2,168 | 908.2 → 49.9 | 0.073 / 0.126 → 0.165 / 0.237 |
+| 4 | 2,200 | Two Grunts | 2,136 → 2,144 | 1799.4 → 56.4 | 0.093 / 0.144 → 0.126 / 0.188 |
+| 4 | 2,400 | Standalone | 2,393 → 2,393 | 832.4 → 832.4 | 0.077 / 0.127 → 0.082 / 0.123 |
+| 4 | 2,400 | Two Grunts | 2,354 → 2,343 | 1651.3 → 55.7 | 0.085 / 0.133 → 0.134 / 0.190 |
+| 6 | 3,150 | Standalone | 3,139 → 3,121 | 635.1 → 41.1 | 0.061 / 0.114 → 0.155 / 0.230 |
+| 6 | 3,150 | Two Grunts | 3,079 → 3,071 | 1267.7 → 53.6 | 0.071 / 0.124 → 0.151 / 0.214 |
+| 8 | 4,400 | Standalone | 4,385 → 4,384 | 454.8 → 454.9 | 0.050 / 0.103 → 0.047 / 0.101 |
+| 8 | 4,400 | Two Grunts | 4,269 → 4,284 | 906.5 → 49.9 | 0.064 / 0.125 → 0.125 / 0.211 |
+| 16 | 8,000 | Standalone | 7,916 → 7,913 | 28.5 → 28.0 | 0.131 / 0.175 → 0.133 / 0.177 |
+| 16 | 8,000 | Two Grunts | 7,795 → 7,792 | 38.8 → 40.6 | 0.110 / 0.151 → 0.107 / 0.148 |
+| 16 | 9,600 | Standalone | 9,555 → 9,556 | 208.8 → 208.8 | 0.041 / 0.091 → 0.039 / 0.095 |
+| 16 | 9,600 | Two Grunts | 9,321 → 9,532 | 416.6 → 416.6 | 0.049 / 0.087 → 0.050 / 0.091 |
+
+At 2,200 starts/s with four workers, the return to the timer saved
+94.5% of CPU time per request standalone and 96.9% across two Grunts.
+The standalone median was 1.1% slower and the two-Grunt median was
+0.4% faster. HTTP tail latencies increased. At sixteen workers the
+pacing path did not change. The observed differences there are
+measurements of two runs with the same cutoff, and do not establish a
+performance change attributable to the new rule.
+
+```sh
+python3 benchmarks/pacer_cpu.py --before target/benchmarks/pacer-hybrid-build/release/horde   --after target/benchmarks/pacer-tuned-build/release/horde   --case 4:2200 --case 4:2400 --case 6:3150 --case 8:4400 --case 16:8000 --case 16:9600   --client-cpus 0-3 --server-cpus 4-11 --output target/benchmarks/pacer-tuned.json
+```

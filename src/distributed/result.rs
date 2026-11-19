@@ -3,14 +3,16 @@ use super::{Budget, Error, StopReason};
 use crate::Report;
 use std::{collections::BTreeMap, time::Duration};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CompletionReason {
     RequestBudget,
     Duration,
 }
 
 /// Counts for logical requests; failure categories may overlap.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResultMetrics {
     pub started: u64,
     pub completed: u64,
@@ -28,7 +30,8 @@ pub struct ResultMetrics {
 }
 
 /// Metadata from an agent claiming that all its started requests have completed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletedResult {
     pub version: u16,
     pub reason: CompletionReason,

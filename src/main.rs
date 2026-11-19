@@ -1,3 +1,5 @@
+#[cfg(feature = "distributed-transport")]
+mod distributed_cli;
 mod signals;
 use clap::Parser;
 use horde_rs::scenario::{
@@ -37,9 +39,14 @@ impl Error for ScenarioDiagnostic {}
 #[command(
     version,
     about,
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true,
     after_help = "Zug zug! Only test services you are authorized to load test."
 )]
 struct Args {
+    #[cfg(feature = "distributed-transport")]
+    #[command(subcommand)]
+    distributed: Option<distributed_cli::Command>,
     /// HTTP or HTTPS target URL.
     #[arg(required_unless_present = "scenario", conflicts_with = "scenario")]
     url: Option<Url>,
@@ -111,6 +118,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
+    #[cfg(feature = "distributed-transport")]
+    if let Some(command) = args.distributed {
+        return distributed_cli::run(command).await;
+    }
     let cancellation = Cancellation::new();
     let interrupts = signals::install(cancellation.clone())?;
     if args

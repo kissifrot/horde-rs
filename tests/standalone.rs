@@ -256,11 +256,17 @@ fn bounded_latency_reports_method_and_checks_p95() {
 
 #[test]
 fn rate_is_shared_across_workers() {
+    for (requests, rate, minimum_ms) in [(4, 5, 500), (1_000, 4_000, 235)] {
+        check_shared_rate(requests, rate, minimum_ms);
+    }
+}
+
+fn check_shared_rate(requests: usize, rate: u32, minimum_ms: u64) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let mut arrivals = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..requests {
             let (mut stream, _) = common::accept(&listener);
             let mut request = [0; 4096];
             assert!(stream.read(&mut request).unwrap() > 0);
@@ -276,11 +282,11 @@ fn rate_is_shared_across_workers() {
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .args([
             "-n",
-            "4",
+            &requests.to_string(),
             "-c",
             "4",
             "--rate",
-            "5",
+            &rate.to_string(),
             "--json",
             &format!("http://{address}/"),
         ])
@@ -289,15 +295,16 @@ fn rate_is_shared_across_workers() {
     let arrivals = server.join().unwrap();
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["completed"], 4);
-    let span = arrivals[3].duration_since(arrivals[0]);
+    assert_eq!(report["completed"], requests);
+    assert_eq!(report["failed"], 0);
+    let span = arrivals.last().unwrap().duration_since(arrivals[0]);
     assert!(
-        span >= std::time::Duration::from_millis(500),
-        "requests arrived too quickly: {arrivals:?}"
+        span >= std::time::Duration::from_millis(minimum_ms),
+        "requests arrived too quickly at {rate}/s: {span:?}"
     );
     assert!(
         span < std::time::Duration::from_secs(3),
-        "requests arrived too slowly: {arrivals:?}"
+        "requests arrived too slowly at {rate}/s: {span:?}"
     );
 }
 

@@ -1,7 +1,7 @@
 //! Experimental loopback protocol. Callers supply already accepted TCP streams.
 use super::{
-    AgentLimits, Budget, Cancellation, GruntPolicy, LocalOutcome, StopReason, preflight,
-    run_reserved,
+    AgentLimits, Budget, Cancellation, CompletedResult, GruntPolicy, LocalOutcome, StopReason,
+    encode_histogram, preflight, run_reserved,
 };
 use crate::TestPlan;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -28,6 +28,8 @@ use tokio_rustls::{
 
 pub const VERSION: u16 = 1;
 const MAX_FRAME: usize = 4096;
+pub(super) const MAX_RESULT_METADATA: usize = 32 * 1024;
+const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROFILE_NAME: usize = 64;
 pub const ALPN: &[u8] = b"horde-grunt/1";
 
@@ -47,6 +49,8 @@ pub struct Request {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Submit { profile: String },
+    SubmitBudget { profile: String, budget: Budget },
+    Collect,
     Inspect,
     Cancel,
 }
@@ -68,6 +72,7 @@ pub enum RunStatus {
 pub enum Reply {
     Hello { version: u16, epoch: Id },
     State { status: RunStatus },
+    Result { histogram_bytes: usize },
     Error { code: ErrorCode },
 }
 
@@ -117,14 +122,23 @@ type RunKey = (usize, Id);
 struct State {
     next_session: u64,
     runs: BTreeMap<RunKey, Run>,
+    retained_bytes: usize,
 }
 
 struct Run {
     profile: String,
+    budget: Budget,
+    result: Option<StoredResult>,
     status: RunStatus,
     session: Option<u64>,
     cancel: Cancellation,
     disconnected: watch::Sender<Option<Instant>>,
+}
+
+#[derive(Clone)]
+struct StoredResult {
+    metadata: CompletedResult,
+    histogram: Arc<[u8]>,
 }
 
 impl Run {
@@ -184,7 +198,20 @@ impl Endpoint {
     ) -> Result<Arc<Self>, BoxError> {
         if controllers.is_empty()
             || profiles.is_empty()
-            || profiles.keys().any(|name| !valid_profile_name(name))
+            || profiles.iter().any(|(name, profile)| {
+                !valid_profile_name(name)
+                    || !profile
+                        .plan
+                        .url
+                        .host_str()
+                        .and_then(|host| {
+                            host.trim_matches(['[', ']'])
+                                .parse::<std::net::IpAddr>()
+                                .ok()
+                        })
+                        .is_some_and(|ip| ip.to_canonical().is_loopback())
+                    || profile.plan.follow_redirects
+            })
             || !(1..=Semaphore::MAX_PERMITS).contains(&config.max_sessions)
             || config.max_records == 0
             || [
@@ -222,6 +249,27 @@ impl Endpoint {
         }))
     }
 
+    /// Cancel active workloads and wait for their workers to close. Stop accepting
+    /// connections and drop session handlers before calling this.
+    pub async fn shutdown(&self) {
+        for run in self.state.lock().unwrap().runs.values_mut() {
+            run.cancel();
+        }
+        loop {
+            if self
+                .state
+                .lock()
+                .unwrap()
+                .runs
+                .values()
+                .all(|run| run.status != RunStatus::Cancelling)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Handle one accepted loopback stream. The caller owns the TCP listener and accept loop.
     pub async fn serve_connection(self: &Arc<Self>, stream: TcpStream) -> Result<(), BoxError> {
         if !stream.local_addr()?.ip().to_canonical().is_loopback()
@@ -229,6 +277,7 @@ impl Endpoint {
         {
             return Err("Grunt transport requires loopback".into());
         }
+        stream.set_nodelay(true)?;
         let _permit = self
             .sessions
             .try_acquire()
@@ -270,11 +319,40 @@ impl Endpoint {
         )
         .await??;
         loop {
-            let Some(request) =
+            let Some(request): Option<Request> =
                 timeout(self.config.frame_timeout, read_frame(&mut stream)).await??
             else {
                 return Ok(());
             };
+            if matches!(request.operation, Operation::Collect)
+                && request.version == VERSION
+                && request.epoch == self.epoch
+            {
+                let result = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .runs
+                    .get(&(controller, request.run_id))
+                    .and_then(|run| run.result.clone());
+                if let Some(result) = result {
+                    timeout(self.config.frame_timeout, async {
+                        write_frame(
+                            &mut stream,
+                            &Reply::Result {
+                                histogram_bytes: result.histogram.len(),
+                            },
+                        )
+                        .await?;
+                        write_frame_limited(&mut stream, &result.metadata, MAX_RESULT_METADATA)
+                            .await?;
+                        stream.write_all(&result.histogram).await?;
+                        stream.flush().await
+                    })
+                    .await??;
+                    continue;
+                }
+            }
             let reply = self.handle(controller, session.id, request);
             timeout(self.config.frame_timeout, write_frame(&mut stream, &reply)).await??;
         }
@@ -293,40 +371,55 @@ impl Endpoint {
         }
         let key = (controller, request.run_id);
         let mut state = self.state.lock().unwrap();
+        let submit = match &request.operation {
+            Operation::Submit { profile } => Some((profile, None)),
+            Operation::SubmitBudget { profile, budget } => Some((profile, Some(*budget))),
+            _ => None,
+        };
         if let Some(run) = state.runs.get_mut(&key) {
             run.expire();
+            if let Some((profile, budget)) = submit
+                && (profile != &run.profile
+                    || budget.unwrap_or(self.profiles[profile].budget) != run.budget)
+            {
+                return error(ErrorCode::ConflictingSubmission);
+            }
             match request.operation {
-                Operation::Submit { profile } if profile != run.profile => {
-                    return error(ErrorCode::ConflictingSubmission);
-                }
                 Operation::Cancel => run.cancel(),
-                Operation::Submit { .. } | Operation::Inspect => run.attach(session),
+                Operation::Submit { .. } | Operation::SubmitBudget { .. } | Operation::Inspect => {
+                    run.attach(session)
+                }
+                Operation::Collect => {}
             }
             return Reply::State { status: run.status };
         }
-        let Operation::Submit { profile } = request.operation else {
+        let Some((profile, requested)) = submit else {
             return error(ErrorCode::UnknownRun);
         };
-        let Some(job) = self.profiles.get(&profile) else {
+        let Some(job) = self.profiles.get(profile) else {
             return error(ErrorCode::UnknownProfile);
         };
         if state.runs.len() >= self.config.max_records {
             return error(ErrorCode::Capacity);
         }
-        if preflight(job.budget, job.limits, job.plan.timeout).is_err() {
+        let budget = requested.unwrap_or(job.budget);
+        if !fits_profile(budget, job.budget)
+            || preflight(budget, job.limits, job.plan.timeout).is_err()
+        {
             return error(ErrorCode::Rejected);
         }
-        let Ok(reservation) = job.policy.reserve(&job.plan, job.budget, job.limits) else {
+        let Ok(reservation) = job.policy.reserve(&job.plan, budget, job.limits) else {
             return error(ErrorCode::Rejected);
         };
-        let (plan, budget, limits, policy) =
-            (job.plan.clone(), job.budget, job.limits, job.policy.clone());
+        let (plan, limits, policy) = (job.plan.clone(), job.limits, job.policy.clone());
         let cancel = Cancellation::new();
         let (disconnected, changes) = watch::channel(None);
         state.runs.insert(
             key,
             Run {
-                profile,
+                profile: profile.clone(),
+                budget,
+                result: None,
                 status: RunStatus::Running,
                 session: Some(session),
                 cancel: cancel.clone(),
@@ -344,22 +437,59 @@ impl Endpoint {
                     () = &mut watchdog => run.await,
                 }
             };
-            let status = match outcome {
-                Ok(LocalOutcome::Complete { .. }) => RunStatus::Complete,
+            let (mut status, mut result) = match outcome {
+                Ok(LocalOutcome::Complete {
+                    report,
+                    reason,
+                    started,
+                }) => {
+                    let result = CompletedResult::from_local(&report, reason, started)
+                        .and_then(|metadata| {
+                            metadata.validate(budget, limits.max_samples)?;
+                            let histogram = encode_histogram(
+                                report.bounded_latencies.as_ref(),
+                                metadata.metrics.completed,
+                            )?;
+                            Ok(StoredResult {
+                                metadata,
+                                histogram: histogram.into(),
+                            })
+                        })
+                        .ok();
+                    (
+                        if result.is_some() {
+                            RunStatus::Complete
+                        } else {
+                            RunStatus::Failed
+                        },
+                        result,
+                    )
+                }
                 Ok(LocalOutcome::Partial {
                     reason: StopReason::Cancelled,
-                }) => RunStatus::Cancelled,
+                }) => (RunStatus::Cancelled, None),
                 Ok(LocalOutcome::Partial {
                     reason: StopReason::AgentDeadline,
-                }) => RunStatus::AgentDeadline,
+                }) => (RunStatus::AgentDeadline, None),
                 Ok(LocalOutcome::Partial {
                     reason: StopReason::SampleLimit,
-                }) => RunStatus::SampleLimit,
-                _ => RunStatus::Failed,
+                }) => (RunStatus::SampleLimit, None),
+                _ => (RunStatus::Failed, None),
             };
             let mut state = endpoint.state.lock().unwrap();
+            if let Some(stored) = &result {
+                // Charge a fixed metadata allowance and the exact encoded byte count.
+                let charge = MAX_RESULT_METADATA + stored.histogram.len();
+                if charge > MAX_RETAINED_BYTES - state.retained_bytes {
+                    result = None;
+                    status = RunStatus::Failed;
+                } else {
+                    state.retained_bytes += charge;
+                }
+            }
             let run = state.runs.get_mut(&key).unwrap();
             run.status = status;
+            run.result = result;
             run.session = None;
             drop(reservation);
         });
@@ -388,6 +518,16 @@ impl Endpoint {
     }
 }
 
+fn fits_profile(budget: Budget, ceiling: Budget) -> bool {
+    let fits = |a: Option<u64>, b: Option<u64>| b.is_none_or(|b| a.is_some_and(|a| a <= b));
+    fits(budget.requests, ceiling.requests)
+        && budget.concurrency <= ceiling.concurrency
+        && budget.rate_per_second <= ceiling.rate_per_second
+        && ceiling
+            .duration
+            .is_none_or(|b| budget.duration.is_some_and(|a| a <= b))
+}
+
 fn valid_profile_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_PROFILE_NAME
@@ -399,13 +539,20 @@ fn valid_profile_name(name: &str) -> bool {
 async fn read_frame<T: DeserializeOwned>(
     stream: &mut (impl AsyncRead + Unpin),
 ) -> io::Result<Option<T>> {
+    read_frame_limited(stream, MAX_FRAME).await
+}
+
+pub(super) async fn read_frame_limited<T: DeserializeOwned>(
+    stream: &mut (impl AsyncRead + Unpin),
+    limit: usize,
+) -> io::Result<Option<T>> {
     let mut size = [0; 4];
     if stream.read(&mut size[..1]).await? == 0 {
         return Ok(None);
     }
     stream.read_exact(&mut size[1..]).await?;
     let size = u32::from_be_bytes(size) as usize;
-    if !(1..=MAX_FRAME).contains(&size) {
+    if !(1..=limit).contains(&size) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid Grunt frame size",
@@ -418,12 +565,20 @@ async fn read_frame<T: DeserializeOwned>(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Grunt frame"))
 }
 
-async fn write_frame(
+pub(super) async fn write_frame(
     stream: &mut (impl AsyncWrite + Unpin),
     message: &impl Serialize,
 ) -> io::Result<()> {
+    write_frame_limited(stream, message, MAX_FRAME).await
+}
+
+async fn write_frame_limited(
+    stream: &mut (impl AsyncWrite + Unpin),
+    message: &impl Serialize,
+    limit: usize,
+) -> io::Result<()> {
     let bytes = serde_json::to_vec(message).map_err(io::Error::other)?;
-    if bytes.len() > MAX_FRAME {
+    if bytes.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Grunt frame too large",

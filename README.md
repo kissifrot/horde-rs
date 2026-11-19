@@ -51,7 +51,7 @@ Each worker sends requests sequentially. Use `--duration` to stop starting reque
 
 Press Ctrl+C to cancel a run and close its active requests. On Unix, SIGTERM behaves likewise. Horde reports an interrupted, partial run without metrics or passing CI thresholds and exits with 130 for SIGINT or 143 for SIGTERM. With `--json`, the interruption is a JSON object with `type: "interrupted"` and `thresholds.status: "not_evaluable"`. A second signal, or a shutdown taking more than five seconds, forces immediate exit and may prevent the report from being printed.
 
-For single-URL tests, `--rate` spaces logical request starts across all workers. Concurrency, response time and scheduling affect the achieved rate. Redirects are not separately rate-limited, and waiting for a rate slot is excluded from latency and timeout.
+For single-URL tests, `--rate` spaces logical request starts across all workers. Concurrency, response time and scheduling affect the achieved rate. Redirects are not separately rate-limited, and waiting for a rate slot is excluded from latency and timeout. The scheduler normally waits on Tokio’s timer. The timer cutoff is the larger of 1,000 starts/s per process and a worker-based allowance. The allowance is 600 starts/s per worker for up to 2 local workers, 550 for 3–4, 525 for 5–7, and 500 for 8 or more. Above the cutoff, it uses a shared admission clock and yields until the next start. Each Grunt applies the cutoff to its own share. This avoids millisecond rounding at high rates, at a higher CPU cost. Missed slots do not accumulate in this path.
 
 To send a body, select a method and provide a file:
 
@@ -190,7 +190,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-The library separates the test plan, local execution and report from the CLI. The optional `distributed-offline` feature provides experimental Grunt execution and aggregation. The optional `distributed-transport` feature adds an experimental mutual TLS protocol for loopback connections. The CLI opens no distributed listener. `--all-features` includes the loopback protocol tests. See [Distributed mode](docs/distributed.md) for the protocol and its scope.
+The library separates the test plan, local execution and report from the CLI. The optional `distributed-offline` feature provides experimental Grunt execution and aggregation. The optional `distributed-transport` feature adds an experimental mutual TLS protocol for loopback connections. With that feature, the explicit `grunt` and `controller` commands support loopback testing. `--all-features` includes the loopback protocol tests. See [Distributed mode](docs/distributed.md) for the protocol and its scope.
 
 ### Local performance benchmark
 
@@ -210,6 +210,31 @@ CI comparisons are informational and have no regression threshold. Shared runner
 ## License
 
 GPL-3.0-only; see [LICENSE](LICENSE).
+
+### Distributed testing on loopback
+
+Build with `cargo build --features distributed-transport`. Start each Grunt with a
+fixed local HTTP(S) target and its own certificate and key. The Grunt prints the
+listening address. A listen port of zero lets the OS select the port.
+
+```sh
+horde grunt --listen 127.0.0.1:7071 --target http://127.0.0.1:8080/ \
+  --ca ca.der --cert grunt.der --key grunt-key.der --controller-cert controller.der
+horde controller --grunt 127.0.0.1:7071 --grunt 127.0.0.1:7072 \
+  --requests 41 --concurrency 2 --rate 100 --server-name localhost \
+  --ca ca.der --cert controller.der --key controller-key.der
+```
+
+Start the second Grunt on port 7072 before running the controller. Certificates
+are DER, keys are PKCS#8 DER, and each Grunt's certificate must match the server
+name supplied by the controller. The Grunt authorizes the specified controller
+certificate. Both the Grunt addresses and the fixed target IPs must be loopback.
+The CLI's Grunt profile sends GET requests with redirects disabled.
+
+The controller emits JSON with per-Grunt states, merged metrics and percentiles.
+It returns a nonzero exit code for partial runs or failed configured thresholds.
+On interruption it requests cancellation concurrently and keeps metrics from
+validated completed Grunts. Unconfirmed Grunts are reported as missing.
 
 ### Fuzzing the offline histogram decoder
 

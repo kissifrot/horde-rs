@@ -137,8 +137,12 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
+#[cfg(feature = "distributed-transport")]
+pub mod controller;
+
 /// A global budget, split only between the agents that can receive nonzero shares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Budget {
     pub requests: Option<u64>,
     pub concurrency: u64,

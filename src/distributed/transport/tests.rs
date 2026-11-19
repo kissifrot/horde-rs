@@ -448,6 +448,32 @@ async fn stale_epoch_and_oversized_frames_do_not_start_work() {
             code: ErrorCode::UnknownRun
         }
     );
+    assert_eq!(
+        request(
+            &mut stream,
+            epoch,
+            ID,
+            Operation::SubmitBudget {
+                profile: "test".into(),
+                budget: Budget {
+                    requests: Some(2),
+                    concurrency: 1,
+                    rate_per_second: 1,
+                    duration: None
+                },
+            }
+        )
+        .await,
+        Reply::Error {
+            code: ErrorCode::Rejected
+        },
+    );
+    assert_eq!(
+        request(&mut stream, epoch, ID, Operation::Inspect).await,
+        Reply::Error {
+            code: ErrorCode::UnknownRun
+        },
+    );
     stream.write_u32((MAX_FRAME + 1) as u32).await.unwrap();
     stream.flush().await.unwrap();
     let error = timeout(WAIT, task).await.unwrap().unwrap().unwrap_err();
