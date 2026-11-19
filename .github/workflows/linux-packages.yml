@@ -136,6 +136,14 @@ jobs:
           shopt -s nullglob
           packages=(*.deb)
           test "${#packages[@]}" -eq 2
+          # Match the release asset names before generating the checksum manifest.
+          for package in "${packages[@]}"; do
+            asset="${package//\~/.}"
+            if [[ "$asset" != "$package" ]]; then
+              mv -- "$package" "$asset"
+            fi
+          done
+          packages=(*.deb)
           sha256sum -- "${packages[@]}" horde-linux-amd64 horde-linux-arm64 > SHA256SUMS
           gh release create "$GITHUB_REF_NAME" "${packages[@]}" horde-linux-amd64 horde-linux-arm64 SHA256SUMS \
             --verify-tag --prerelease --latest=false --generate-notes

@@ -223,13 +223,17 @@ Get the package or standalone executable for your architecture from
 [GitHub Releases](https://github.com/kissifrot/horde-rs/releases). Use
 `dpkg --print-architecture` to check whether to select `amd64` or `arm64`.
 Download `SHA256SUMS` alongside the asset and verify it before installing.
-For example, for AMD64 and the `v0.1.0-rc.1` tag:
+For the immutable `v0.1.0-rc.1` release, GitHub changed the `~` in
+the package asset names to a dot. Normalize those two names in the
+checksum input when verifying this release. For example, on AMD64:
 
 ```sh
-sha256sum --ignore-missing -c SHA256SUMS
-sudo apt install './horde-rs_0.1.0~rc.1_amd64.deb'
+sed 's/~rc\./.rc./g' SHA256SUMS | sha256sum --ignore-missing -c -
+sudo apt install './horde-rs_0.1.0.rc.1_amd64.deb'
 horde --version
 ```
+
+For later prereleases, verify with `sha256sum --ignore-missing -c SHA256SUMS`.
 
 The standalone file contains the same executable as the package.
 It can be run directly with `chmod +x horde-linux-amd64` followed by
