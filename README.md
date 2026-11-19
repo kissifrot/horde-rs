@@ -190,7 +190,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-The library separates the test plan, local execution and report from the CLI. Distributed mode is not implemented and no remote listener is enabled. A future remote load generator will be called a Grunt. The optional `distributed-offline` feature contains experimental, offline histogram validation and aggregation building blocks; `--all-features` includes their tests. They are not a network protocol or a security boundary.
+The library separates the test plan, local execution and report from the CLI. The optional `distributed-offline` feature provides experimental Grunt execution and aggregation. The optional `distributed-transport` feature adds an experimental mutual TLS protocol for loopback connections. The CLI opens no distributed listener. `--all-features` includes the loopback protocol tests. See [Distributed mode](docs/distributed.md) for the protocol and its scope.
 
 ### Local performance benchmark
 

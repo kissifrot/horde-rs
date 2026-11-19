@@ -1,9 +1,11 @@
-//! Offline building blocks for a future distributed mode. No networking is provided.
+//! Building blocks for distributed runs. The experimental transport is loopback only.
 #![forbid(unsafe_code)]
 
 mod histogram;
 mod policy;
 mod result;
+#[cfg(feature = "distributed-transport")]
+pub mod transport;
 pub use histogram::{
     DecodeLimits, DistributedHistogram, MAX_ENVELOPE_BYTES, decode_histogram, encode_histogram,
 };
@@ -70,7 +72,7 @@ pub fn preflight(
 /// Execute one agent locally. This API opens no listener or distributed transport.
 /// Call `Cancellation::cancel` to request a run-level cancellation.
 pub async fn run_local(
-    mut plan: crate::TestPlan,
+    plan: crate::TestPlan,
     budget: Budget,
     limits: AgentLimits,
     policy: &GruntPolicy,
@@ -78,6 +80,16 @@ pub async fn run_local(
 ) -> Result<LocalOutcome, Box<dyn std::error::Error + Send + Sync>> {
     preflight(budget, limits, plan.timeout)?;
     let _reservation = policy.reserve(&plan, budget, limits)?;
+    run_reserved(plan, budget, limits, policy, cancel).await
+}
+
+async fn run_reserved(
+    mut plan: crate::TestPlan,
+    budget: Budget,
+    limits: AgentLimits,
+    policy: &GruntPolicy,
+    cancel: Cancellation,
+) -> Result<LocalOutcome, Box<dyn std::error::Error + Send + Sync>> {
     plan.requests = match budget.requests {
         Some(n) => usize::try_from(n)?,
         None => usize::MAX,

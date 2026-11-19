@@ -2,7 +2,7 @@
 
 # Distributed mode: proposed design
 
-This document describes a future mode. Horde does not currently open an agent listener or execute remote tests.
+This document describes the planned distributed mode and the current offline and loopback implementations. The CLI does not open an agent listener or execute remote tests.
 
 ## Roles and trust
 
@@ -16,6 +16,22 @@ Agents are security boundaries, not trusted relays. A controller credential auth
 - Configure certificates, trust roots, identities and agent policy locally, outside the remote protocol. Document rotation and revocation before deployment. Never offer a plaintext or unauthenticated fallback.
 - Bind the listener only when agent mode is explicitly started, to a locally configured address and port. Set connection, handshake and idle timeouts, and bound concurrent sessions and message sizes.
 - Version the protocol and validate every field before allocating resources or starting work. Do not log credentials, request bodies or authorization headers.
+
+### Experimental loopback protocol
+
+The `distributed-transport` feature handles TCP streams accepted by the library caller. It checks that both endpoints are loopback addresses and requires TLS with ALPN `horde-grunt/1`. The Grunt validates the client certificate chain and authorizes the exact client leaf certificate against its local list. The controller must validate the Grunt certificate and expected server name. Each listed controller may submit any of the locally configured profiles. Test certificates are only for loopback fixtures.
+
+Each message is a JSON object preceded by a four-byte unsigned length in network byte order. Frames must contain between 1 and 4,096 bytes. After authentication the Grunt sends a `hello` with `version` and a random 16-byte `epoch`. Requests carry `version`, `epoch`, a nonzero 16-byte `run_id` chosen by the controller, and an `operation` object. IDs are JSON arrays of bytes.
+
+| Operation type | Extra field | Behavior |
+| --- | --- | --- |
+| `submit` | `profile` | Starts a locally configured plan and budget. The same run ID and profile return existing state. A different profile for that ID returns a conflict. |
+| `inspect` | | Returns the current state. For an active run it attaches the current session. |
+| `cancel` | | Requests cancellation. Repeats return the current state and never restart work. |
+
+Replies are `state` with a `status`, or `error` with a `code`. Run IDs are scoped to the authenticated controller certificate. A reconnect with the same certificate can reattach before the configured grace expires. Once it expires, the Grunt cancels the run and keeps its terminal state. The run's own deadline still applies. A restarted endpoint rejects requests bearing the old epoch. Controllers must preserve the original epoch for retries. Terminal records remain for that epoch. When the bounded record table is full, new runs are refused while existing records remain available. Session count, TLS handshake and frame operations also have local limits.
+
+This slice exposes state only. Result and histogram transfer, listener and process management, certificate rotation and remote deployment remain separate work.
 
 ## Target and resource policy
 
