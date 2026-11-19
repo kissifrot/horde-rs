@@ -286,6 +286,10 @@ async fn run_impl(
         builder = builder
             .no_proxy()
             .dns_resolver(Arc::new(options.policy.clone()));
+        if plan.url.scheme() == "http" && !plan.follow_redirects {
+            // This workload cannot use TLS, so it needs no system CA store.
+            builder = builder.tls_certs_only([]);
+        }
     }
     let client = builder.build()?;
     let next = Arc::new(AtomicUsize::new(0));
