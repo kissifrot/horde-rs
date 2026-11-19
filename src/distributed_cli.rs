@@ -4,7 +4,7 @@ use horde_rs::{
     distributed::{
         AgentLimits, Budget, GruntPolicy, MAX_ENVELOPE_BYTES, ResourceLimits, ThresholdResult,
         controller::{Controller, Grunt},
-        transport::{Endpoint, EndpointLimits, Profile},
+        transport::{Endpoint, EndpointLimits, ListenerPolicy, MAX_RETAINED_RESULT_BYTES, Profile},
     },
 };
 use std::{
@@ -28,7 +28,7 @@ const MAX_RATE: u64 = 1_000;
 pub(crate) enum Command {
     /// Serve a fixed loopback HTTP GET profile over mutual TLS.
     Grunt(GruntArgs),
-    /// Split a request budget across loopback Grunts and print merged JSON results.
+    /// Split a request budget across Grunts and print merged JSON results.
     Controller(ControllerArgs),
 }
 
@@ -47,9 +47,12 @@ struct Identity {
 
 #[derive(Args)]
 pub(crate) struct GruntArgs {
-    /// Loopback address to listen on. Port zero selects an available port.
+    /// Specific loopback or private address to listen on. Port zero selects an available port.
     #[arg(long)]
     listen: SocketAddr,
+    /// Exact private IP of an allowed controller. Repeat to authorize multiple IPs.
+    #[arg(long)]
+    allow_controller_ip: Vec<IpAddr>,
     /// Locally selected HTTP(S) target with a literal loopback IP.
     #[arg(long)]
     target: reqwest::Url,
@@ -62,12 +65,15 @@ pub(crate) struct GruntArgs {
 
 #[derive(Args)]
 pub(crate) struct ControllerArgs {
-    /// Grunt loopback address. Repeat for each Grunt in allocation order.
-    #[arg(long, required = true)]
-    grunt: Vec<SocketAddr>,
-    /// Certificate name expected on each Grunt.
-    #[arg(long, default_value = "localhost")]
-    server_name: String,
+    /// Grunt socket address, optionally followed by =TLS_IDENTITY. Repeat in allocation order.
+    #[arg(long, required = true, value_name = "ADDRESS[=TLS_IDENTITY]", value_parser = parse_grunt)]
+    grunt: Vec<GruntSpec>,
+    /// Connect to explicitly listed private Grunt addresses instead of loopback.
+    #[arg(long)]
+    private_network: bool,
+    /// Default TLS identity for entries that omit one. Defaults to localhost on loopback and the Grunt IP in private mode.
+    #[arg(long)]
+    server_name: Option<String>,
     /// Total requests across all Grunts.
     #[arg(short = 'n', long)]
     requests: u64,
@@ -88,6 +94,46 @@ pub(crate) struct ControllerArgs {
     max_p95_ms: Option<f64>,
     #[command(flatten)]
     identity: Identity,
+}
+
+#[derive(Clone)]
+struct GruntSpec {
+    address: SocketAddr,
+    identity: Option<ServerName<'static>>,
+}
+
+fn parse_grunt(value: &str) -> Result<GruntSpec, String> {
+    let (address, identity) = value
+        .split_once('=')
+        .map_or((value, None), |(address, name)| (address, Some(name)));
+    Ok(GruntSpec {
+        address: address
+            .parse()
+            .map_err(|_| "expected a socket address (IP:port)".to_owned())?,
+        identity: identity
+            .map(|name| ServerName::try_from(name).map(|identity| identity.to_owned()))
+            .transpose()
+            .map_err(|_| "expected a DNS name or IP as the Grunt TLS identity".to_owned())?,
+    })
+}
+
+impl GruntSpec {
+    fn resolve(self, default: Option<&ServerName<'static>>, private: bool) -> Grunt {
+        let server_name = self
+            .identity
+            .or_else(|| default.cloned())
+            .unwrap_or_else(|| {
+                if private {
+                    ServerName::from(self.address.ip().to_canonical())
+                } else {
+                    ServerName::try_from("localhost").expect("localhost is a valid DNS name")
+                }
+            });
+        Grunt {
+            address: self.address,
+            server_name,
+        }
+    }
 }
 
 impl Identity {
@@ -119,9 +165,7 @@ async fn serve(
     args: GruntArgs,
     mut signals: tokio::sync::watch::Receiver<Option<crate::signals::Interrupt>>,
 ) -> Result<ExitCode, BoxError> {
-    if !args.listen.ip().to_canonical().is_loopback() {
-        return Err("Grunt listener requires a loopback address".into());
-    }
+    let listener_policy = ListenerPolicy::for_listener(args.listen, args.allow_controller_ip)?;
     let target_ip = args
         .target
         .host_str()
@@ -173,7 +217,7 @@ async fn serve(
         max_rate_per_second: MAX_RATE,
         max_duration: Duration::from_secs(60),
     };
-    let endpoint = Endpoint::new(
+    let endpoint = Endpoint::with_listener_policy(
         vec![certificate(&args.identity.cert)?],
         args.identity.key()?,
         args.identity.roots()?,
@@ -194,10 +238,12 @@ async fn serve(
         EndpointLimits {
             max_sessions: 16,
             max_records: 64,
+            max_retained_result_bytes: MAX_RETAINED_RESULT_BYTES,
             handshake_timeout: Duration::from_secs(2),
             frame_timeout: Duration::from_secs(3),
             reconnect_grace: Duration::from_secs(2),
         },
+        listener_policy,
     )?;
     let listener = TcpListener::bind(args.listen).await?;
     println!("{}", listener.local_addr()?);
@@ -227,14 +273,11 @@ async fn coordinate(
     cancel: Cancellation,
     signals: tokio::sync::watch::Receiver<Option<crate::signals::Interrupt>>,
 ) -> Result<ExitCode, BoxError> {
-    let name = ServerName::try_from(args.server_name)?;
+    let default = args.server_name.map(ServerName::try_from).transpose()?;
     let grunts = args
         .grunt
         .into_iter()
-        .map(|address| Grunt {
-            address,
-            server_name: name.clone(),
-        })
+        .map(|spec| spec.resolve(default.as_ref(), args.private_network))
         .collect::<Vec<_>>();
     let budget = Budget {
         requests: Some(args.requests),
@@ -256,6 +299,11 @@ async fn coordinate(
         vec![certificate(&args.identity.cert)?],
         args.identity.key()?,
     )?;
+    let controller = if args.private_network {
+        controller.with_private_network()
+    } else {
+        controller
+    };
     let report = controller
         .run(
             &grunts,
@@ -315,4 +363,24 @@ async fn coordinate(
             || matches!(thresholds.failure_rate, ThresholdResult::Failed)
             || matches!(thresholds.p95, ThresholdResult::Failed),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_grunts_default_to_ip_and_explicit_names_override_the_fallback() {
+        for (address, ip) in [("10.0.0.2:7071", "10.0.0.2"), ("[fd12::2]:7071", "fd12::2")] {
+            let grunt = parse_grunt(address).unwrap().resolve(None, true);
+            assert!(matches!(grunt.server_name, ServerName::IpAddress(_)));
+            assert_eq!(grunt.server_name.to_str(), ip);
+        }
+        let fallback = ServerName::try_from("fallback.test").unwrap();
+        let grunt = parse_grunt("10.0.0.2:7071=grunt-a.test")
+            .unwrap()
+            .resolve(Some(&fallback), true);
+        assert_eq!(grunt.server_name.to_str(), "grunt-a.test");
+        assert!(parse_grunt("10.0.0.2:7071=").is_err());
+    }
 }

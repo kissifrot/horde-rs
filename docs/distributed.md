@@ -2,7 +2,7 @@
 
 # Distributed mode: proposed design
 
-This document describes the planned distributed mode and the current offline and loopback implementations. The explicit Grunt CLI command listens on loopback and executes a locally configured loopback workload.
+This document describes the planned distributed mode and the current offline and control transport implementations. The Grunt CLI listens on loopback by default and can opt into an explicitly configured private address. It executes a locally configured loopback workload.
 
 ## Roles and trust
 
@@ -17,9 +17,9 @@ Agents are security boundaries, not trusted relays. A controller credential auth
 - Bind the listener only when agent mode is explicitly started, to a locally configured address and port. Set connection, handshake and idle timeouts, and bound concurrent sessions and message sizes.
 - Version the protocol and validate every field before allocating resources or starting work. Do not log credentials, request bodies or authorization headers.
 
-### Experimental loopback protocol
+### Experimental control protocol
 
-The `distributed-transport` feature handles TCP streams accepted by the library caller. It checks that both endpoints are loopback addresses and requires TLS with ALPN `horde-grunt/1`. The Grunt validates the client certificate chain and authorizes the exact client leaf certificate against its local list. The controller must validate the Grunt certificate and expected server name. Each listed controller may submit any of the locally configured profiles. Test certificates are only for loopback fixtures.
+The `distributed-transport` feature handles TCP streams accepted by the library caller. It checks the configured listener address and controller source IP before TLS with ALPN `horde-grunt/1`. The Grunt validates the client certificate chain and authorizes the exact client leaf certificate against its local list. The controller must validate the Grunt certificate and expected server name. Each listed controller may submit any of the locally configured profiles. Test certificates are only for loopback fixtures.
 
 Each message is a JSON object preceded by a four-byte unsigned length in network byte order. Frames must contain between 1 and 4,096 bytes. After authentication the Grunt sends a `hello` with `version` and a random 16-byte `epoch`. Requests carry `version`, `epoch`, a nonzero 16-byte `run_id` chosen by the controller, and an `operation` object. IDs are JSON arrays of bytes.
 
@@ -45,9 +45,51 @@ The controller opens one authenticated session per assigned Grunt and submits
 each share once. It does not reassign missing shares or resubmit after ambiguous
 I/O. On interruption it sends cancellation concurrently on its active sessions
 and waits within a bounded grace for terminal states. Only validated complete
-results are merged, and partial results cannot pass thresholds. The CLI accepts
-only loopback Grunt addresses and fixed literal loopback workload targets.
-Certificate rotation and remote deployment remain separate work.
+results are merged, and partial results cannot pass thresholds. HTTP workload
+targets must be literal loopback addresses, and the transport rejects profiles
+that follow redirects. Certificate rotation and multi-machine validation
+remain separate work.
+
+Control transport defaults to loopback. The Grunt can be configured with an
+exact RFC 1918 or IPv6 ULA listen address and a nonempty list of exact private
+source addresses. Using another interface address, a wildcard bind, or an
+unlisted source fails the address check. An IP match still requires successful
+mutual TLS and an authorized controller leaf. The controller opts in with
+`--private-network` and must name each private Grunt address explicitly.
+The source IP checked is the address seen by the Grunt. This mode has been tested
+on a private interface on one machine. Tests across hosts remain open.
+
+The controller configures each Grunt with `--grunt ADDRESS=TLS_IDENTITY`.
+The address is a literal socket address, and the identity is an expected
+DNS or IP SAN. For private peers the address's IP is the default. A
+Grunt with a stable private IP can use an IP SAN and needs no hostname.
+A separate DNS identity also works when mapped explicitly to an IP
+address. It need not resolve in DNS. Private Grunts must have distinct
+expected identities. Provision leaves with separate identities and keys
+so a certificate for one machine cannot match another machine's identity.
+
+#### Certificate provisioning for a fleet
+
+Before a large rollout, make the machine inventory the source for control
+addresses, expected TLS identities and controller allowlists. Provide a
+preflight that checks the certificate chain, expected SAN and validity
+before a run. Automate enrollment and renewal through an existing
+internal CA. Generate private keys on the endpoint, issue one leaf
+per Grunt and distribute trust roots separately. A stable IP can be the
+identity when DNS is unavailable. If the address changes often, use an
+inventory identity in a DNS SAN and update the socket address separately.
+
+Plan for overlapping trust roots and controller leaf allowlists during
+rotation, plus a way to remove a compromised credential. The current
+Grunt matches exact controller leaves, so replacing a controller
+certificate also requires updating those allowlists. An inventory and
+renewal workflow would remove the need to manage hundreds of CLI flags
+and certificates by hand. Enrolling a fleet and running all its Grunts
+in one test are separate issues. The current controller accepts at most
+32 Grunts per run.
+
+See the [two-Grunt pilot procedure](distributed-pilot.md) for the first
+private-network run and its acceptance criteria.
 
 ## Target and resource policy
 
@@ -78,7 +120,7 @@ Do not average percentiles. For bounded-memory mode, merge compatible histogram 
 3. Add the authenticated transport and explicit agent lifecycle. Test invalid and unauthorized identities, certificate expiry, disconnects, cancellation and resource exhaustion.
 4. Add controller scheduling, partial-result handling and functional tests with multiple local agents. Benchmark controller and agent overhead before claiming scalability.
 
-Do not enable a network listener until these controls and tests are implemented together.
+Keep private control listeners opt-in. Complete the remaining identity, failure and resource tests before deploying across hosts.
 
 ## Offline contract proposal — review draft
 

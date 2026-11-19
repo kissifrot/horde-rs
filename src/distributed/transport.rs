@@ -1,4 +1,5 @@
-//! Experimental loopback protocol. Callers supply already accepted TCP streams.
+//! Experimental control protocol. Callers supply already accepted TCP streams.
+pub use super::control_network::ListenerPolicy;
 use super::{
     AgentLimits, Budget, Cancellation, CompletedResult, GruntPolicy, LocalOutcome, StopReason,
     encode_histogram, preflight, run_reserved,
@@ -29,7 +30,7 @@ use tokio_rustls::{
 pub const VERSION: u16 = 1;
 const MAX_FRAME: usize = 4096;
 pub(super) const MAX_RESULT_METADATA: usize = 32 * 1024;
-const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_RETAINED_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROFILE_NAME: usize = 64;
 pub const ALPN: &[u8] = b"horde-grunt/1";
 
@@ -101,12 +102,15 @@ pub struct EndpointLimits {
     pub max_sessions: usize,
     /// Records include terminal runs, retained for the lifetime of the epoch.
     pub max_records: usize,
+    /// Retained metadata allowance plus encoded histograms, shared across runs.
+    pub max_retained_result_bytes: usize,
     pub handshake_timeout: Duration,
     pub frame_timeout: Duration,
     pub reconnect_grace: Duration,
 }
 
 pub struct Endpoint {
+    listener_policy: ListenerPolicy,
     tls: TlsAcceptor,
     controllers: Vec<CertificateDer<'static>>,
     profiles: BTreeMap<String, Profile>,
@@ -196,6 +200,27 @@ impl Endpoint {
         profiles: BTreeMap<String, Profile>,
         config: EndpointLimits,
     ) -> Result<Arc<Self>, BoxError> {
+        Self::with_listener_policy(
+            server_chain,
+            server_key,
+            controller_roots,
+            controllers,
+            profiles,
+            config,
+            ListenerPolicy::default(),
+        )
+    }
+
+    /// Configure the allowed ingress interface and peer addresses in addition to mutual TLS.
+    pub fn with_listener_policy(
+        server_chain: Vec<CertificateDer<'static>>,
+        server_key: PrivateKeyDer<'static>,
+        controller_roots: RootCertStore,
+        controllers: Vec<CertificateDer<'static>>,
+        profiles: BTreeMap<String, Profile>,
+        config: EndpointLimits,
+        listener_policy: ListenerPolicy,
+    ) -> Result<Arc<Self>, BoxError> {
         if controllers.is_empty()
             || profiles.is_empty()
             || profiles.iter().any(|(name, profile)| {
@@ -214,6 +239,7 @@ impl Endpoint {
             })
             || !(1..=Semaphore::MAX_PERMITS).contains(&config.max_sessions)
             || config.max_records == 0
+            || !(1..=MAX_RETAINED_RESULT_BYTES).contains(&config.max_retained_result_bytes)
             || [
                 config.handshake_timeout,
                 config.frame_timeout,
@@ -239,6 +265,7 @@ impl Endpoint {
         let mut epoch = [0; 16];
         getrandom::fill(&mut epoch).map_err(|_| "could not generate Grunt epoch")?;
         Ok(Arc::new(Self {
+            listener_policy,
             tls: TlsAcceptor::from(Arc::new(tls)),
             controllers,
             profiles,
@@ -270,12 +297,13 @@ impl Endpoint {
         }
     }
 
-    /// Handle one accepted loopback stream. The caller owns the TCP listener and accept loop.
+    /// Handle one accepted stream. The caller owns the TCP listener and accept loop.
     pub async fn serve_connection(self: &Arc<Self>, stream: TcpStream) -> Result<(), BoxError> {
-        if !stream.local_addr()?.ip().to_canonical().is_loopback()
-            || !stream.peer_addr()?.ip().to_canonical().is_loopback()
+        if !self
+            .listener_policy
+            .admits(stream.local_addr()?, stream.peer_addr()?)
         {
-            return Err("Grunt transport requires loopback".into());
+            return Err("Grunt control connection denied by address policy".into());
         }
         stream.set_nodelay(true)?;
         let _permit = self
@@ -480,7 +508,7 @@ impl Endpoint {
             if let Some(stored) = &result {
                 // Charge a fixed metadata allowance and the exact encoded byte count.
                 let charge = MAX_RESULT_METADATA + stored.histogram.len();
-                if charge > MAX_RETAINED_BYTES - state.retained_bytes {
+                if charge > endpoint.config.max_retained_result_bytes - state.retained_bytes {
                     result = None;
                     status = RunStatus::Failed;
                 } else {

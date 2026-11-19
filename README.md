@@ -190,7 +190,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-The library separates the test plan, local execution and report from the CLI. The optional `distributed-offline` feature provides experimental Grunt execution and aggregation. The optional `distributed-transport` feature adds an experimental mutual TLS protocol for loopback connections. With that feature, the explicit `grunt` and `controller` commands support loopback testing. `--all-features` includes the loopback protocol tests. See [Distributed mode](docs/distributed.md) for the protocol and its scope.
+The library separates the test plan, local execution and report from the CLI. The optional `distributed-offline` feature provides experimental Grunt execution and aggregation. The optional `distributed-transport` feature adds an experimental mutual TLS protocol for loopback or explicitly authorized private control connections. The `grunt` command still runs its HTTP workload on loopback. `--all-features` includes the loopback protocol tests. See [Distributed mode](docs/distributed.md) for the protocol and its scope.
 
 ### Local performance benchmark
 
@@ -211,7 +211,7 @@ CI comparisons are informational and have no regression threshold. Shared runner
 
 GPL-3.0-only; see [LICENSE](LICENSE).
 
-### Distributed testing on loopback
+### Distributed testing with local HTTP targets
 
 Build with `cargo build --features distributed-transport`. Start each Grunt with a
 fixed local HTTP(S) target and its own certificate and key. The Grunt prints the
@@ -228,8 +228,27 @@ horde controller --grunt 127.0.0.1:7071 --grunt 127.0.0.1:7072 \
 Start the second Grunt on port 7072 before running the controller. Certificates
 are DER, keys are PKCS#8 DER, and each Grunt's certificate must match the server
 name supplied by the controller. The Grunt authorizes the specified controller
-certificate. Both the Grunt addresses and the fixed target IPs must be loopback.
-The CLI's Grunt profile sends GET requests with redirects disabled.
+certificate. Control connections use loopback by default. The fixed HTTP
+target must have a literal loopback IP. The Grunt profile sends GET requests
+with redirects disabled.
+
+To opt into private control connections, set `grunt --listen` to the exact
+private address of the Grunt and repeat `--allow-controller-ip` for each allowed
+controller source IP. Start the controller with `--private-network` and the
+explicit private Grunt addresses in `--grunt`. IPv4 RFC 1918 addresses and IPv6
+ULA addresses are accepted. A wildcard bind or an empty private peer list is
+rejected. The IP check applies before TLS, and each peer still needs an
+authorized controller certificate. Use certificates issued for the pilot
+machines. Set the expected TLS identity per Grunt with
+`--grunt 10.0.0.21:7071=grunt-a.example.test`. The controller connects to the
+socket address and checks the certificate's DNS SAN against the identity.
+DNS resolution is unnecessary for that identity. In private mode, omitting
+the suffix defaults to the socket's IP. The certificate must then contain
+that address in an IP SAN, including for IPv6. An IP string in a DNS SAN is
+insufficient. A bare loopback address defaults to `localhost`.
+`--server-name` sets a fallback for entries without an explicit identity.
+Private entries must resolve to distinct expected identities. Issue each
+Grunt a leaf certificate for its own identity.
 
 The controller emits JSON with per-Grunt states, merged metrics and percentiles.
 It returns a nonzero exit code for partial runs or failed configured thresholds.

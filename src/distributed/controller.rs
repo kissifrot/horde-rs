@@ -40,6 +40,7 @@ pub struct ControllerReport {
 
 pub struct Controller {
     tls: TlsConnector,
+    private_network: bool,
 }
 
 impl Controller {
@@ -57,7 +58,14 @@ impl Controller {
         tls.alpn_protocols = vec![ALPN.to_vec()];
         Ok(Self {
             tls: TlsConnector::from(Arc::new(tls)),
+            private_network: false,
         })
+    }
+
+    /// Opt into explicitly configured private Grunt addresses in place of loopback.
+    pub fn with_private_network(mut self) -> Self {
+        self.private_network = true;
+        self
     }
 
     /// Submit each share once, with no resubmission following ambiguous I/O.
@@ -70,9 +78,15 @@ impl Controller {
         cancel: Cancellation,
     ) -> Result<ControllerReport, BoxError> {
         if grunts.len() > 32
-            || grunts
-                .iter()
-                .any(|g| !g.address.ip().to_canonical().is_loopback())
+            || grunts.iter().any(|g| {
+                let ip = g.address.ip().to_canonical();
+                g.address.port() == 0
+                    || if self.private_network {
+                        !super::control_network::is_private_control_ip(ip)
+                    } else {
+                        !ip.is_loopback()
+                    }
+            })
             || grunts
                 .iter()
                 .map(|g| (g.address.ip().to_canonical(), g.address.port()))
@@ -84,7 +98,22 @@ impl Controller {
             || profile.is_empty()
             || profile.len() > 64
         {
-            return Err("invalid local controller configuration".into());
+            return Err("invalid controller configuration or Grunt address".into());
+        }
+        if self.private_network
+            && grunts
+                .iter()
+                .map(|g| {
+                    g.server_name
+                        .to_str()
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase()
+                })
+                .collect::<BTreeSet<_>>()
+                .len()
+                != grunts.len()
+        {
+            return Err("private Grunts require distinct TLS identities".into());
         }
         let shares = split_budget(budget, grunts.len())?;
         let mut run_id = [0; 16];

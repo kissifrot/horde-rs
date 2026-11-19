@@ -1,6 +1,8 @@
-//! Building blocks for distributed runs. The experimental transport is loopback only.
+//! Building blocks for distributed runs with experimental private control transport.
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "distributed-transport")]
+mod control_network;
 mod histogram;
 mod policy;
 mod result;

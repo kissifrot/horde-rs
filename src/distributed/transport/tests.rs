@@ -101,6 +101,7 @@ fn endpoint(target: SocketAddr, grace: Duration) -> Arc<Endpoint> {
         EndpointLimits {
             max_sessions: 2,
             max_records: 1,
+            max_retained_result_bytes: MAX_RETAINED_RESULT_BYTES,
             handshake_timeout: WAIT,
             frame_timeout: WAIT,
             reconnect_grace: grace,
@@ -219,9 +220,18 @@ fn submit() -> Operation {
 }
 
 async fn wait_for_status(stream: &mut TlsStream<TcpStream>, epoch: Id, expected: RunStatus) {
+    wait_for_run_status(stream, epoch, ID, expected).await;
+}
+
+async fn wait_for_run_status(
+    stream: &mut TlsStream<TcpStream>,
+    epoch: Id,
+    run: Id,
+    expected: RunStatus,
+) {
     timeout(WAIT, async {
         loop {
-            let reply = request(stream, epoch, ID, Operation::Inspect).await;
+            let reply = request(stream, epoch, run, Operation::Inspect).await;
             if reply == (Reply::State { status: expected }) {
                 break;
             }
@@ -483,4 +493,135 @@ async fn stale_epoch_and_oversized_frames_do_not_start_work() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn saturated_session_limit_rejects_and_releases_connections() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = endpoint(target.local_addr().unwrap(), Duration::from_secs(1));
+    let (first, _, first_task) = ready(&endpoint, controller()).await;
+    let (second, _, second_task) = ready(&endpoint, controller()).await;
+
+    let (third, third_task) = open(&endpoint, controller(), "localhost").await;
+    assert!(
+        third.is_err(),
+        "a saturated endpoint must reject before TLS"
+    );
+    let error = timeout(WAIT, third_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Grunt session capacity reached");
+
+    close(first, first_task).await;
+    let (replacement, _, replacement_task) = ready(&endpoint, controller()).await;
+    close(replacement, replacement_task).await;
+    close(second, second_task).await;
+}
+
+#[tokio::test]
+async fn handshake_and_incomplete_frame_timeouts_free_the_session() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut endpoint = endpoint(target.local_addr().unwrap(), Duration::from_secs(1));
+    let config = &mut Arc::get_mut(&mut endpoint).unwrap().config;
+    config.handshake_timeout = Duration::from_millis(500);
+    config.frame_timeout = Duration::from_millis(500);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalled = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (stream, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+    let error = timeout(WAIT, endpoint.serve_connection(stream))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is::<tokio::time::error::Elapsed>());
+    assert_eq!(endpoint.sessions.available_permits(), 2);
+    drop(stalled);
+
+    let (mut stalled, _, stalled_task) = ready(&endpoint, controller()).await;
+    stalled.write_u32(10).await.unwrap();
+    stalled.write_all(b"{").await.unwrap();
+    stalled.flush().await.unwrap();
+    let error = timeout(WAIT, stalled_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is::<tokio::time::error::Elapsed>());
+    assert_eq!(endpoint.sessions.available_permits(), 2);
+    drop(stalled);
+
+    let (replacement, _, replacement_task) = ready(&endpoint, controller()).await;
+    close(replacement, replacement_task).await;
+    assert!(
+        timeout(Duration::from_millis(50), target.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn retained_result_limit_preserves_the_first_result_and_rejects_the_next() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut endpoint = endpoint(target.local_addr().unwrap(), Duration::from_secs(1));
+    let config = &mut Arc::get_mut(&mut endpoint).unwrap().config;
+    config.max_records = 3;
+    config.max_retained_result_bytes = MAX_RESULT_METADATA + 1024;
+
+    let (mut stream, epoch, task) = ready(&endpoint, controller()).await;
+    for (run, expected_status) in [(ID, RunStatus::Complete), ([2; 16], RunStatus::Failed)] {
+        assert_eq!(
+            request(&mut stream, epoch, run, submit()).await,
+            Reply::State {
+                status: RunStatus::Running
+            }
+        );
+        let mut workload = target_request(&target).await;
+        workload
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        wait_for_run_status(&mut stream, epoch, run, expected_status).await;
+    }
+    assert_eq!(
+        request(&mut stream, epoch, [2; 16], Operation::Collect).await,
+        Reply::State {
+            status: RunStatus::Failed
+        }
+    );
+    let Reply::Result { histogram_bytes } =
+        request(&mut stream, epoch, ID, Operation::Collect).await
+    else {
+        panic!("the first result must remain retrievable");
+    };
+    assert!(histogram_bytes <= 1024);
+    timeout(WAIT, async {
+        let metadata: CompletedResult = read_frame_limited(&mut stream, MAX_RESULT_METADATA)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut histogram = vec![0; histogram_bytes];
+        stream.read_exact(&mut histogram).await.unwrap();
+        assert_eq!(metadata.metrics.completed, 1);
+        assert_eq!(
+            super::super::decode_histogram(
+                &histogram,
+                1,
+                super::super::DecodeLimits {
+                    max_envelope_bytes: 1024,
+                    max_samples: 1,
+                    assigned_requests: Some(1),
+                }
+            )
+            .unwrap()
+            .count(),
+            1
+        );
+    })
+    .await
+    .unwrap();
+    close(stream, task).await;
 }
