@@ -211,6 +211,44 @@ CI comparisons are informational and have no regression threshold. Shared runner
 
 GPL-3.0-only; see [LICENSE](LICENSE).
 
+### Linux prereleases
+
+The [Linux packages workflow](.github/workflows/linux-packages.yml) builds
+Horde on Debian 13 with static musl for AMD64 and ARM64. It checks package
+installation and the distributed CLI on Debian 13 and Ubuntu 24.04
+on both architectures. Each build includes `grunt`, `preflight` and
+`controller`. Installation places `horde` in `/usr/bin` and starts no service.
+
+Get the package or standalone executable for your architecture from
+[GitHub Releases](https://github.com/kissifrot/horde-rs/releases). Use
+`dpkg --print-architecture` to check whether to select `amd64` or `arm64`.
+Download `SHA256SUMS` alongside the asset and verify it before installing.
+For example, for AMD64 and the `v0.1.0-rc.1` tag:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+sudo apt install './horde-rs_0.1.0~rc.1_amd64.deb'
+horde --version
+```
+
+The standalone file contains the same executable as the package.
+It can be run directly with `chmod +x horde-linux-amd64` followed by
+`./horde-linux-amd64 --version`.
+
+To prepare a prerelease, create and push a `vX.Y.Z-rc.N` tag on the
+commit to ship. Its base version must match `Cargo.toml`. For example:
+
+```sh
+git tag -a v0.1.0-rc.1 -m "Horde 0.1.0 release candidate 1"
+git push origin v0.1.0-rc.1
+```
+
+After the install checks, GitHub Actions publishes the two packages,
+two standalone binaries and `SHA256SUMS` as a prerelease. The workflow
+also supports manual runs and keeps snapshot outputs as workflow
+artifacts. The build pins the Rust container and musl toolchain versions,
+uses `Cargo.lock` and sets package timestamps from the commit.
+
 ### Distributed testing with local HTTP targets
 
 See the [illustrated overview](docs/distributed.md#how-distributed-mode-works)

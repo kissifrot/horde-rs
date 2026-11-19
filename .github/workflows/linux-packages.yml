@@ -1,0 +1,134 @@
+name: Linux packages
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*-rc.*']
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'LICENSE'
+      - 'scripts/package-linux.py'
+      - '.github/workflows/linux-packages.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'LICENSE'
+      - 'scripts/package-linux.py'
+      - '.github/workflows/linux-packages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    container: rust:trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install native musl toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+          MUSL_VERSION: '1.2.5-3.1~deb13u1'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            "musl=$MUSL_VERSION" "musl-dev=$MUSL_VERSION" "musl-tools=$MUSL_VERSION"
+          rustup target add "$TARGET"
+      - name: Build and package Horde
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+          CC: musl-gcc
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export RUSTFLAGS="-C linker=musl-gcc -C target-feature=+crt-static -C strip=symbols --remap-path-prefix=$GITHUB_WORKSPACE=/horde --remap-path-prefix=$CARGO_HOME=/cargo"
+          cargo build --release --locked --features distributed-transport --target "$TARGET"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            revision=(--tag "$GITHUB_REF_NAME")
+          else
+            revision=(--snapshot "${GITHUB_RUN_NUMBER}.${GITHUB_SHA:0:12}")
+          fi
+          python3 scripts/package-linux.py --binary "target/$TARGET/release/horde" \
+            --architecture "$ARCH" --output dist "${revision[@]}"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  install:
+    needs: build
+    strategy:
+      matrix:
+        image: ['debian:trixie-slim', 'ubuntu:24.04']
+        platform:
+          - {arch: amd64, runner: ubuntu-24.04}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.platform.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: linux-${{ matrix.platform.arch }}
+          path: dist
+      - name: Install package and verify the distributed CLI
+        env:
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          apt-get install -y "$PWD"/dist/*.deb
+          test "$(dpkg-query -W -f='${Architecture}' horde-rs)" = "$ARCH"
+          cmp /usr/bin/horde "dist/horde-linux-$ARCH"
+          horde --version
+          horde grunt --help
+          horde preflight --help
+          horde controller --help
+
+  publish:
+    needs: install
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: linux-prerelease-${{ github.ref }}
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: linux-*
+          merge-multiple: true
+          path: dist
+      - name: Publish the GitHub prerelease
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LC_ALL: C
+        run: |
+          shopt -s nullglob
+          packages=(*.deb)
+          test "${#packages[@]}" -eq 2
+          sha256sum -- "${packages[@]}" horde-linux-amd64 horde-linux-arm64 > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" "${packages[@]}" horde-linux-amd64 horde-linux-arm64 SHA256SUMS \
+            --verify-tag --prerelease --latest=false --generate-notes

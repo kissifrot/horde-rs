@@ -15,8 +15,12 @@ for the control channel, workload flow and partial reports.
 
 ## Before the run
 
-- Build the same revision on all three machines with
+- Use the same revision on all three machines. Install the
+  [Linux prerelease](../README.md#linux-prereleases) for each machine's
+  architecture or build locally with
   `cargo build --release --locked --features distributed-transport`.
+  When using a package or standalone executable, use that binary in the
+  commands below in place of `target/release/horde`.
 - Provision an internal CA trust root, one controller client certificate
   and distinct server certificates for the Grunts. Each process needs
   its own leaf certificate in DER, its own PKCS#8 DER private key and
