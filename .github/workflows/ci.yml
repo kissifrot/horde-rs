@@ -17,8 +17,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check benchmark server formatting
         run: rustfmt --edition 2024 --check benchmarks/server.rs
-      - name: Check pilot HTTP fixture formatting
-        run: rustfmt --edition 2024 --check scripts/pilot-http.rs
+      - name: Check pilot fixture formatting
+        run: rustfmt --edition 2024 --check scripts/pilot-http.rs scripts/pilot-relay.rs
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
@@ -38,7 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
       - name: Build distributed release binary
         run: cargo build --release --locked --features distributed-transport
-      - name: Run Docker pilot with preflight, rotation and Grunt restart
+      - name: Run Docker pilot with preflight, rotation, link failures and Grunt restart
         timeout-minutes: 5
         run: python3 scripts/pilot-docker.py --output "$RUNNER_TEMP/pilot-docker-report.json"
       - name: Upload pilot report

@@ -3,6 +3,7 @@
 
 import argparse
 from contextlib import ExitStack
+from datetime import datetime
 import ipaddress
 import json
 import os
@@ -44,11 +45,14 @@ def build_image(work, image, binary):
     rootfs = work / "rootfs"
     rootfs.mkdir()
     shutil.copy2(binary, rootfs / "horde")
-    run("rustc", "--edition=2024", "-O", ROOT / "scripts/pilot-http.rs",
-        "-o", rootfs / "pilot-http", timeout=60)
+    fixtures = ("pilot-http", "pilot-relay")
+    for fixture in fixtures:
+        run("rustc", "--edition=2024", "-O", ROOT / "scripts" / f"{fixture}.rs",
+            "-o", rootfs / fixture, timeout=60)
 
     # Use the host build's own glibc and loader. Nothing needs to be pulled.
-    for executable in (rootfs / "horde", rootfs / "pilot-http"):
+    for name in ("horde", *fixtures):
+        executable = rootfs / name
         libraries = run("ldd", executable, check=False)
         if "not a dynamic executable" in libraries.stderr or "statically linked" in libraries.stdout:
             continue
@@ -79,8 +83,8 @@ def allocate_peers(network):
             continue
         if any(subnet.subnet_of(private) for private in private_ranges):
             hosts = (str(ip) for ip in subnet.hosts() if str(ip) != pool.get("Gateway"))
-            return str(subnet), {role: next(hosts) for role in ("controller", *GRUNTS)}
-    raise RuntimeError("Docker must allocate a private IPv4 subnet with room for three endpoints.")
+            return str(subnet), {role: next(hosts) for role in ("controller", *GRUNTS, "relay")}
+    raise RuntimeError("Docker must allocate a private IPv4 subnet with room for four endpoints.")
 
 
 def tls_config(leaf, roots):
@@ -154,7 +158,12 @@ def pilot(binary):
         wrong_inventory = {"grunts": [inventory["grunts"][0], {
             "address": addresses["grunt-b"], "tls_identity": wrong_identity,
         }]}
-        for file, data in (("grunts.json", inventory), ("wrong-grunts.json", wrong_inventory)):
+        relay_address = f"{peers['relay']}:7071"
+        relay_inventory = {"grunts": [inventory["grunts"][0], {
+            **inventory["grunts"][1], "address": relay_address,
+        }]}
+        for file, data in (("grunts.json", inventory), ("wrong-grunts.json", wrong_inventory),
+                           ("relay-grunts.json", relay_inventory)):
             (work / "controller" / file).write_text(json.dumps(data))
         issue_certificates(work, addresses, inventory_file)
         containers = []
@@ -170,8 +179,18 @@ def pilot(binary):
                    "--mount", f"type=bind,source={work / role},destination=/identity,readonly",
                    "--entrypoint", entrypoint, image, *args)
 
-        def logs(name):
-            return docker("logs", f"{prefix}-{name}")
+        def logs(name, *options):
+            return docker("logs", *options, f"{prefix}-{name}")
+
+        def timestamps(name, message, stream="stdout"):
+            found = []
+            for line in getattr(logs(name, "--timestamps"), stream).splitlines():
+                timestamp, _, content = line.partition(" ")
+                if content == message:
+                    # Docker's RFC 3339 log timestamps have nanosecond precision.
+                    base, _, fraction = timestamp.removesuffix("Z").partition(".")
+                    found.append(datetime.fromisoformat(f"{base}.{fraction[:6]:0<6}+00:00"))
+            return found
 
         def requests(role):
             return logs(grunt_names[role]).stdout.splitlines().count("pilot-http: 200")
@@ -197,14 +216,14 @@ def pilot(binary):
             start(name, role, "/pilot-http", "grunt", *config)
             wait_for(lambda: addresses[role] in logs(name).stdout.splitlines(), f"{name} readiness")
 
-        def start_grunts(stage, leaves, roots, controllers, limits=None):
+        def start_grunts(stage, leaves, roots, controllers, limits=None, controller_ips=None):
             for name in grunt_names.values():
                 remove("rm", "-f", f"{prefix}-{name}")
             configs = {}
             for role, leaf in zip(GRUNTS, leaves):
                 configs[role] = config_args(role, f"{stage}.json", {
                     "listen": addresses[role],
-                    "allow_controller_ip": [peers["controller"]],
+                    "allow_controller_ip": [(controller_ips or {}).get(role, peers["controller"])],
                     "target": "http://127.0.0.1:18080/",
                     "controller_cert": [f"{controller}-controller.der" for controller in controllers],
                     "tls": tls_config(leaf, roots),
@@ -213,9 +232,9 @@ def pilot(binary):
                 launch_grunt(role, f"{stage}-{role}", configs[role])
             return configs
 
-        def start_controller(name, budget):
+        def start_controller(name, budget, inventory_file="grunts.json"):
             start(name, "controller", "/horde", "controller",
-                  *controller_config("new", ("new",), "grunts.json"),
+                  *controller_config("new", ("new",), inventory_file),
                   "--requests", str(budget), "--concurrency", "2", "--rate", "4",
                   "--deadline", "30", "--max-failure-rate", "0")
 
@@ -243,11 +262,12 @@ def pilot(binary):
                     "Preflight reached a workload target", connections)
             return {"report": report, "target_connections": connections}
 
-        def verify(report, completed, states, partial):
+        def verify(report, completed, states, partial, isolated_address=None):
             metrics = report["metrics"]
+            expected_agents = (addresses["grunt-a"], isolated_address or addresses["grunt-b"])
             require(report["partial"] is partial, "Unexpected partial status", report)
             require({agent["address"]: agent["status"] for agent in report["agents"]}
-                    == dict(zip(addresses.values(), states)), "Unexpected Grunt states", report)
+                    == dict(zip(expected_agents, states)), "Unexpected Grunt states", report)
             require(metrics["started"] == metrics["completed"] == completed and metrics["failed"] == 0
                     and metrics["response_bytes"] == 2 * completed
                     and metrics["status_codes"] == {"200": completed}, "Unexpected totals", metrics)
@@ -304,6 +324,41 @@ def pilot(binary):
             require(after_drop["grunt-a"] == 20 and 0 < after_drop["grunt-b"] < 20,
                     "Unexpected split after disconnect", after_drop)
             print(f"Link disconnect passed: {after_drop}", flush=True)
+
+            start_grunts("silent", ("new", "new"), ("new",), ("new",),
+                         controller_ips={"grunt-b": peers["relay"]})
+            start("silent-relay", "relay", "/pilot-relay", relay_address, addresses["grunt-b"])
+            wait_for(lambda: "pilot-relay: ready" in logs("silent-relay").stdout,
+                     "silent relay readiness")
+            start_controller("silent-failure", 40, "relay-grunts.json")
+            wait_for(lambda: requests("grunt-b") > 0, "Grunt B workload through relay", timeout=5)
+            (work / "relay" / "silent").touch()
+            timeout_message = f"Grunt {relay_address}: deadline has elapsed"
+            wait_for(lambda: timestamps("silent-failure", timeout_message, "stderr"),
+                     "controller I/O timeout on the silent connection", timeout=4)
+            [detected_at] = timestamps("silent-failure", timeout_message, "stderr")
+            [paused_at] = timestamps("silent-relay", "pilot-relay: traffic paused")
+            detection_seconds = (detected_at - paused_at).total_seconds()
+            require(0.5 <= detection_seconds <= 2.5,
+                    "Unexpected controller detection delay after relay paused", detection_seconds)
+            silent_report = collect("silent-failure", 1)
+            verify(silent_report, 20, ("complete", "missing"), partial=True,
+                   isolated_address=relay_address)
+            require(silent_report["thresholds"]["failure_rate"] == "not_evaluable",
+                    "Silent failure did not invalidate the threshold", silent_report["thresholds"])
+            starts = {role: timestamps(grunt_names[role], "pilot-http: connection") for role in GRUNTS}
+            counts_silent = {role: len(times) for role, times in starts.items()}
+            require(counts_silent["grunt-a"] == 20 and 0 < counts_silent["grunt-b"] < 20,
+                    "Unexpected workload shares after silence", counts_silent)
+            last_isolated_seconds = (starts["grunt-b"][-1] - paused_at).total_seconds()
+            quiet_seconds = (starts["grunt-a"][-1] - starts["grunt-b"][-1]).total_seconds()
+            require(3.0 <= last_isolated_seconds <= 6.5 and quiet_seconds >= 2.0,
+                    "Unexpected workload stop after silence", (last_isolated_seconds, quiet_seconds))
+            require(docker("inspect", "--format", "{{.State.Running}}", f"{prefix}-silent-relay")
+                    .stdout.strip() == "true", "Relay exited during silent failure", relay_address)
+            print(f"Silent failure passed: controller detected it in {detection_seconds:.2f}s; "
+                  f"last isolated request at {last_isolated_seconds:.2f}s; counts {counts_silent}.",
+                  flush=True)
 
             # Each retained result costs 32 KiB of metadata plus its histogram.
             # The two-record table on B admits one result and one failed record.
@@ -370,6 +425,13 @@ def pilot(binary):
             "certificate_rotation": rotation,
             "nominal": {"controller_report": nominal, "requests_per_target": counts},
             "link_disconnect": {"controller_report": fault, "requests_per_target": after_drop},
+            "silent_failure": {
+                "controller_report": silent_report,
+                "controller_detection_seconds": detection_seconds,
+                "last_isolated_request_seconds": last_isolated_seconds,
+                "quiet_while_healthy_seconds": quiet_seconds,
+                "target_connections": counts_silent,
+            },
             "maintenance": {
                 "saturation": saturation,
                 "before_restart": before_restart,

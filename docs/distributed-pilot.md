@@ -242,6 +242,19 @@ ports are published.
   its 20-request share, A completes its own 20 requests, and the
   controller reports B as missing with a partial result and an
   unevaluable failure threshold.
+- The silent failure run routes B's TLS control stream through a
+  test-only TCP relay on the internal network. After B's first workload
+  request, the relay pauses both directions while keeping both sockets
+  open. The controller must report an I/O timeout and mark B missing
+  while A completes exactly its 20-request share. The failure threshold
+  remains unevaluable. Docker log timestamps measure the controller
+  detection time and the last HTTP connection at B's fixture. The pilot
+  allows 0.5–2.5 seconds for controller detection and 3–6.5 seconds until
+  the last observed connection at B, with at least two more seconds
+  between B's last connection and A's last connection. These windows
+  allow for observation and scheduling around the one-second controller
+  timeout, three-second Grunt frame timeout and two-second reconnection
+  grace.
 - The maintenance run lowers both retention limits on Grunt B. It checks
   both saturation reasons and their HTTP effects, stops B with SIGTERM,
   and verifies that only B's epoch changes. A fresh two-request run then
