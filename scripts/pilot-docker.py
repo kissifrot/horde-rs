@@ -127,6 +127,13 @@ def pilot(binary):
         subnet, peers = allocate_peers(prefix)
         issue_certificates(work, peers)
         addresses = {role: f"{peers[role]}:7071" for role in GRUNTS}
+        inventory = {"grunts": [{"address": addresses[role]} for role in GRUNTS]}
+        wrong_identity = "wrong-grunt.invalid"
+        wrong_inventory = {"grunts": [inventory["grunts"][0], {
+            "address": addresses["grunt-b"], "tls_identity": wrong_identity,
+        }]}
+        for file, data in (("grunts.json", inventory), ("wrong-grunts.json", wrong_inventory)):
+            (work / "controller" / file).write_text(json.dumps(data))
         containers = []
 
         def start(name, role, entrypoint, *args):
@@ -147,7 +154,7 @@ def pilot(binary):
 
         def start_controller(name, budget):
             start(name, "controller", "/horde", "controller", "--private-network",
-                  "--grunt", addresses["grunt-a"], "--grunt", addresses["grunt-b"], *IDENTITY,
+                  "--inventory", "/identity/grunts.json", *IDENTITY,
                   "--requests", str(budget), "--concurrency", "2", "--rate", "4",
                   "--deadline", "30", "--max-failure-rate", "0")
 
@@ -159,6 +166,22 @@ def pilot(binary):
                     result.stdout + result.stderr)
             remove("rm", container)
             return json.loads(result.stdout)
+
+        def preflight(name, inventory_file, ready):
+            start(name, "controller", "/horde", "preflight", "--private-network",
+                  "--inventory", f"/identity/{inventory_file}", *IDENTITY)
+            report = collect(name, 0 if ready else 1)
+            require(report["type"] == "distributed_preflight" and report["ready"] is ready,
+                    "Unexpected preflight result", report)
+            require([(grunt["address"], grunt["status"]) for grunt in report["grunts"]] == [
+                (addresses["grunt-a"], "ready"),
+                (addresses["grunt-b"], "ready" if ready else "failed"),
+            ], "Unexpected preflight peer states", report)
+            connections = {role: logs(role).stdout.splitlines().count("pilot-http: connection")
+                           for role in GRUNTS}
+            require(connections == dict.fromkeys(GRUNTS, 0),
+                    "Preflight reached a workload target", connections)
+            return {"report": report, "target_connections": connections}
 
         def verify(report, completed, states, partial):
             metrics = report["metrics"]
@@ -177,6 +200,14 @@ def pilot(binary):
                       "--allow-controller-ip", peers["controller"], "--target", "http://127.0.0.1:18080/",
                       "--controller-cert", "/identity/controller.der", *IDENTITY)
                 wait_for(lambda: addresses[role] in logs(role).stdout.splitlines(), f"{role} readiness")
+
+            checked = preflight("preflight", "grunts.json", ready=True)
+            rejected = preflight("preflight-wrong-identity", "wrong-grunts.json", ready=False)
+            failed = rejected["report"]["grunts"][1]
+            require(failed["tls_identity"] == wrong_identity and "certificate" in (failed["error"] or ""),
+                    "Expected Grunt B certificate rejection", failed)
+            print("Preflight passed and identified the misconfigured Grunt; no target connections.",
+                  flush=True)
 
             start_controller("nominal", 20)
             nominal = collect("nominal", 0)
@@ -206,6 +237,7 @@ def pilot(binary):
         return {
             "subnet": subnet,
             "roles": peers,
+            "preflight": {"nominal": checked, "wrong_identity": rejected},
             "nominal": {"controller_report": nominal, "requests_per_target": counts},
             "link_disconnect": {"controller_report": fault, "requests_per_target": after_drop},
         }

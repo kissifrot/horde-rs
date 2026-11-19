@@ -175,6 +175,30 @@ fn report(output: &Output) -> Value {
 }
 
 #[test]
+fn preflight_requires_the_hello_after_controller_authorization() {
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (address, _grunt) = start_grunt(target.local_addr().unwrap());
+    for (credential, ready) in [("controller", true), ("unauthorized", false)] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_horde"));
+        command.args(["preflight", "--grunt", &address.to_string()]);
+        identity(&mut command, credential, "ca.der");
+        let output = command.output_timeout().unwrap();
+        let report = report(&output);
+        assert_eq!(output.status.code(), Some(i32::from(!ready)), "{report}");
+        assert_eq!(report["ready"], ready);
+        let peer = &report["grunts"][0];
+        assert_eq!(peer["address"], address.to_string());
+        assert_eq!(peer["status"], if ready { "ready" } else { "failed" });
+        assert_eq!(peer["error"].is_null(), ready);
+    }
+    target.set_nonblocking(true).unwrap();
+    assert_eq!(
+        target.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
 fn controller_splits_budget_and_collects_and_merges_two_grunts() {
     let (fast, fast_target) = start_target(21, 0);
     let (slow, slow_target) = start_target(20, 2);

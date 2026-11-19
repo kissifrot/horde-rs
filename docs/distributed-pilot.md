@@ -115,6 +115,36 @@ and `--grunt`. Leave it unbracketed when signing and setting peer IPs.
 
 ## Run and verify
 
+For repeated runs, put the peers in a JSON inventory such as `grunts.json`.
+Use the actual private socket addresses for your Grunts.
+
+```json
+{
+  "grunts": [
+    {"address": "10.0.0.12:7071"},
+    {"address": "10.0.0.13:7071", "tls_identity": "grunt-b.example.internal"}
+  ]
+}
+```
+
+With `--private-network`, an omitted identity defaults to the address's
+IP SAN. Set `tls_identity` when the certificate has a different IP or a
+DNS SAN. The DNS name is checked against the certificate. The connection
+uses the literal socket address from the inventory.
+
+```sh
+target/release/horde preflight --private-network --inventory grunts.json \
+  --ca "$HOME/horde-pilot/ca.der" --cert "$HOME/horde-pilot/cert.der" \
+  --key "$HOME/horde-pilot/key.der"
+```
+
+Preflight checks each peer through the authenticated protocol hello and
+prints a JSON report with the address, expected identity, status and any
+connection error. It exits zero when all peers are ready and one when a
+peer fails. It sends no run operations and generates no HTTP traffic.
+The `controller` command also accepts `--inventory grunts.json` in place
+of the repeated `--grunt` flags below. Inventory order is allocation order.
+
 From the controller machine, use a small budget first:
 
 ```sh
@@ -174,6 +204,9 @@ issues fresh TLS certificates, and starts two Grunts and a controller.
 Each Grunt's HTTP fixture listens on its own loopback interface. No
 ports are published.
 
+- Preflight checks both Grunts, then repeats with an incorrect TLS identity
+  for Grunt B. It must report A as ready and B as failed. Both loopback HTTP
+  fixtures must observe zero connections in both cases.
 - The nominal run checks 10 requests per Grunt, 20 successful responses,
   40 body bytes and populated merged p95/p99.
 - The interruption run disconnects Grunt B from the Docker network

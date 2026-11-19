@@ -7,6 +7,7 @@ use horde_rs::{
         transport::{Endpoint, EndpointLimits, ListenerPolicy, MAX_RETAINED_RESULT_BYTES, Profile},
     },
 };
+use serde::Deserialize;
 use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -30,6 +31,8 @@ pub(crate) enum Command {
     Grunt(GruntArgs),
     /// Split a request budget across Grunts and print merged JSON results.
     Controller(ControllerArgs),
+    /// Verify Grunt control connections through the authenticated hello.
+    Preflight(PreflightArgs),
 }
 
 #[derive(Args)]
@@ -64,16 +67,33 @@ pub(crate) struct GruntArgs {
 }
 
 #[derive(Args)]
-pub(crate) struct ControllerArgs {
+struct Peers {
     /// Grunt socket address, optionally followed by =TLS_IDENTITY. Repeat in allocation order.
-    #[arg(long, required = true, value_name = "ADDRESS[=TLS_IDENTITY]", value_parser = parse_grunt)]
+    #[arg(long, required_unless_present = "inventory", value_name = "ADDRESS[=TLS_IDENTITY]", value_parser = parse_grunt)]
     grunt: Vec<GruntSpec>,
+    /// Read Grunt addresses and TLS identities from a JSON inventory.
+    #[arg(long, conflicts_with = "grunt")]
+    inventory: Option<PathBuf>,
     /// Connect to explicitly listed private Grunt addresses instead of loopback.
     #[arg(long)]
     private_network: bool,
     /// Default TLS identity for entries that omit one. Defaults to localhost on loopback and the Grunt IP in private mode.
     #[arg(long)]
     server_name: Option<String>,
+    #[command(flatten)]
+    identity: Identity,
+}
+
+#[derive(Args)]
+pub(crate) struct PreflightArgs {
+    #[command(flatten)]
+    peers: Peers,
+}
+
+#[derive(Args)]
+pub(crate) struct ControllerArgs {
+    #[command(flatten)]
+    peers: Peers,
     /// Total requests across all Grunts.
     #[arg(short = 'n', long)]
     requests: u64,
@@ -92,8 +112,64 @@ pub(crate) struct ControllerArgs {
     /// CI threshold for the merged p95 in milliseconds.
     #[arg(long)]
     max_p95_ms: Option<f64>,
-    #[command(flatten)]
-    identity: Identity,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Inventory {
+    grunts: Vec<InventoryEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InventoryEntry {
+    address: SocketAddr,
+    tls_identity: Option<String>,
+}
+
+impl Peers {
+    fn prepare(self) -> Result<(Controller, Vec<Grunt>), BoxError> {
+        let mut specs = self.grunt;
+        if let Some(path) = self.inventory {
+            let inventory: Inventory = serde_json::from_reader(std::io::BufReader::new(
+                std::fs::File::open(&path).map_err(|error| {
+                    format!("cannot open Grunt inventory {}: {error}", path.display())
+                })?,
+            ))
+            .map_err(|error| format!("invalid Grunt inventory {}: {error}", path.display()))?;
+            for entry in inventory.grunts {
+                let identity = entry
+                    .tls_identity
+                    .map(ServerName::try_from)
+                    .transpose()
+                    .map_err(|error| {
+                        format!("invalid TLS identity for {}: {error}", entry.address)
+                    })?;
+                specs.push(GruntSpec {
+                    address: entry.address,
+                    identity,
+                });
+            }
+        }
+        let default = self.server_name.map(ServerName::try_from).transpose()?;
+        let grunts = specs
+            .into_iter()
+            .map(|spec| spec.resolve(default.as_ref(), self.private_network))
+            .collect();
+        let controller = Controller::new(
+            self.identity.roots()?,
+            vec![certificate(&self.identity.cert)?],
+            self.identity.key()?,
+        )?;
+        Ok((
+            if self.private_network {
+                controller.with_private_network()
+            } else {
+                controller
+            },
+            grunts,
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -158,6 +234,7 @@ pub(crate) async fn run(command: Command) -> Result<ExitCode, BoxError> {
     match command {
         Command::Grunt(args) => serve(args, signals).await,
         Command::Controller(args) => coordinate(args, cancel, signals).await,
+        Command::Preflight(args) => preflight(args, cancel, signals).await,
     }
 }
 
@@ -268,17 +345,45 @@ async fn serve(
     ))
 }
 
+async fn preflight(
+    args: PreflightArgs,
+    cancel: Cancellation,
+    signals: tokio::sync::watch::Receiver<Option<crate::signals::Interrupt>>,
+) -> Result<ExitCode, BoxError> {
+    let (controller, grunts) = args.peers.prepare()?;
+    let results = controller.preflight(&grunts, cancel).await?;
+    let signal = *signals.borrow();
+    let ready = signal.is_none() && results.iter().all(Result::is_ok);
+    let peers = grunts
+        .iter()
+        .zip(results)
+        .map(|(grunt, result)| {
+            let status = if result.is_ok() { "ready" } else { "failed" };
+            serde_json::json!({
+                "address": grunt.address.to_string(),
+                "tls_identity": grunt.server_name.to_str(),
+                "status": status,
+                "error": result.err().map(|error| error.to_string()),
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema_version": 1, "type": "distributed_preflight", "ready": ready,
+            "interruption": signal.map(|signal| signal.label()), "grunts": peers,
+        })
+    );
+    Ok(ExitCode::from(
+        signal.map_or(u8::from(!ready), |signal| signal.code()),
+    ))
+}
+
 async fn coordinate(
     args: ControllerArgs,
     cancel: Cancellation,
     signals: tokio::sync::watch::Receiver<Option<crate::signals::Interrupt>>,
 ) -> Result<ExitCode, BoxError> {
-    let default = args.server_name.map(ServerName::try_from).transpose()?;
-    let grunts = args
-        .grunt
-        .into_iter()
-        .map(|spec| spec.resolve(default.as_ref(), args.private_network))
-        .collect::<Vec<_>>();
     let budget = Budget {
         requests: Some(args.requests),
         concurrency: args.concurrency,
@@ -294,16 +399,7 @@ async fn coordinate(
     {
         return Err("invalid distributed thresholds".into());
     }
-    let controller = Controller::new(
-        args.identity.roots()?,
-        vec![certificate(&args.identity.cert)?],
-        args.identity.key()?,
-    )?;
-    let controller = if args.private_network {
-        controller.with_private_network()
-    } else {
-        controller
-    };
+    let (controller, grunts) = args.peers.prepare()?;
     let report = controller
         .run(
             &grunts,

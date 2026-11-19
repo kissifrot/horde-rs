@@ -1,4 +1,4 @@
-//! Coordinator for the experimental loopback Grunt transport.
+//! Coordinator for the experimental Grunt control transport.
 use super::{
     AgentOutcome, Aggregate, Budget, Cancellation, CompletedResult, DecodeLimits,
     MAX_ENVELOPE_BYTES, split_budget,
@@ -7,7 +7,7 @@ use super::{
         read_frame_limited, write_frame,
     },
 };
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all, stream};
 use std::{collections::BTreeSet, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::AsyncReadExt,
@@ -26,6 +26,8 @@ use tokio_rustls::{
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
+const MAX_RUN_GRUNTS: usize = 32;
+const PREFLIGHT_CONCURRENCY: usize = 16;
 
 pub struct Grunt {
     pub address: SocketAddr,
@@ -68,16 +70,8 @@ impl Controller {
         self
     }
 
-    /// Submit each share once, with no resubmission following ambiguous I/O.
-    pub async fn run(
-        &self,
-        grunts: &[Grunt],
-        profile: &str,
-        budget: Budget,
-        deadline: Duration,
-        cancel: Cancellation,
-    ) -> Result<ControllerReport, BoxError> {
-        if grunts.len() > 32
+    fn validate_grunts(&self, grunts: &[Grunt]) -> Result<(), BoxError> {
+        if grunts.is_empty()
             || grunts.iter().any(|g| {
                 let ip = g.address.ip().to_canonical();
                 g.address.port() == 0
@@ -93,10 +87,6 @@ impl Controller {
                 .collect::<BTreeSet<_>>()
                 .len()
                 != grunts.len()
-            || deadline.is_zero()
-            || deadline > Duration::from_secs(3600)
-            || profile.is_empty()
-            || profile.len() > 64
         {
             return Err("invalid controller configuration or Grunt address".into());
         }
@@ -115,6 +105,53 @@ impl Controller {
         {
             return Err("private Grunts require distinct TLS identities".into());
         }
+        Ok(())
+    }
+
+    /// Check each peer through the authenticated hello, in input order.
+    pub async fn preflight(
+        &self,
+        grunts: &[Grunt],
+        cancel: Cancellation,
+    ) -> Result<Vec<Result<(), BoxError>>, BoxError> {
+        self.validate_grunts(grunts)?;
+        Ok(stream::iter(grunts)
+            .map(|grunt| {
+                let mut cancellation = cancel.subscribe();
+                async move {
+                    tokio::select! {
+                        biased;
+                        _ = crate::wait_for_cancel(&mut cancellation) => Err("preflight interrupted".into()),
+                        connection = timeout(IO_TIMEOUT, self.connect(grunt)) => {
+                            connection.map_err(|_| "timed out waiting for Grunt hello")??;
+                            Ok(())
+                        }
+                    }
+                }
+            })
+            .buffered(PREFLIGHT_CONCURRENCY)
+            .collect()
+            .await)
+    }
+
+    /// Submit each share once, with no resubmission following ambiguous I/O.
+    pub async fn run(
+        &self,
+        grunts: &[Grunt],
+        profile: &str,
+        budget: Budget,
+        deadline: Duration,
+        cancel: Cancellation,
+    ) -> Result<ControllerReport, BoxError> {
+        if grunts.len() > MAX_RUN_GRUNTS
+            || deadline.is_zero()
+            || deadline > Duration::from_secs(3600)
+            || profile.is_empty()
+            || profile.len() > 64
+        {
+            return Err("invalid controller configuration or Grunt address".into());
+        }
+        self.validate_grunts(grunts)?;
         let shares = split_budget(budget, grunts.len())?;
         let mut run_id = [0; 16];
         getrandom::fill(&mut run_id).map_err(|_| "could not generate run identifier")?;

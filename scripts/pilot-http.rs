@@ -39,7 +39,10 @@ fn main() -> io::Result<ExitCode> {
     let listener = TcpListener::bind("127.0.0.1:18080")?;
     std::thread::spawn(move || {
         for connection in listener.incoming() {
-            if let Err(error) = connection.and_then(respond) {
+            if let Err(error) = connection.and_then(|stream| {
+                println!("pilot-http: connection");
+                respond(stream)
+            }) {
                 eprintln!("pilot-http: {error}");
             }
         }

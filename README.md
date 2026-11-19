@@ -250,6 +250,11 @@ insufficient. A bare loopback address defaults to `localhost`.
 Private entries must resolve to distinct expected identities. Issue each
 Grunt a leaf certificate for its own identity.
 
+Both `controller` and `preflight` accept `--inventory grunts.json` in place
+of repeated `--grunt` flags. Preflight checks the authenticated control hello
+for each peer without generating HTTP traffic. See the
+[inventory format and preflight example](docs/distributed-pilot.md#run-and-verify).
+
 The controller emits JSON with per-Grunt states, merged metrics and percentiles.
 It returns a nonzero exit code for partial runs or failed configured thresholds.
 On interruption it requests cancellation concurrently and keeps metrics from
