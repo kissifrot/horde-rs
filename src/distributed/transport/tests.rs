@@ -572,7 +572,10 @@ async fn retained_result_limit_preserves_the_first_result_and_rejects_the_next()
     config.max_retained_result_bytes = MAX_RESULT_METADATA + 1024;
 
     let (mut stream, epoch, task) = ready(&endpoint, controller()).await;
-    for (run, expected_status) in [(ID, RunStatus::Complete), ([2; 16], RunStatus::Failed)] {
+    for (run, expected_status) in [
+        (ID, RunStatus::Complete),
+        ([2; 16], RunStatus::ResultStorageCapacity),
+    ] {
         assert_eq!(
             request(&mut stream, epoch, run, submit()).await,
             Reply::State {
@@ -589,7 +592,7 @@ async fn retained_result_limit_preserves_the_first_result_and_rejects_the_next()
     assert_eq!(
         request(&mut stream, epoch, [2; 16], Operation::Collect).await,
         Reply::State {
-            status: RunStatus::Failed
+            status: RunStatus::ResultStorageCapacity
         }
     );
     let Reply::Result { histogram_bytes } =

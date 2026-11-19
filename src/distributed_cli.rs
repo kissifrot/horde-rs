@@ -24,6 +24,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const MAX_SAMPLES: u64 = 10_000;
 const MAX_CONCURRENCY: u64 = 8;
 const MAX_RATE: u64 = 1_000;
+const MAX_RUN_RECORDS: usize = 64;
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
@@ -138,6 +139,8 @@ struct GruntConfig {
     target: reqwest::Url,
     controller_cert: Vec<PathBuf>,
     tls: Identity,
+    max_records: Option<usize>,
+    max_retained_result_bytes: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +208,8 @@ impl GruntArgs {
                 target: self.target.ok_or("missing --target")?,
                 controller_cert: self.controller_cert,
                 tls: self.identity.load()?,
+                max_records: None,
+                max_retained_result_bytes: None,
             })
         }
     }
@@ -346,6 +351,19 @@ async fn serve(
     args: GruntConfig,
     mut signals: tokio::sync::watch::Receiver<Option<crate::signals::Interrupt>>,
 ) -> Result<ExitCode, BoxError> {
+    let max_records = args.max_records.unwrap_or(MAX_RUN_RECORDS);
+    if !(1..=MAX_RUN_RECORDS).contains(&max_records) {
+        return Err(format!("Grunt max_records must be between 1 and {MAX_RUN_RECORDS}").into());
+    }
+    let max_retained_result_bytes = args
+        .max_retained_result_bytes
+        .unwrap_or(MAX_RETAINED_RESULT_BYTES);
+    if !(1..=MAX_RETAINED_RESULT_BYTES).contains(&max_retained_result_bytes) {
+        return Err(format!(
+            "Grunt max_retained_result_bytes must be between 1 and {MAX_RETAINED_RESULT_BYTES}"
+        )
+        .into());
+    }
     let listener_policy = ListenerPolicy::for_listener(args.listen, args.allow_controller_ip)?;
     let target_ip = args
         .target
@@ -418,8 +436,8 @@ async fn serve(
         .into(),
         EndpointLimits {
             max_sessions: 16,
-            max_records: 64,
-            max_retained_result_bytes: MAX_RETAINED_RESULT_BYTES,
+            max_records,
+            max_retained_result_bytes,
             handshake_timeout: Duration::from_secs(2),
             frame_timeout: Duration::from_secs(3),
             reconnect_grace: Duration::from_secs(2),
@@ -462,12 +480,16 @@ async fn preflight(
         .iter()
         .zip(results)
         .map(|(grunt, result)| {
-            let status = if result.is_ok() { "ready" } else { "failed" };
+            let (status, epoch, error) = match result {
+                Ok(epoch) => ("ready", Some(epoch), None),
+                Err(error) => ("failed", None, Some(error.to_string())),
+            };
             serde_json::json!({
                 "address": grunt.address.to_string(),
                 "tls_identity": grunt.server_name.to_str(),
                 "status": status,
-                "error": result.err().map(|error| error.to_string()),
+                "epoch": epoch,
+                "error": error,
             })
         })
         .collect::<Vec<_>>();
@@ -536,7 +558,11 @@ async fn coordinate(
             Some(Invalid) => "invalid",
             None => "missing",
         };
-        serde_json::json!({"address": agent, "status": status, "elapsed_seconds": aggregate.agent_elapsed(agent).map(|v| v.as_secs_f64())})
+        let mut entry = serde_json::json!({"address": agent, "status": status, "elapsed_seconds": aggregate.agent_elapsed(agent).map(|v| v.as_secs_f64())});
+        if let Some(reason) = report.capacity_failures.get(agent) {
+            entry["reason"] = serde_json::json!(reason);
+        }
+        entry
     }).collect::<Vec<_>>();
     let percentile = |percent| {
         aggregate

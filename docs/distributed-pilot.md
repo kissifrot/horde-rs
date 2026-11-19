@@ -197,7 +197,8 @@ Stop after any unexpected continued load, duplicate submission, acceptance
 of a wrong certificate or partial report passing a configured threshold.
 End the test by stopping the controller, Grunts and local HTTP fixtures.
 The current Grunt retains terminal records for its process lifetime.
-For a fresh pilot session, stop it cleanly before starting a new epoch.
+See [controlled restart](#restart-a-grunt-after-saturation) for how to
+start a fresh epoch.
 
 A one-machine rehearsal over a private interface completed 20 requests
 with ephemeral pilot certificates, 10 at each local target, and no
@@ -241,6 +242,10 @@ ports are published.
   its 20-request share, A completes its own 20 requests, and the
   controller reports B as missing with a partial result and an
   unevaluable failure threshold.
+- The maintenance run lowers both retention limits on Grunt B. It checks
+  both saturation reasons and their HTTP effects, stops B with SIGTERM,
+  and verifies that only B's epoch changes. A fresh two-request run then
+  completes with one request on each Grunt.
 
 The script removes its containers, network, image and temporary
 credentials on exit, including on failure, SIGINT or SIGTERM. It writes
@@ -252,6 +257,42 @@ as the `horde-distributed-pilot` artifact.
 This exercises separate IPs and TLS identities on a single kernel.
 Routing, firewalls and physical link detection remain checks for the
 multi-host pilot.
+
+## Restart a Grunt after saturation
+
+Each Grunt keeps up to 64 run records and accounts for up to 16 MiB of
+retained results by default. A result is charged for its encoded histogram
+and a 32 KiB metadata allowance. For a maintenance drill, set
+`max_records` and `max_retained_result_bytes` in the Grunt JSON to lower
+these limits. Both accept positive integers up to their default values.
+
+| Reason in the controller's per-Grunt JSON | Effect |
+| --- | --- |
+| `run_record_capacity` | The Grunt refuses the new submission before it starts HTTP work. |
+| `result_storage_capacity` | The workload can already have reached the target. The Grunt cannot retain the new result, and previously stored results remain available. |
+
+The Grunt writes each diagnostic to stderr the first time it hits that
+limit in an epoch. The controller reports the affected Grunt as `failed`
+with the corresponding `reason`, keeps completed metrics from healthy
+Grunts, and marks the report partial. Configured thresholds are
+`not_evaluable`.
+
+1. Pause new submissions targeting the Grunt and let active runs finish.
+   Save the controller reports and Grunt logs. Capture a preflight
+   report and note the affected peer's `epoch`.
+2. Send SIGTERM to that Grunt through its service manager or directly
+   with `kill -TERM "$GRUNT_PID"`. Wait for the process to exit before
+   restarting it with the same local configuration. The Grunt stops
+   accepting control connections and cancels any work still active.
+3. Run `horde preflight --config controller.json` and check that the
+   restarted peer is ready and has a new epoch. Resume with a small,
+   explicitly budgeted fresh run.
+
+Restart clears the Grunt's in-memory records and retained results.
+Requests bearing the old epoch are rejected. Keep budgets already
+submitted out of the recovery run, since their HTTP effects may already
+have reached a target. Preflight checks the control channel and reports
+the epoch even while either retention limit is saturated.
 
 ## Rotate a pilot CA
 

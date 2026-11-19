@@ -176,6 +176,10 @@ def pilot(binary):
         def requests(role):
             return logs(grunt_names[role]).stdout.splitlines().count("pilot-http: 200")
 
+        def target_connections():
+            return {role: logs(grunt_names[role]).stdout.splitlines().count("pilot-http: connection")
+                    for role in GRUNTS}
+
         def config_args(role, filename, settings):
             (work / role / filename).write_text(json.dumps(settings))
             return "--config", f"/identity/{filename}"
@@ -188,21 +192,26 @@ def pilot(binary):
                 "tls": tls_config(leaf, roots),
             })
 
-        def start_grunts(stage, leaves, roots, controllers):
+        def launch_grunt(role, name, config):
+            grunt_names[role] = name
+            start(name, role, "/pilot-http", "grunt", *config)
+            wait_for(lambda: addresses[role] in logs(name).stdout.splitlines(), f"{name} readiness")
+
+        def start_grunts(stage, leaves, roots, controllers, limits=None):
             for name in grunt_names.values():
                 remove("rm", "-f", f"{prefix}-{name}")
+            configs = {}
             for role, leaf in zip(GRUNTS, leaves):
-                name = f"{stage}-{role}"
-                grunt_names[role] = name
-                config = config_args(role, f"{stage}.json", {
+                configs[role] = config_args(role, f"{stage}.json", {
                     "listen": addresses[role],
                     "allow_controller_ip": [peers["controller"]],
                     "target": "http://127.0.0.1:18080/",
                     "controller_cert": [f"{controller}-controller.der" for controller in controllers],
                     "tls": tls_config(leaf, roots),
+                    **(limits or {}).get(role, {}),
                 })
-                start(name, role, "/pilot-http", "grunt", *config)
-                wait_for(lambda: addresses[role] in logs(name).stdout.splitlines(), f"{name} readiness")
+                launch_grunt(role, f"{stage}-{role}", configs[role])
+            return configs
 
         def start_controller(name, budget):
             start(name, "controller", "/horde", "controller",
@@ -220,6 +229,7 @@ def pilot(binary):
             return json.loads(result.stdout)
 
         def preflight(name, leaf, roots, states, inventory_file="grunts.json"):
+            before = target_connections()
             start(name, "controller", "/horde", "preflight",
                   *controller_config(leaf, roots, inventory_file))
             ready = all(status == "ready" for status in states)
@@ -228,8 +238,7 @@ def pilot(binary):
                     "Unexpected preflight result", report)
             require([(grunt["address"], grunt["status"]) for grunt in report["grunts"]]
                     == list(zip(addresses.values(), states)), "Unexpected preflight peer states", report)
-            connections = {role: logs(grunt_names[role]).stdout.splitlines().count("pilot-http: connection")
-                           for role in GRUNTS}
+            connections = {role: total - before[role] for role, total in target_connections().items()}
             require(connections == dict.fromkeys(GRUNTS, 0),
                     "Preflight reached a workload target", connections)
             return {"report": report, "target_connections": connections}
@@ -295,6 +304,58 @@ def pilot(binary):
             require(after_drop["grunt-a"] == 20 and 0 < after_drop["grunt-b"] < 20,
                     "Unexpected split after disconnect", after_drop)
             print(f"Link disconnect passed: {after_drop}", flush=True)
+
+            # Each retained result costs 32 KiB of metadata plus its histogram.
+            # The two-record table on B admits one result and one failed record.
+            configs = start_grunts("maintenance", ("new", "new"), ("new",), ("new",), limits={
+                "grunt-b": {"max_records": 2, "max_retained_result_bytes": 33_792},
+            })
+            start_controller("fill", 2)
+            first = collect("fill", 0)
+            verify(first, 2, ("complete", "complete"), partial=False)
+            require(target_connections() == {"grunt-a": 1, "grunt-b": 1},
+                    "First run did not reach both targets once", target_connections())
+
+            saturation = {}
+            for reason, expected_b_connections in (("result_storage_capacity", 2),
+                                                   ("run_record_capacity", 2)):
+                start_controller(reason, 2)
+                report = collect(reason, 1)
+                verify(report, 1, ("complete", "failed"), partial=True)
+                failed = next(agent for agent in report["agents"] if agent["address"] == addresses["grunt-b"])
+                require(failed.get("reason") == reason, "Incorrect capacity failure", failed)
+                require(report["thresholds"]["failure_rate"] == "not_evaluable",
+                        "Capacity failure did not invalidate the threshold", report["thresholds"])
+                connections = target_connections()
+                require(connections == {"grunt-a": len(saturation) + 2, "grunt-b": expected_b_connections},
+                        "Unexpected workload at capacity", connections)
+                require(f"Grunt {reason}:" in logs(grunt_names["grunt-b"]).stderr,
+                        "Missing Grunt capacity diagnostic", reason)
+                saturation[reason] = {"report": report, "target_connections": connections}
+
+            before_restart = preflight("before-restart", "new", ("new",), both_ready)
+            stopped_name = f"{prefix}-{grunt_names['grunt-b']}"
+            docker("stop", "--time", "5", stopped_name)
+            exit_code = docker("wait", stopped_name).stdout.strip()
+            require(exit_code == "143", "Grunt did not handle SIGTERM", exit_code)
+            remove("rm", stopped_name)
+            launch_grunt("grunt-b", "maintenance-restarted-grunt-b", configs["grunt-b"])
+
+            after_restart = preflight("after-restart", "new", ("new",), both_ready)
+            before_epochs = [agent["epoch"] for agent in before_restart["report"]["grunts"]]
+            after_epochs = [agent["epoch"] for agent in after_restart["report"]["grunts"]]
+            require(all(isinstance(epoch, list) and len(epoch) == 16
+                        for epoch in before_epochs + after_epochs)
+                    and before_epochs[0] == after_epochs[0] and before_epochs[1] != after_epochs[1],
+                    "Expected only Grunt B to change epoch", (before_epochs, after_epochs))
+            before_recovery = target_connections()
+            start_controller("recovery", 2)
+            recovery = collect("recovery", 0)
+            verify(recovery, 2, ("complete", "complete"), partial=False)
+            recovered = {role: total - before_recovery[role] for role, total in target_connections().items()}
+            require(recovered == {"grunt-a": 1, "grunt-b": 1},
+                    "Unexpected workload after restart", recovered)
+            print("Capacity diagnostics and controlled Grunt restart passed.", flush=True)
         except Exception:
             for container in containers:
                 result = docker("logs", container, check=False)
@@ -309,6 +370,13 @@ def pilot(binary):
             "certificate_rotation": rotation,
             "nominal": {"controller_report": nominal, "requests_per_target": counts},
             "link_disconnect": {"controller_report": fault, "requests_per_target": after_drop},
+            "maintenance": {
+                "saturation": saturation,
+                "before_restart": before_restart,
+                "after_restart": after_restart,
+                "grunt_exit_code": int(exit_code),
+                "recovery": {"controller_report": recovery, "target_connections": recovered},
+            },
         }
 
 

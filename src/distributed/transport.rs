@@ -66,6 +66,7 @@ pub enum RunStatus {
     AgentDeadline,
     SampleLimit,
     Failed,
+    ResultStorageCapacity,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -127,6 +128,8 @@ struct State {
     next_session: u64,
     runs: BTreeMap<RunKey, Run>,
     retained_bytes: usize,
+    record_limit_reported: bool,
+    result_limit_reported: bool,
 }
 
 struct Run {
@@ -428,6 +431,14 @@ impl Endpoint {
             return error(ErrorCode::UnknownProfile);
         };
         if state.runs.len() >= self.config.max_records {
+            if !state.record_limit_reported {
+                state.record_limit_reported = true;
+                eprintln!(
+                    "Grunt run_record_capacity: {} of {} records used",
+                    state.runs.len(),
+                    self.config.max_records
+                );
+            }
             return error(ErrorCode::Capacity);
         }
         let budget = requested.unwrap_or(job.budget);
@@ -509,8 +520,15 @@ impl Endpoint {
                 // Charge a fixed metadata allowance and the exact encoded byte count.
                 let charge = MAX_RESULT_METADATA + stored.histogram.len();
                 if charge > endpoint.config.max_retained_result_bytes - state.retained_bytes {
+                    if !state.result_limit_reported {
+                        state.result_limit_reported = true;
+                        eprintln!(
+                            "Grunt result_storage_capacity: {} bytes used, {} additional bytes needed, limit {}",
+                            state.retained_bytes, charge, endpoint.config.max_retained_result_bytes
+                        );
+                    }
                     result = None;
-                    status = RunStatus::Failed;
+                    status = RunStatus::ResultStorageCapacity;
                 } else {
                     state.retained_bytes += charge;
                 }

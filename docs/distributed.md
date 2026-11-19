@@ -39,7 +39,11 @@ containing `histogram_bytes`, followed by a length-prefixed metadata frame and
 exactly that many encoded histogram bytes. Result metadata is bounded to 32 KiB and the controller limits
 the histogram before allocation. The endpoint caps retained result storage at
 16 MiB of charged bytes, accounting for each encoded histogram plus a fixed
-metadata allowance. A result that cannot be retained is reported as failed.
+metadata allowance. The endpoint reports a full record table with the
+`capacity` error, and an unretainable result with terminal status
+`result_storage_capacity`. The controller preserves per-agent
+`status: failed` and includes a `reason` for these failures. Use the same
+revision on the controller and Grunts for the experimental protocol.
 
 The controller opens one authenticated session per assigned Grunt and submits
 each share once. It does not reassign missing shares or resubmit after ambiguous

@@ -3,12 +3,17 @@ use super::{
     AgentOutcome, Aggregate, Budget, Cancellation, CompletedResult, DecodeLimits,
     MAX_ENVELOPE_BYTES, split_budget,
     transport::{
-        ALPN, MAX_RESULT_METADATA, Operation, Reply, Request, RunStatus, VERSION,
+        ALPN, ErrorCode, MAX_RESULT_METADATA, Operation, Reply, Request, RunStatus, VERSION,
         read_frame_limited, write_frame,
     },
 };
 use futures_util::{StreamExt, future::join_all, stream};
-use std::{collections::BTreeSet, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::AsyncReadExt,
     net::TcpStream,
@@ -38,6 +43,14 @@ pub struct ControllerReport {
     pub aggregate: Aggregate,
     pub elapsed: Duration,
     pub interrupted: bool,
+    pub capacity_failures: BTreeMap<String, CapacityFailure>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityFailure {
+    RunRecordCapacity,
+    ResultStorageCapacity,
 }
 
 pub struct Controller {
@@ -113,7 +126,7 @@ impl Controller {
         &self,
         grunts: &[Grunt],
         cancel: Cancellation,
-    ) -> Result<Vec<Result<(), BoxError>>, BoxError> {
+    ) -> Result<Vec<Result<[u8; 16], BoxError>>, BoxError> {
         self.validate_grunts(grunts)?;
         Ok(stream::iter(grunts)
             .map(|grunt| {
@@ -123,8 +136,8 @@ impl Controller {
                         biased;
                         _ = crate::wait_for_cancel(&mut cancellation) => Err("preflight interrupted".into()),
                         connection = timeout(IO_TIMEOUT, self.connect(grunt)) => {
-                            connection.map_err(|_| "timed out waiting for Grunt hello")??;
-                            Ok(())
+                            let (epoch, _) = connection.map_err(|_| "timed out waiting for Grunt hello")??;
+                            Ok(epoch)
                         }
                     }
                 }
@@ -186,6 +199,7 @@ impl Controller {
                 }),
         )
         .await;
+        let mut capacity_failures = BTreeMap::new();
         for ((name, share), outcome) in agents.iter().zip(shares).zip(outcomes) {
             match outcome {
                 Some(Outcome::Result(metadata, histogram)) => {
@@ -205,11 +219,19 @@ impl Controller {
                         RunStatus::AgentDeadline => AgentOutcome::AgentDeadline,
                         RunStatus::SampleLimit => AgentOutcome::SampleLimit,
                         RunStatus::Failed => AgentOutcome::Failed,
+                        RunStatus::ResultStorageCapacity => {
+                            capacity_failures
+                                .insert(name.clone(), CapacityFailure::ResultStorageCapacity);
+                            AgentOutcome::Failed
+                        }
                         _ => continue,
                     };
                     aggregate.add_noncomplete(run_id, name, outcome)?;
                 }
-                Some(Outcome::Rejected) => {
+                Some(Outcome::Rejected(code)) => {
+                    if code == ErrorCode::Capacity {
+                        capacity_failures.insert(name.clone(), CapacityFailure::RunRecordCapacity);
+                    }
                     aggregate.add_noncomplete(run_id, name, AgentOutcome::Failed)?
                 }
                 None => {}
@@ -219,6 +241,7 @@ impl Controller {
             aggregate,
             elapsed: start.elapsed(),
             interrupted: cancel.is_cancelled(),
+            capacity_failures,
         })
     }
 
@@ -288,7 +311,7 @@ impl Controller {
                     status: RunStatus::Running | RunStatus::Cancelling,
                 } => {}
                 Reply::State { status } => return Ok(Outcome::State(status)),
-                Reply::Error { .. } => return Ok(Outcome::Rejected),
+                Reply::Error { code } => return Ok(Outcome::Rejected(code)),
                 _ => return Err("invalid Grunt operation reply".into()),
             }
             if cancel.is_cancelled() && cancel_by.is_none() {
@@ -336,7 +359,7 @@ impl Controller {
 enum Outcome {
     State(RunStatus),
     Result(Box<CompletedResult>, Vec<u8>),
-    Rejected,
+    Rejected(ErrorCode),
 }
 
 fn decode_limits(budget: Budget) -> DecodeLimits {

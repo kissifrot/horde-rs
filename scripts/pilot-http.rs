@@ -1,7 +1,8 @@
 //! Loopback HTTP fixture and Grunt launcher for the Docker pilot only.
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Command, ExitCode};
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn respond(mut connection: TcpStream) -> io::Result<()> {
@@ -35,22 +36,34 @@ fn respond(mut connection: TcpStream) -> io::Result<()> {
     Ok(())
 }
 
-fn main() -> io::Result<ExitCode> {
+fn serve_fixture() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:18080")?;
-    std::thread::spawn(move || {
-        for connection in listener.incoming() {
-            if let Err(error) = connection.and_then(|stream| {
-                println!("pilot-http: connection");
-                respond(stream)
-            }) {
-                eprintln!("pilot-http: {error}");
-            }
+    writeln!(io::stderr(), "ready")?;
+    for connection in listener.incoming() {
+        if let Err(error) = connection.and_then(|stream| {
+            println!("pilot-http: connection");
+            respond(stream)
+        }) {
+            println!("pilot-http: {error}");
         }
-    });
+    }
+    Ok(())
+}
 
-    // The listener is already bound when the Grunt announces readiness.
-    let status = Command::new("/horde")
-        .args(std::env::args_os().skip(1))
-        .status()?;
-    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+fn main() -> io::Result<()> {
+    let mut args = std::env::args_os().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "--serve-fixture") {
+        return serve_fixture();
+    }
+    let mut fixture = Command::new(std::env::current_exe()?)
+        .arg("--serve-fixture")
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut ready = String::new();
+    BufReader::new(fixture.stderr.take().expect("piped stderr")).read_line(&mut ready)?;
+    if ready.trim_end() != "ready" {
+        return Err(io::Error::other(format!("HTTP fixture failed: {ready}")));
+    }
+    // Replace the launcher so Docker delivers SIGTERM directly to the Grunt.
+    Err(Command::new("/horde").args(args).exec())
 }
