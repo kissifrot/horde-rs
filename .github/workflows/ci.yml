@@ -38,7 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
       - name: Build distributed release binary
         run: cargo build --release --locked --features distributed-transport
-      - name: Run Docker pilot with preflight, rotation, link failures and Grunt restart
+      - name: Run Docker pilot with source-IP filtering, rotation, link failures and Grunt restart
         timeout-minutes: 5
         run: python3 scripts/pilot-docker.py --output "$RUNNER_TEMP/pilot-docker-report.json"
       - name: Upload pilot report

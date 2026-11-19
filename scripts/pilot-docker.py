@@ -169,12 +169,12 @@ def pilot(binary):
         containers = []
         grunt_names = {}
 
-        def start(name, role, entrypoint, *args):
+        def start(name, role, entrypoint, *args, source_ip=None):
             container = f"{prefix}-{name}"
             containers.append(container)
             cleanup.callback(remove, "rm", "-f", container)
             docker("run", "-d", "--pull=never", "--name", container, "--label", LABEL,
-                   "--network", prefix, "--ip", peers[role], "--read-only", "--cap-drop", "ALL",
+                   "--network", prefix, "--ip", source_ip or peers[role], "--read-only", "--cap-drop", "ALL",
                    "--security-opt", "no-new-privileges", "--user", f"{os.getuid()}:{os.getgid()}",
                    "--mount", f"type=bind,source={work / role},destination=/identity,readonly",
                    "--entrypoint", entrypoint, image, *args)
@@ -247,10 +247,10 @@ def pilot(binary):
             remove("rm", container)
             return json.loads(result.stdout)
 
-        def preflight(name, leaf, roots, states, inventory_file="grunts.json"):
+        def preflight(name, leaf, roots, states, inventory_file="grunts.json", *, source_ip=None):
             before = target_connections()
             start(name, "controller", "/horde", "preflight",
-                  *controller_config(leaf, roots, inventory_file))
+                  *controller_config(leaf, roots, inventory_file), source_ip=source_ip)
             ready = all(status == "ready" for status in states)
             report = collect(name, 0 if ready else 1)
             require(report["type"] == "distributed_preflight" and report["ready"] is ready,
@@ -280,6 +280,17 @@ def pilot(binary):
             both_roots = ("old", "new")
             start_grunts("initial", ("old", "old"), ("old",), ("old",))
             checked = preflight("preflight", "old", ("old",), both_ready)
+            # Use the relay's reserved address before the relay starts. Keep the controller's TLS files.
+            unlisted_ip = peers["relay"]
+            source_denied = preflight("preflight-unlisted-source", "old", ("old",),
+                                      both_failed, source_ip=unlisted_ip)
+            for grunt in source_denied["report"]["grunts"]:
+                error = grunt["error"] or ""
+                require(grunt["epoch"] is None
+                        and (error == "tls handshake eof" or error.startswith("Connection reset by peer")),
+                        "Expected unlisted source to be disconnected before TLS hello", grunt)
+            print(f"Unlisted source {unlisted_ip} denied by both Grunts; no target connections.",
+                  flush=True)
             rejected = preflight("preflight-wrong-identity", "old", ("old",),
                                  ("ready", "failed"), "wrong-grunts.json")
             failed = rejected["report"]["grunts"][1]
@@ -421,7 +432,11 @@ def pilot(binary):
         return {
             "subnet": subnet,
             "roles": peers,
-            "preflight": {"nominal": checked, "wrong_identity": rejected},
+            "preflight": {
+                "nominal": checked,
+                "wrong_identity": rejected,
+                "unlisted_source": {"source_ip": unlisted_ip, **source_denied},
+            },
             "certificate_rotation": rotation,
             "nominal": {"controller_report": nominal, "requests_per_target": counts},
             "link_disconnect": {"controller_report": fault, "requests_per_target": after_drop},

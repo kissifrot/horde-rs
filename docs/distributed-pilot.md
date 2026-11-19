@@ -230,6 +230,11 @@ ports are published.
 - Preflight checks both Grunts, then repeats with an incorrect TLS identity
   for Grunt B. It must report A as ready and B as failed. Both loopback HTTP
   fixtures must observe zero connections in both cases.
+- The source IP check repeats the successful preflight with the same
+  controller certificate and inventory from an unlisted private Docker
+  IP. Both Grunts must close the control connection before the TLS
+  handshake completes. Neither Grunt sends a `hello` or reaches its HTTP
+  target. The JSON report records the source and both failures.
 - Rotation uses two CAs, an IP SAN and a DNS SAN. During overlap, both
   controller leaves must reach both Grunts, one with the new certificate
   and one with the old. Removing the old controller leaf must deny it
