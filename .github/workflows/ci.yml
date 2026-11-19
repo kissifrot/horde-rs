@@ -17,6 +17,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check benchmark server formatting
         run: rustfmt --edition 2024 --check benchmarks/server.rs
+      - name: Check pilot HTTP fixture formatting
+        run: rustfmt --edition 2024 --check scripts/pilot-http.rs
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
@@ -25,6 +27,26 @@ jobs:
       - name: Test benchmark tools
         timeout-minutes: 5
         run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
+  distributed-pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Build distributed release binary
+        run: cargo build --release --locked --features distributed-transport
+      - name: Run Docker pilot
+        timeout-minutes: 5
+        run: python3 scripts/pilot-docker.py --output "$RUNNER_TEMP/pilot-docker-report.json"
+      - name: Upload pilot report
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: horde-distributed-pilot
+          path: ${{ runner.temp }}/pilot-docker-report.json
+          if-no-files-found: error
   benchmark:
     runs-on: ubuntu-latest
     steps:

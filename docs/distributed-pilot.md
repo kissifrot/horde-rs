@@ -158,6 +158,41 @@ failures. This procedure has not been executed across hosts. Assigned
 private addresses, matching pilot certificates and network access are
 the operational prerequisites for doing so.
 
+## Single-host alternative using containers
+
+On Linux with a local Docker daemon, Rust, Python 3, OpenSSL and
+`ldd`, run:
+
+```sh
+cargo build --release --locked --features distributed-transport
+python3 scripts/pilot-docker.py
+```
+
+The script builds a temporary image from the local release binary and
+HTTP fixture. It allocates private IPs on an internal Docker network,
+issues fresh TLS certificates, and starts two Grunts and a controller.
+Each Grunt's HTTP fixture listens on its own loopback interface. No
+ports are published.
+
+- The nominal run checks 10 requests per Grunt, 20 successful responses,
+  40 body bytes and populated merged p95/p99.
+- The interruption run disconnects Grunt B from the Docker network
+  after its first HTTP request. It checks that B stops before spending
+  its 20-request share, A completes its own 20 requests, and the
+  controller reports B as missing with a partial result and an
+  unevaluable failure threshold.
+
+The script removes its containers, network, image and temporary
+credentials on exit, including on failure, SIGINT or SIGTERM. It writes
+the combined report to `target/pilot-docker-report.json` on success.
+Use `--output` to choose another location. The `distributed-pilot`
+GitHub Actions job runs the same script and uploads the JSON report
+as the `horde-distributed-pilot` artifact.
+
+This exercises separate IPs and TLS identities on a single kernel.
+Routing, firewalls and physical link detection remain checks for the
+multi-host pilot.
+
 ## Evidence before the pilot
 
 The Rust suite, Clippy and release build passed. On loopback, the
