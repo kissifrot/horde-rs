@@ -3,10 +3,7 @@ use reqwest::{
     Client, Method, Request, Response, StatusCode, Url,
     header::{self, HeaderValue},
 };
-use std::{
-    sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 pub(crate) fn referer(previous: &Url, next: &Url) -> Option<HeaderValue> {
     if previous.scheme() == "https" && next.scheme() == "http" {
@@ -46,7 +43,7 @@ pub(crate) async fn send(
     mut request: Request,
     limit: usize,
     timeout: Duration,
-    followed: Option<&AtomicUsize>,
+    followed: Option<&crate::counter::AtomicCounter>,
 ) -> Result<Response, RedirectError> {
     let started = Instant::now();
     let mut count = 0;
@@ -90,7 +87,7 @@ pub(crate) async fn send(
         }
         count += 1;
         if let Some(followed) = followed {
-            followed.fetch_add(1, Ordering::Relaxed);
+            followed.increment();
         }
         let previous = response.url();
         let headers = next_request.headers_mut();
@@ -128,5 +125,100 @@ pub(crate) async fn send(
         }
         *next_request.url_mut() = next;
         request = next_request;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::timeout,
+    };
+    use tokio_rustls::{
+        TlsAcceptor,
+        rustls::{
+            ServerConfig,
+            pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        },
+    };
+
+    #[tokio::test]
+    async fn https_to_http_redirect_drops_referer_and_credentials() {
+        let ca = include_bytes!("../tests/fixtures/tls/ca.der");
+        let certificate =
+            CertificateDer::from(include_bytes!("../tests/fixtures/tls/server.der").to_vec());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            include_bytes!("../tests/fixtures/tls/server-key.der").to_vec(),
+        ));
+        let config = ServerConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], key)
+        .unwrap();
+        let tls = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = tls.local_addr().unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = tls.accept().await.unwrap();
+            let mut stream = TlsAcceptor::from(Arc::new(config))
+                .accept(stream)
+                .await
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap().to_ascii_lowercase()
+        });
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(reqwest::Certificate::from_der(ca).unwrap())
+            .build()
+            .unwrap();
+        let request = client
+            .get(format!(
+                "https://localhost:{}/private?token=secret",
+                tls_addr.port()
+            ))
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header(header::COOKIE, "session=secret")
+            .header(header::REFERER, "https://localhost/private?token=secret")
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            send(&client, request, 1, Duration::from_secs(4), None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.starts_with("get /target "), "{request}");
+        assert!(!request.contains("referer:"), "{request}");
+        assert!(!request.contains("authorization:"), "{request}");
+        assert!(!request.contains("cookie:"), "{request}");
+        assert!(!request.contains("secret"), "{request}");
     }
 }

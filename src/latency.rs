@@ -11,6 +11,52 @@ pub struct BoundedLatency {
 }
 
 impl BoundedLatency {
+    #[cfg(feature = "distributed-offline")]
+    pub(crate) fn histogram(&self) -> &Histogram<u64> {
+        &self.histogram
+    }
+
+    #[cfg(feature = "distributed-offline")]
+    pub(crate) fn total_seconds(&self) -> f64 {
+        self.total_seconds
+    }
+
+    #[cfg(feature = "distributed-offline")]
+    pub(crate) fn from_validated(
+        histogram: Histogram<u64>,
+        min: Duration,
+        max: Duration,
+        total_seconds: f64,
+    ) -> Self {
+        Self {
+            histogram,
+            min,
+            max,
+            total_seconds,
+        }
+    }
+
+    #[cfg(feature = "distributed-offline")]
+    pub(crate) fn merge_checked(&mut self, other: &Self) -> Result<(), &'static str> {
+        let total_count = self
+            .len()
+            .checked_add(other.len())
+            .ok_or("histogram count overflow")?;
+        for entry in other.histogram.iter_recorded() {
+            self.histogram
+                .count_at(entry.value_iterated_to())
+                .checked_add(entry.count_at_value())
+                .ok_or("histogram bucket overflow")?;
+        }
+        let total_seconds = self.total_seconds + other.total_seconds;
+        if !total_seconds.is_finite()
+            || (total_count > 0 && !(total_seconds / total_count as f64 * 1000.0).is_finite())
+        {
+            return Err("histogram sum overflow");
+        }
+        self.merge(other)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             histogram: Histogram::new_with_bounds(1, u64::MAX, 3)

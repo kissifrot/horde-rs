@@ -1,3 +1,5 @@
+mod common;
+use common::CommandTimeout;
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
@@ -10,7 +12,7 @@ fn environment_values_expand_in_urls_headers_forms_and_assertions() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = common::accept(&listener);
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
@@ -59,7 +61,7 @@ fn environment_values_expand_in_urls_headers_forms_and_assertions() {
         .env("HORDE_TEST_ENV_BASE", format!("http://{address}"))
         .env("HORDE_TEST_ENV_USER", "user &+")
         .env("HORDE_TEST_ENV_SECRET", "secret-value")
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     server.join().unwrap();
@@ -88,7 +90,7 @@ fn missing_environment_variable_fails_before_requests() {
         .arg(&path)
         .args(["--json", "--verbose"])
         .env_remove("HORDE_TEST_ENV_MISSING")
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     assert!(!output.status.success());
@@ -119,7 +121,7 @@ fn non_utf8_environment_variable_is_rejected_without_its_value() {
             "HORDE_TEST_ENV_INVALID",
             std::ffi::OsString::from_vec(b"sensitive\xff".to_vec()),
         )
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     assert!(!output.status.success());

@@ -1,8 +1,13 @@
 //! Local load generation and reporting, independent of the command-line interface.
+mod cancellation;
+mod counter;
+#[cfg(feature = "distributed-offline")]
+pub mod distributed;
 mod latency;
 mod redirect;
 pub mod scenario;
 use bytes::Bytes;
+pub use cancellation::Cancellation;
 use futures_util::StreamExt;
 pub use latency::BoundedLatency;
 use reqwest::{
@@ -85,6 +90,7 @@ struct WorkerReport {
     latencies: Vec<Duration>,
     bounded_latencies: Option<BoundedLatency>,
     latency_overflow: bool,
+    bytes_overflow: bool,
 }
 
 impl Report {
@@ -177,8 +183,61 @@ impl LatencyStats {
     }
 }
 
+// Avoid a heap allocation for every successful standalone run.
+#[allow(clippy::large_enum_variant)]
+enum RunOutcome {
+    Standalone(Report),
+    Cancelled,
+    #[cfg(feature = "distributed-offline")]
+    OfflineComplete {
+        report: Report,
+        reason: distributed::StopReason,
+        started: u64,
+    },
+    #[cfg(feature = "distributed-offline")]
+    OfflinePartial(distributed::StopReason),
+}
+
 /// Run a plan locally. No listener or remote execution capability is started.
-pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(plan: TestPlan) -> Result<Report, Box<dyn std::error::Error + Send + Sync>> {
+    match run_impl(
+        plan,
+        #[cfg(feature = "distributed-offline")]
+        None,
+        None,
+    )
+    .await?
+    {
+        RunOutcome::Standalone(report) => Ok(report),
+        _ => Err("unexpected offline outcome".into()),
+    }
+}
+
+/// Return `None` after cancelling and joining all local request workers.
+pub async fn run_with_cancellation(
+    plan: TestPlan,
+    cancel: Cancellation,
+) -> Result<Option<Report>, Box<dyn std::error::Error + Send + Sync>> {
+    match run_impl(
+        plan,
+        #[cfg(feature = "distributed-offline")]
+        None,
+        Some(cancel),
+    )
+    .await?
+    {
+        RunOutcome::Standalone(report) => Ok(Some(report)),
+        RunOutcome::Cancelled => Ok(None),
+        #[cfg(feature = "distributed-offline")]
+        _ => Err("unexpected offline outcome".into()),
+    }
+}
+
+async fn run_impl(
+    mut plan: TestPlan,
+    #[cfg(feature = "distributed-offline")] mut control: Option<distributed::LocalControl>,
+    local_cancel: Option<Cancellation>,
+) -> Result<RunOutcome, Box<dyn std::error::Error + Send + Sync>> {
     if plan.requests == 0 || plan.concurrency == 0 || plan.timeout.is_zero() {
         return Err("requests, concurrency and timeout must be greater than zero".into());
     }
@@ -197,8 +256,14 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
     if !matches!(plan.url.scheme(), "http" | "https") {
         return Err("URL must use http or https".into());
     }
-    let redirects_followed = Arc::new(AtomicUsize::new(0));
-    let connections_opened = Arc::new(AtomicUsize::new(0));
+    if local_cancel
+        .as_ref()
+        .is_some_and(Cancellation::is_cancelled)
+    {
+        return Ok(RunOutcome::Cancelled);
+    }
+    let redirects_followed = Arc::new(counter::AtomicCounter::default());
+    let connections_opened = Arc::new(counter::AtomicCounter::default());
     if !plan.reuse_connections {
         plan.headers
             .insert(CONNECTION, HeaderValue::from_static("close"));
@@ -209,7 +274,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
         .timeout(plan.timeout)
         .redirect(reqwest::redirect::Policy::none())
         .connector_layer(tower::util::MapResponseLayer::new(move |connection| {
-            connection_counter.fetch_add(1, Ordering::Relaxed);
+            connection_counter.increment();
             connection
         }));
     if !plan.reuse_connections {
@@ -218,9 +283,47 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
     let client = builder.build()?;
     let next = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
+    #[cfg(feature = "distributed-offline")]
+    let gate = match &control {
+        Some(options) => Some(Arc::new(Mutex::new(distributed::StartGate::new(
+            options.budget,
+            options.limits,
+            start,
+        )?))),
+        None => None,
+    };
+    #[cfg(feature = "distributed-offline")]
+    if control
+        .as_ref()
+        .is_some_and(|options| *options.cancel.borrow())
+    {
+        return Ok(RunOutcome::OfflinePartial(
+            distributed::StopReason::Cancelled,
+        ));
+    }
+    #[cfg(feature = "distributed-offline")]
+    let stop_signal = gate.as_ref().map(|_| tokio::sync::watch::channel(false));
     let next_start = Arc::new(Mutex::new(start));
     let mut workers = tokio::task::JoinSet::new();
+    let mut local_cancel_rx = local_cancel.as_ref().map(Cancellation::subscribe);
     for worker_id in 1..=plan.concurrency.min(plan.requests) {
+        if local_cancel
+            .as_ref()
+            .is_some_and(Cancellation::is_cancelled)
+        {
+            workers.abort_all();
+            while workers.join_next().await.is_some() {}
+            return Ok(RunOutcome::Cancelled);
+        }
+        let worker_local_cancel = local_cancel.clone();
+        #[cfg(feature = "distributed-offline")]
+        let worker_gate = gate.clone();
+        #[cfg(feature = "distributed-offline")]
+        let worker_cancel = control.as_ref().map(|options| options.cancel.clone());
+        #[cfg(feature = "distributed-offline")]
+        let worker_stop_tx = stop_signal.as_ref().map(|(tx, _)| tx.clone());
+        #[cfg(feature = "distributed-offline")]
+        let mut worker_stop_rx = stop_signal.as_ref().map(|(_, rx)| rx.clone());
         let redirects_followed = Arc::clone(&redirects_followed);
         let (client, plan, next, next_start) = (
             client.clone(),
@@ -259,12 +362,39 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                     {
                         break;
                     }
+                    #[cfg(feature = "distributed-offline")]
+                    if let Some(stop) = &mut worker_stop_rx {
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_cancel(stop) => break,
+                            _ = tokio::time::sleep_until(scheduled.into()) => {}
+                        }
+                    } else { tokio::time::sleep_until(scheduled.into()).await; }
+                    #[cfg(not(feature = "distributed-offline"))]
                     tokio::time::sleep_until(scheduled.into()).await;
                     if plan
                         .duration
                         .is_some_and(|duration| start.elapsed() >= duration)
                     {
                         break;
+                    }
+                }
+                if worker_local_cancel.as_ref().is_some_and(Cancellation::is_cancelled) { break; }
+                #[cfg(feature = "distributed-offline")]
+                if let Some(gate) = &worker_gate {
+                    let mut state = gate.lock().map_err(|_| "start gate poisoned")?;
+                    if worker_cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+                        state.cancel(Instant::now())?;
+                        break;
+                    }
+                    let decision = state.try_start(Instant::now())?;
+                    match decision {
+                        distributed::StartDecision::Start => {}
+                        distributed::StartDecision::Stopped(_) => {
+                            if let Some(tx) = &worker_stop_tx { tx.send_replace(true); }
+                            break;
+                        }
+                        distributed::StartDecision::AtConcurrency => return Err("agent concurrency invariant violated".into()),
                     }
                 }
                 let started = Instant::now();
@@ -304,7 +434,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                         let mut body = response.bytes_stream();
                         while let Some(chunk) = body.next().await {
                             match chunk {
-                                Ok(chunk) => bytes = bytes.saturating_add(chunk.len() as u64),
+                                Ok(chunk) => counter::add_bytes(&mut bytes, chunk.len() as u64, &mut results.bytes_overflow),
                                 Err(error) => {
                                     failed = true;
                                     body_failure = true;
@@ -348,7 +478,7 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                 results.body_failures += usize::from(body_failure);
                 results.other_failures += usize::from(other_failure);
                 results.redirect_limit_failures += usize::from(redirect_limit_failure);
-                results.bytes = results.bytes.saturating_add(bytes);
+                counter::add_bytes(&mut results.bytes, bytes, &mut results.bytes_overflow);
                 if let Some(code) = status_code {
                     *results.status_codes.entry(code).or_default() += 1;
                 }
@@ -360,8 +490,12 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
                 } else {
                     results.latencies.push(latency);
                 }
+                #[cfg(feature = "distributed-offline")]
+                if let Some(gate) = &worker_gate {
+                    gate.lock().map_err(|_| "start gate poisoned")?.complete_at(Instant::now())?;
+                }
             }
-            results
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results)
         });
     }
     let mut report = Report {
@@ -381,9 +515,97 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
         latencies: Vec::new(),
         bounded_latencies: None,
     };
-    while let Some(worker) = workers.join_next().await {
-        let worker = worker?;
+    loop {
+        let worker = if let Some(cancel) = &mut local_cancel_rx {
+            tokio::select! {
+                biased;
+                _ = wait_for_cancel(cancel) => {
+                    workers.abort_all();
+                    while workers.join_next().await.is_some() {}
+                    return Ok(RunOutcome::Cancelled);
+                }
+                next = workers.join_next() => next,
+            }
+        } else {
+            #[cfg(feature = "distributed-offline")]
+            let worker = if let (Some(options), Some(gate)) = (&mut control, &gate) {
+                let deadline = start
+                    .checked_add(options.limits.max_duration)
+                    .ok_or("deadline out of range")?;
+                tokio::select! {
+                    biased;
+                    _ = wait_for_cancel(&mut options.cancel) => {
+                        let reason = {
+                            let mut state = gate.lock().map_err(|_| "start gate poisoned")?;
+                            state.cancel(Instant::now())?;
+                            state.stop_reason().unwrap_or(distributed::StopReason::Cancelled)
+                        };
+                        if reason.is_partial() {
+                            workers.abort_all();
+                            while workers.join_next().await.is_some() {}
+                            return Ok(RunOutcome::OfflinePartial(reason));
+                        }
+                        workers.join_next().await
+                    }
+                    _ = tokio::time::sleep_until(deadline.into()) => {
+                        let reason = {
+                            let mut state = gate.lock().map_err(|_| "start gate poisoned")?;
+                            state.observe(Instant::now())?;
+                            state.stop_reason().unwrap_or(distributed::StopReason::AgentDeadline)
+                        };
+                        if reason.is_partial() {
+                            workers.abort_all();
+                            while workers.join_next().await.is_some() {}
+                            return Ok(RunOutcome::OfflinePartial(reason));
+                        }
+                        workers.join_next().await
+                    }
+                    next = workers.join_next() => next,
+                }
+            } else {
+                workers.join_next().await
+            };
+            #[cfg(not(feature = "distributed-offline"))]
+            let worker = workers.join_next().await;
+            worker
+        };
+        let Some(worker) = worker else {
+            break;
+        };
+        #[cfg(feature = "distributed-offline")]
+        let worker = match worker {
+            Ok(Ok(worker)) => worker,
+            Ok(Err(error)) => {
+                if control.is_some() {
+                    workers.abort_all();
+                    while workers.join_next().await.is_some() {}
+                }
+                return Err(error);
+            }
+            Err(error) => {
+                if control.is_some() {
+                    workers.abort_all();
+                    while workers.join_next().await.is_some() {}
+                }
+                return Err(error.into());
+            }
+        };
+        #[cfg(not(feature = "distributed-offline"))]
+        let worker = worker??;
+        if worker.bytes_overflow {
+            #[cfg(feature = "distributed-offline")]
+            if control.is_some() {
+                workers.abort_all();
+                while workers.join_next().await.is_some() {}
+            }
+            return Err("response byte counter overflow".into());
+        }
         if worker.latency_overflow {
+            #[cfg(feature = "distributed-offline")]
+            if control.is_some() {
+                workers.abort_all();
+                while workers.join_next().await.is_some() {}
+            }
             return Err("latency exceeds bounded histogram range or capacity".into());
         }
         report.completed += worker.completed;
@@ -394,7 +616,17 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
         report.body_failures += worker.body_failures;
         report.other_failures += worker.other_failures;
         report.redirect_limit_failures += worker.redirect_limit_failures;
-        report.bytes = report.bytes.saturating_add(worker.bytes);
+        report.bytes = match report.bytes.checked_add(worker.bytes) {
+            Some(bytes) => bytes,
+            None => {
+                #[cfg(feature = "distributed-offline")]
+                if control.is_some() {
+                    workers.abort_all();
+                    while workers.join_next().await.is_some() {}
+                }
+                return Err("response byte counter overflow".into());
+            }
+        };
         for (code, count) in worker.status_codes {
             *report.status_codes.entry(code).or_default() += count;
         }
@@ -405,16 +637,79 @@ pub async fn run(mut plan: TestPlan) -> Result<Report, Box<dyn std::error::Error
         }
         if let Some(histogram) = worker.bounded_latencies {
             if let Some(current) = &mut report.bounded_latencies {
-                current.merge(&histogram)?;
+                if let Err(error) = current.merge(&histogram) {
+                    #[cfg(feature = "distributed-offline")]
+                    if control.is_some() {
+                        workers.abort_all();
+                        while workers.join_next().await.is_some() {}
+                    }
+                    return Err(error.into());
+                }
             } else {
                 report.bounded_latencies = Some(histogram);
             }
         }
     }
+    if local_cancel
+        .as_ref()
+        .is_some_and(Cancellation::is_cancelled)
+    {
+        return Ok(RunOutcome::Cancelled);
+    }
     report.elapsed = start.elapsed();
-    report.redirects_followed = redirects_followed.load(Ordering::Relaxed);
-    report.connections_opened = connections_opened.load(Ordering::Relaxed);
-    Ok(report)
+    report.redirects_followed = redirects_followed
+        .get()
+        .ok_or("redirect counter overflow")?;
+    report.connections_opened = connections_opened
+        .get()
+        .ok_or("connection counter overflow")?;
+    #[cfg(feature = "distributed-offline")]
+    if let (Some(options), Some(gate)) = (&mut control, &gate) {
+        // A rate slot beyond the window can leave all workers finished before W.
+        let awaiting_stop = {
+            gate.lock()
+                .map_err(|_| "start gate poisoned")?
+                .outcome()
+                .is_none()
+        };
+        if awaiting_stop && let Some(duration) = options.budget.duration {
+            let end = start.checked_add(duration).ok_or("duration out of range")?;
+            tokio::select! {
+                biased;
+                _ = wait_for_cancel(&mut options.cancel) => { gate.lock().map_err(|_| "start gate poisoned")?.cancel(Instant::now())?; }
+                _ = tokio::time::sleep_until(end.into()) => { gate.lock().map_err(|_| "start gate poisoned")?.observe(Instant::now())?; }
+            }
+        }
+        let mut state = gate.lock().map_err(|_| "start gate poisoned")?;
+        state.observe(Instant::now())?;
+        let reason = state
+            .outcome()
+            .ok_or("agent run ended without a terminal reason")?;
+        if reason.is_partial() {
+            return Ok(RunOutcome::OfflinePartial(reason));
+        }
+        if state.started() != report.completed as u64 {
+            return Err("agent request counts disagree".into());
+        }
+        report.elapsed = start.elapsed();
+        return Ok(RunOutcome::OfflineComplete {
+            report,
+            reason,
+            started: state.started(),
+        });
+    }
+    Ok(RunOutcome::Standalone(report))
+}
+
+pub(crate) async fn wait_for_cancel(cancel: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *cancel.borrow_and_update() {
+            return;
+        }
+        if cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 #[cfg(test)]

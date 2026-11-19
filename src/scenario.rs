@@ -1183,6 +1183,31 @@ pub async fn run_scenario_config(
     timeout: Duration,
     options: ScenarioOptions,
 ) -> Result<ScenarioReport, RunError> {
+    run_scenario_impl(scenario, iterations, users, timeout, options, None)
+        .await?
+        .ok_or_else(|| "unexpected scenario cancellation".into())
+}
+
+/// Return `None` after cancelling and joining all scenario workers.
+pub async fn run_scenario_with_cancellation(
+    scenario: Scenario,
+    iterations: usize,
+    users: usize,
+    timeout: Duration,
+    options: ScenarioOptions,
+    cancel: crate::Cancellation,
+) -> Result<Option<ScenarioReport>, RunError> {
+    run_scenario_impl(scenario, iterations, users, timeout, options, Some(cancel)).await
+}
+
+async fn run_scenario_impl(
+    scenario: Scenario,
+    iterations: usize,
+    users: usize,
+    timeout: Duration,
+    options: ScenarioOptions,
+    cancel: Option<crate::Cancellation>,
+) -> Result<Option<ScenarioReport>, RunError> {
     let ScenarioOptions {
         verbose,
         max_redirects,
@@ -1204,6 +1229,12 @@ pub async fn run_scenario_config(
     if rate.is_some_and(|rate| !(1..=1_000_000_000).contains(&rate)) {
         return Err("rate must be between 1 and 1000000000 iterations per second".into());
     }
+    if cancel
+        .as_ref()
+        .is_some_and(crate::Cancellation::is_cancelled)
+    {
+        return Ok(None);
+    }
     let user_agent = reqwest::header::HeaderValue::from_str(
         user_agent
             .as_deref()
@@ -1212,9 +1243,19 @@ pub async fn run_scenario_config(
     let scenario = Arc::new(scenario);
     let next = Arc::new(AtomicUsize::new(0));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut cancel_rx = cancel.as_ref().map(crate::Cancellation::subscribe);
     let started = Instant::now();
     let next_start = rate.map(|_| Arc::new(Mutex::new(started)));
     for user_id in 1..=users.min(iterations) {
+        if cancel
+            .as_ref()
+            .is_some_and(crate::Cancellation::is_cancelled)
+        {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            return Ok(None);
+        }
+        let worker_cancel = cancel.clone();
         let scenario = Arc::clone(&scenario);
         let next = Arc::clone(&next);
         let next_start = next_start.clone();
@@ -1233,6 +1274,7 @@ pub async fn run_scenario_config(
             while let Ok(index) = next.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                     (n < iterations).then(|| n + 1)
                 }) {
+                if worker_cancel.as_ref().is_some_and(crate::Cancellation::is_cancelled) { break; }
                 let iteration = index + 1;
                 if let (Some(rate), Some(next_start)) = (rate, &next_start) {
                     let scheduled = {
@@ -1267,6 +1309,7 @@ pub async fn run_scenario_config(
                         }
                         tokio::time::sleep(step.wait).await;
                     }
+                    if worker_cancel.as_ref().is_some_and(crate::Cancellation::is_cancelled) { run_failed = true; break; }
                     if verbose {
                         use std::io::Write;
                         let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} started", started.elapsed().as_secs_f64(), step.name);
@@ -1434,7 +1477,23 @@ pub async fn run_scenario_config(
     };
     let mut first_start: Option<Instant> = None;
     let mut last_start: Option<Instant> = None;
-    while let Some(task) = tasks.join_next().await {
+    loop {
+        let task = if let Some(signal) = &mut cancel_rx {
+            tokio::select! {
+                biased;
+                _ = crate::wait_for_cancel(signal) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Ok(None);
+                }
+                next = tasks.join_next() => next,
+            }
+        } else {
+            tasks.join_next().await
+        };
+        let Some(task) = task else {
+            break;
+        };
         let (totals, steps, worker_first, worker_last) = task?;
         if let Some(first) = worker_first {
             first_start = Some(first_start.map_or(first, |current| current.min(first)));
@@ -1447,6 +1506,12 @@ pub async fn run_scenario_config(
             aggregate.merge(step)?;
         }
     }
+    if cancel
+        .as_ref()
+        .is_some_and(crate::Cancellation::is_cancelled)
+    {
+        return Ok(None);
+    }
     report.elapsed = started.elapsed();
     report.starts = measure_starts(
         report.scenarios.completed,
@@ -1455,5 +1520,5 @@ pub async fn run_scenario_config(
         first_start,
         last_start,
     );
-    Ok(report)
+    Ok(Some(report))
 }

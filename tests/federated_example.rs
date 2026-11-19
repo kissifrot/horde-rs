@@ -1,3 +1,5 @@
+mod common;
+use common::CommandTimeout;
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
@@ -69,7 +71,7 @@ fn federated_example_redirects_and_requires_correct_credentials() {
         if follow {
             command.arg("-L");
         }
-        let output = command.output().unwrap();
+        let output = command.output_timeout().unwrap();
         assert!(
             output.status.success(),
             "{}",

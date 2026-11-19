@@ -17,3 +17,6 @@ target
 rustc-ice-*.txt
 
 benchmarks/__pycache__/
+# Generated cargo-fuzz findings; committed seed inputs remain tracked.
+fuzz/artifacts/
+fuzz/coverage/

@@ -1,3 +1,5 @@
+mod common;
+use common::CommandTimeout;
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -12,14 +14,14 @@ fn standalone_redirect_restricts_referer_and_sensitive_headers() {
     let site_addr = site.local_addr().unwrap();
     let target_addr = target.local_addr().unwrap();
     let site_server = thread::spawn(move || {
-        let (mut stream, _) = site.accept().unwrap();
+        let (mut stream, _) = common::accept(&site);
         let mut buffer = [0; 4096];
         let n = stream.read(&mut buffer).unwrap();
         assert!(String::from_utf8_lossy(&buffer[..n]).contains("secret=private"));
         write!(stream, "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
     });
     let target_server = thread::spawn(move || {
-        let (mut stream, _) = target.accept().unwrap();
+        let (mut stream, _) = common::accept(&target);
         let mut buffer = [0; 4096];
         let n = stream.read(&mut buffer).unwrap();
         let request = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
@@ -48,7 +50,7 @@ fn standalone_redirect_restricts_referer_and_sensitive_headers() {
             "Cookie: secret=private",
         ])
         .arg(format!("http://{site_addr}/private?secret=private"))
-        .output()
+        .output_timeout()
         .unwrap();
     site_server.join().unwrap();
     target_server.join().unwrap();
@@ -64,12 +66,12 @@ fn redirect_chain_uses_one_timeout_including_final_body() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
+        let (mut first, _) = common::accept(&listener);
         let mut buffer = [0; 4096];
         assert!(first.read(&mut buffer).unwrap() > 0);
         thread::sleep(std::time::Duration::from_millis(600));
         write!(first, "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-        let (mut second, _) = listener.accept().unwrap();
+        let (mut second, _) = common::accept(&listener);
         assert!(second.read(&mut buffer).unwrap() > 0);
         write!(
             second,
@@ -82,7 +84,7 @@ fn redirect_chain_uses_one_timeout_including_final_body() {
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .args(["-L", "--json", "-t", "1"])
         .arg(format!("http://{addr}/start"))
-        .output()
+        .output_timeout()
         .unwrap();
     server.join().unwrap();
     assert!(output.status.success());
@@ -99,11 +101,11 @@ fn post_redirects_switch_to_get_and_remove_body_headers() {
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let mut buffer = [0; 4096];
-            let (mut first, _) = listener.accept().unwrap();
+            let (mut first, _) = common::accept(&listener);
             let n = first.read(&mut buffer).unwrap();
             assert!(String::from_utf8_lossy(&buffer[..n]).starts_with("POST "));
             write!(first, "HTTP/1.1 {status} Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-            let (mut second, _) = listener.accept().unwrap();
+            let (mut second, _) = common::accept(&listener);
             let n = second.read(&mut buffer).unwrap();
             let request = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
             assert!(request.starts_with("get /next "), "{request}");
@@ -134,7 +136,7 @@ fn post_redirects_switch_to_get_and_remove_body_headers() {
             ])
             .arg(&body)
             .arg(format!("http://{addr}/"))
-            .output()
+            .output_timeout()
             .unwrap();
         std::fs::remove_file(body).unwrap();
         server.join().unwrap();
@@ -151,7 +153,7 @@ fn auto_referer_uses_final_redirect_url_and_respects_explicit_header() {
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         for index in 0..4 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut buffer = [0; 4096];
             let count = stream.read(&mut buffer).unwrap();
             let request = String::from_utf8_lossy(&buffer[..count]).to_ascii_lowercase();
@@ -210,7 +212,7 @@ fn auto_referer_uses_final_redirect_url_and_respects_explicit_header() {
         .arg("--scenario")
         .arg(&path)
         .args(["--auto-referer", "-L", "--json"])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     server.join().unwrap();
@@ -228,7 +230,7 @@ fn scenario_redirects_are_not_followed_by_default() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = common::accept(&listener);
         let mut buffer = [0; 4096];
         assert!(stream.read(&mut buffer).unwrap() > 0);
         write!(stream, "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
@@ -242,7 +244,7 @@ fn scenario_redirects_are_not_followed_by_default() {
         .arg("--scenario")
         .arg(&path)
         .args(["--json", "-v"])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     server.join().unwrap();
@@ -259,11 +261,11 @@ fn scenario_follows_redirects_across_site_and_authentication_server() {
     let site_addr = site.local_addr().unwrap();
     let auth_port = auth.local_addr().unwrap().port();
     let site_server = thread::spawn(move || {
-        let (mut first, _) = site.accept().unwrap();
+        let (mut first, _) = common::accept(&site);
         let mut buffer = [0; 4096];
         assert!(first.read(&mut buffer).unwrap() > 0);
         write!(first, "HTTP/1.1 302 Found\r\nLocation: http://localhost:{auth_port}/authorize\r\nSet-Cookie: site_session=site; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-        let (mut callback, _) = site.accept().unwrap();
+        let (mut callback, _) = common::accept(&site);
         let read = callback.read(&mut buffer).unwrap();
         let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
         assert!(request.starts_with("get /callback "), "{request}");
@@ -280,7 +282,7 @@ fn scenario_follows_redirects_across_site_and_authentication_server() {
         .unwrap();
     });
     let auth_server = thread::spawn(move || {
-        let (mut stream, _) = auth.accept().unwrap();
+        let (mut stream, _) = common::accept(&auth);
         let mut buffer = [0; 4096];
         let read = stream.read(&mut buffer).unwrap();
         let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
@@ -303,7 +305,7 @@ fn scenario_follows_redirects_across_site_and_authentication_server() {
         .arg("--scenario")
         .arg(&path)
         .args(["-L", "--json", "-v"])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     site_server.join().unwrap();
@@ -325,7 +327,7 @@ fn scenario_redirect_limit_fails_the_step() {
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut buffer = [0; 4096];
             assert!(stream.read(&mut buffer).unwrap() > 0);
             write!(stream, "HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
@@ -341,7 +343,7 @@ fn scenario_redirect_limit_fails_the_step() {
         .arg("--scenario")
         .arg(&path)
         .args(["-L", "--max-redirects", "1", "--json", "-v"])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     server.join().unwrap();

@@ -1,3 +1,5 @@
+mod common;
+use common::CommandTimeout;
 use std::{path::Path, process::Command};
 
 fn run(path: &Path, content: &str) -> String {
@@ -5,7 +7,7 @@ fn run(path: &Path, content: &str) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .arg("--scenario")
         .arg(path)
-        .output()
+        .output_timeout()
         .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
@@ -79,7 +81,7 @@ fn diagnostics_identify_file_schema_and_semantic_errors_without_values() {
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .arg("--scenario")
         .arg(&path)
-        .output()
+        .output_timeout()
         .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
@@ -120,7 +122,7 @@ fn verbose_extraction_diagnostics_do_not_expose_response_values() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut request = [0; 4096];
             assert!(stream.read(&mut request).unwrap() > 0);
             write!(
@@ -142,7 +144,7 @@ fn verbose_extraction_diagnostics_do_not_expose_response_values() {
             .arg("--scenario")
             .arg(&path)
             .args(["--json", "--verbose"])
-            .output()
+            .output_timeout()
             .unwrap();
         std::fs::remove_file(path).unwrap();
         server.join().unwrap();

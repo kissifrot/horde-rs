@@ -20,8 +20,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
+        timeout-minutes: 5
         run: cargo test --all-targets --all-features
       - name: Test benchmark tools
+        timeout-minutes: 5
         run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
   benchmark:
     runs-on: ubuntu-latest

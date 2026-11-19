@@ -1,3 +1,5 @@
+mod common;
+use common::CommandTimeout;
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -11,7 +13,7 @@ fn cli_runs_requests_and_reports_http_errors() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         for index in 0..4 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut request = [0; 4096];
             let read = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..read]);
@@ -39,7 +41,7 @@ fn cli_runs_requests_and_reports_http_errors() {
             "X-Horde: zug-zug",
             &format!("http://{address}/test"),
         ])
-        .output()
+        .output_timeout()
         .unwrap();
     server.join().unwrap();
     assert!(
@@ -74,7 +76,7 @@ fn reports_status_even_when_body_is_incomplete() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = common::accept(&listener);
         let mut request = [0; 4096];
         assert!(stream.read(&mut request).unwrap() > 0);
         write!(
@@ -85,7 +87,7 @@ fn reports_status_even_when_body_is_incomplete() {
     });
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .arg(format!("http://{address}/"))
-        .output()
+        .output_timeout()
         .unwrap();
     server.join().unwrap();
     assert!(output.status.success());
@@ -99,7 +101,7 @@ fn verbose_success_has_relative_timestamps_and_no_error_field() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = common::accept(&listener);
         let mut request = [0; 4096];
         assert!(stream.read(&mut request).unwrap() > 0);
         write!(
@@ -110,7 +112,7 @@ fn verbose_success_has_relative_timestamps_and_no_error_field() {
     });
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .args(["--verbose", "--json", &format!("http://{address}/")])
-        .output()
+        .output_timeout()
         .unwrap();
     server.join().unwrap();
     assert!(output.status.success());
@@ -130,7 +132,7 @@ fn verbose_success_has_relative_timestamps_and_no_error_field() {
 fn rejects_invalid_options() {
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .args(["-n", "0", "http://localhost/"])
-        .output()
+        .output_timeout()
         .unwrap();
     assert!(!output.status.success());
     for args in [
@@ -146,7 +148,7 @@ fn rejects_invalid_options() {
         assert!(
             !Command::new(env!("CARGO_BIN_EXE_horde"))
                 .args(args)
-                .output()
+                .output_timeout()
                 .unwrap()
                 .status
                 .success()
@@ -165,7 +167,7 @@ fn ci_thresholds_report_results_and_exit_status() {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             for status in ["200 OK", "500 Error"] {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = common::accept(&listener);
                 let mut request = [0; 4096];
                 assert!(stream.read(&mut request).unwrap() > 0);
                 write!(
@@ -186,7 +188,7 @@ fn ci_thresholds_report_results_and_exit_status() {
                 p95_limit,
                 &format!("http://{address}/"),
             ])
-            .output()
+            .output_timeout()
             .unwrap();
         server.join().unwrap();
         assert_eq!(output.status.success(), success);
@@ -212,7 +214,7 @@ fn bounded_latency_reports_method_and_checks_p95() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         for _ in 0..4 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut request = [0; 4096];
             assert!(stream.read(&mut request).unwrap() > 0);
             write!(
@@ -234,7 +236,7 @@ fn bounded_latency_reports_method_and_checks_p95() {
             "--json",
             &format!("http://{address}/"),
         ])
-        .output()
+        .output_timeout()
         .unwrap();
     server.join().unwrap();
     assert_eq!(output.status.code(), Some(2));
@@ -257,16 +259,19 @@ fn rate_is_shared_across_workers() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
+        let mut arrivals = Vec::new();
         for _ in 0..4 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut request = [0; 4096];
             assert!(stream.read(&mut request).unwrap() > 0);
+            arrivals.push(std::time::Instant::now());
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
         }
+        arrivals
     });
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .args([
@@ -279,13 +284,21 @@ fn rate_is_shared_across_workers() {
             "--json",
             &format!("http://{address}/"),
         ])
-        .output()
+        .output_timeout()
         .unwrap();
-    server.join().unwrap();
+    let arrivals = server.join().unwrap();
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["completed"], 4);
-    assert!(report["elapsed_seconds"].as_f64().unwrap() >= 0.55);
+    let span = arrivals[3].duration_since(arrivals[0]);
+    assert!(
+        span >= std::time::Duration::from_millis(500),
+        "requests arrived too quickly: {arrivals:?}"
+    );
+    assert!(
+        span < std::time::Duration::from_secs(3),
+        "requests arrived too slowly: {arrivals:?}"
+    );
 }
 
 #[test]
@@ -298,7 +311,7 @@ fn connection_reuse_can_be_disabled_and_connections_are_counted() {
             let mut requests = 0;
             let mut connections = 0;
             while requests < 2 {
-                let (stream, _) = listener.accept().unwrap();
+                let (stream, _) = common::accept(&listener);
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
@@ -333,7 +346,10 @@ fn connection_reuse_can_be_disabled_and_connections_are_counted() {
         if !reuse {
             command.arg("--no-connection-reuse");
         }
-        let output = command.arg(format!("http://{address}/")).output().unwrap();
+        let output = command
+            .arg(format!("http://{address}/"))
+            .output_timeout()
+            .unwrap();
         let actual = server.join().unwrap();
         assert!(output.status.success());
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -356,7 +372,7 @@ fn user_agent_can_be_set_and_overrides_header_option() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut request = [0; 4096];
             let read = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..read]);
@@ -378,7 +394,7 @@ fn user_agent_can_be_set_and_overrides_header_option() {
         let output = Command::new(env!("CARGO_BIN_EXE_horde"))
             .args(args)
             .arg(format!("http://{address}/"))
-            .output()
+            .output_timeout()
             .unwrap();
         server.join().unwrap();
         assert!(output.status.success());
@@ -391,7 +407,7 @@ fn requests_preserve_credentials_and_repeated_headers() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut request = [0; 4096];
             let n = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
@@ -421,7 +437,7 @@ fn requests_preserve_credentials_and_repeated_headers() {
             "X-Test: two",
             &format!("http://user:pass@{address}/"),
         ])
-        .output()
+        .output_timeout()
         .unwrap();
     server.join().unwrap();
     assert!(output.status.success());
@@ -462,7 +478,7 @@ fn redirects_are_opt_in_and_bounded() {
                 1
             };
             for index in 0..requests {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = common::accept(&listener);
                 let mut request = [0; 4096];
                 assert!(stream.read(&mut request).unwrap() > 0);
                 if index < redirects {
@@ -483,7 +499,10 @@ fn redirects_are_opt_in_and_bounded() {
         if let Some(limit) = limit {
             command.args(["--max-redirects", &limit.to_string()]);
         }
-        let output = command.arg(format!("http://{address}/")).output().unwrap();
+        let output = command
+            .arg(format!("http://{address}/"))
+            .output_timeout()
+            .unwrap();
         server.join().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).unwrap();
@@ -512,16 +531,16 @@ fn reports_redirects_before_a_transport_failure() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = common::accept(&listener);
         let mut request = [0; 4096];
         assert!(stream.read(&mut request).unwrap() > 0);
         write!(stream, "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = common::accept(&listener);
         assert!(stream.read(&mut request).unwrap() > 0);
     });
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .args(["-L", &format!("http://{address}/")])
-        .output()
+        .output_timeout()
         .unwrap();
     server.join().unwrap();
     assert!(output.status.success());
@@ -537,7 +556,7 @@ fn json_report_and_request_body_survive_redirect() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         for index in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut request = Vec::new();
             let mut buffer = [0; 1024];
             loop {
@@ -571,7 +590,7 @@ fn json_report_and_request_body_survive_redirect() {
         .args(["-L", "-v", "-X", "POST", "--json", "--body-file"])
         .arg(&path)
         .arg(format!("http://{address}/"))
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     server.join().unwrap();
@@ -611,6 +630,12 @@ fn duration_stops_new_requests_and_finishes_in_flight() {
         while !done.load(std::sync::atomic::Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
                     let mut request = [0; 4096];
                     assert!(stream.read(&mut request).unwrap() > 0);
                     thread::sleep(std::time::Duration::from_millis(600));
@@ -629,7 +654,7 @@ fn duration_stops_new_requests_and_finishes_in_flight() {
     });
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .args(["--duration", "1", "--json", &format!("http://{address}/")])
-        .output()
+        .output_timeout()
         .unwrap();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     server.join().unwrap();

@@ -1,3 +1,5 @@
+mod common;
+use common::CommandTimeout;
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -16,12 +18,27 @@ fn scenario_rate_is_global_and_respects_duration_and_iteration_limits() {
     let address = listener.local_addr().unwrap();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done = Arc::clone(&stop);
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let server_arrivals = Arc::clone(&arrivals);
     let server = thread::spawn(move || {
         while !done.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
                     let mut request = [0; 4096];
-                    assert!(stream.read(&mut request).unwrap() > 0);
+                    let read = stream.read(&mut request).unwrap();
+                    assert!(read > 0);
+                    if request[..read].starts_with(b"GET / HTTP/") {
+                        server_arrivals
+                            .lock()
+                            .unwrap()
+                            .push(std::time::Instant::now());
+                    }
                     write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -46,8 +63,9 @@ fn scenario_rate_is_global_and_respects_duration_and_iteration_limits() {
         .arg("--scenario")
         .arg(&path)
         .args(["-n", "3", "-c", "3", "--rate", "2", "--json"])
-        .output()
+        .output_timeout()
         .unwrap();
+    let first_run_arrivals = arrivals.lock().unwrap().clone();
     let limited = Command::new(env!("CARGO_BIN_EXE_horde"))
         .arg("--scenario")
         .arg(&path)
@@ -62,19 +80,19 @@ fn scenario_rate_is_global_and_respects_duration_and_iteration_limits() {
             "1",
             "--json",
         ])
-        .output()
+        .output_timeout()
         .unwrap();
     let invalid = Command::new(env!("CARGO_BIN_EXE_horde"))
         .arg("--scenario")
         .arg(&path)
         .args(["--rate", "0"])
-        .output()
+        .output_timeout()
         .unwrap();
     let text_report = Command::new(env!("CARGO_BIN_EXE_horde"))
         .arg("--scenario")
         .arg(&path)
         .args(["-n", "1", "--rate", "2"])
-        .output()
+        .output_timeout()
         .unwrap();
     let slow_scenario = serde_json::json!({"version":1,"name":"slow","steps":[
         {"name":"first", "url":format!("http://{address}/"), "wait_ms":600}
@@ -84,7 +102,7 @@ fn scenario_rate_is_global_and_respects_duration_and_iteration_limits() {
         .arg("--scenario")
         .arg(&path)
         .args(["-n", "2", "-c", "1", "--rate", "10", "--json"])
-        .output()
+        .output_timeout()
         .unwrap();
     stop.store(true, Ordering::Relaxed);
     server.join().unwrap();
@@ -95,6 +113,16 @@ fn scenario_rate_is_global_and_respects_duration_and_iteration_limits() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(first_run_arrivals.len(), 3);
+    let span = first_run_arrivals[2].duration_since(first_run_arrivals[0]);
+    assert!(
+        span >= std::time::Duration::from_millis(850),
+        "scenario starts were too fast: {first_run_arrivals:?}"
+    );
+    assert!(
+        span < std::time::Duration::from_secs(4),
+        "scenario starts were too slow: {first_run_arrivals:?}"
+    );
     assert_eq!(report["scenarios"]["completed"], 3);
     assert_eq!(report["scenarios"]["failed"], 0);
     assert_eq!(report["steps"][0]["completed"], 3);
@@ -174,6 +202,12 @@ fn scenario_duration_respects_iteration_limits_and_finishes_active_steps() {
             while !done.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                            .unwrap();
                         let mut request = [0; 4096];
                         assert!(stream.read(&mut request).unwrap() > 0);
                         write!(
@@ -211,7 +245,7 @@ fn scenario_duration_respects_iteration_limits_and_finishes_active_steps() {
         if case == "duration_limit" {
             command.args(["--rate", "2"]);
         }
-        let output = command.output().unwrap();
+        let output = command.output_timeout().unwrap();
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();
         std::fs::remove_file(path).unwrap();
@@ -258,7 +292,7 @@ fn scenario_user_agent_defaults_and_step_overrides() {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             for expected in [expected, "Step-agent/1"] {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = common::accept(&listener);
                 let mut data = [0; 4096];
                 let n = stream.read(&mut data).unwrap();
                 let request = String::from_utf8_lossy(&data[..n]);
@@ -291,7 +325,7 @@ fn scenario_user_agent_defaults_and_step_overrides() {
         if let Some(agent) = custom {
             command.args(["-A", agent]);
         }
-        let output = command.output().unwrap();
+        let output = command.output_timeout().unwrap();
         std::fs::remove_file(file).unwrap();
         server.join().unwrap();
         assert!(
@@ -319,7 +353,7 @@ fn scenario_rejects_invalid_user_agent() {
         .arg("--scenario")
         .arg(&file)
         .args(["-A", "invalid\nagent"])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(file).unwrap();
     assert!(!output.status.success());
@@ -335,7 +369,7 @@ fn scenario_users_keep_isolated_cookies_across_steps() {
     let server = thread::spawn(move || {
         let mut handlers = Vec::new();
         for _ in 0..4 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let ids = Arc::clone(&ids);
             let seen = Arc::clone(&seen);
             handlers.push(thread::spawn(move || {
@@ -377,7 +411,7 @@ fn scenario_users_keep_isolated_cookies_across_steps() {
             "--verbose",
             "--auto-referer",
         ])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(file).unwrap();
     server.join().unwrap();
@@ -418,7 +452,7 @@ fn failed_step_stops_scenario_and_reports_skipped_steps() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = common::accept(&listener);
         let mut data = [0; 4096];
         assert!(stream.read(&mut data).unwrap() > 0);
         write!(
@@ -437,7 +471,7 @@ fn failed_step_stops_scenario_and_reports_skipped_steps() {
         .arg(&file)
         .arg("-v")
         .arg("--json")
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(file).unwrap();
     server.join().unwrap();
@@ -473,7 +507,7 @@ fn scenario_ci_thresholds_report_success_failure_and_skipped_steps() {
         let server = thread::spawn(move || {
             let requests = if status == 500 { 1 } else { 2 };
             for _ in 0..requests {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = common::accept(&listener);
                 let mut data = [0; 4096];
                 assert!(stream.read(&mut data).unwrap() > 0);
                 write!(
@@ -500,7 +534,7 @@ fn scenario_ci_thresholds_report_success_failure_and_skipped_steps() {
         if bounded {
             command.arg("--bounded-latency");
         }
-        let output = command.output().unwrap();
+        let output = command.output_timeout().unwrap();
         std::fs::remove_file(file).unwrap();
         server.join().unwrap();
         assert_eq!(
@@ -551,7 +585,7 @@ fn invalid_scenarios_are_rejected_before_running() {
 }
 
 #[test]
-fn versioned_schema_matches_scenario_validation() {
+fn versioned_schema_enforces_documented_structural_contract() {
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../schemas/scenario-v1.schema.json")).unwrap();
     jsonschema::meta::validate(&schema).unwrap();
@@ -562,6 +596,20 @@ fn versioned_schema_matches_scenario_validation() {
     assert!(
         horde_rs::scenario::Scenario::from_json(&serde_json::to_vec(&example).unwrap()).is_ok()
     );
+    // These examples specify the contract independently of the implementation's
+    // use of the same schema. Schema acceptance alone does not imply that the
+    // semantic checks performed by Scenario::from_json will accept a document.
+    for document in [
+        serde_json::json!({"version":1,"name":"minimal","steps":[{"name":"a","url":"http://localhost/"}]}),
+        serde_json::json!({"version":1,"name":"options","variables":{"token":"value"},"steps":[{"name":"a","url":"http://localhost/","method":"POST","json_body":{"key":"{{token}}"},"expect":{"status":[200,201]}}]}),
+    ] {
+        assert!(validator.is_valid(&document), "{document}");
+        assert!(
+            horde_rs::scenario::Scenario::from_json(&serde_json::to_vec(&document).unwrap())
+                .is_ok(),
+            "{document}"
+        );
+    }
     for document in [
         serde_json::json!({"name":"x", "steps":[{"name":"a", "url":"http://localhost/"}]}),
         serde_json::json!({"version":2,"name":"x", "steps":[{"name":"a", "url":"http://localhost/"}]}),
@@ -573,6 +621,20 @@ fn versioned_schema_matches_scenario_validation() {
         serde_json::json!({"version":1,"name":"x", "variables":{"secret":{"env":"OK", "default":"no"}}, "steps":[{"name":"a", "url":"http://localhost/"}]}),
     ] {
         assert!(!validator.is_valid(&document), "{document}");
+        assert!(
+            horde_rs::scenario::Scenario::from_json(&serde_json::to_vec(&document).unwrap())
+                .is_err(),
+            "{document}"
+        );
+    }
+    // These documents are structurally valid but violate semantic rules that
+    // the schema deliberately cannot express.
+    for document in [
+        serde_json::json!({"version":1,"name":"x","steps":[{"name":"a","url":"file:///etc/passwd"}]}),
+        serde_json::json!({"version":1,"name":"x","steps":[{"name":"a","url":"http://localhost/"},{"name":"a","url":"http://localhost/"}]}),
+        serde_json::json!({"version":1,"name":"x","steps":[{"name":"a","url":"http://localhost/{{missing}}"}]}),
+    ] {
+        assert!(validator.is_valid(&document), "{document}");
         assert!(
             horde_rs::scenario::Scenario::from_json(&serde_json::to_vec(&document).unwrap())
                 .is_err(),
@@ -594,7 +656,7 @@ fn scenario_variables_expand_in_request_body() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = common::accept(&listener);
         let mut data = Vec::new();
         let mut chunk = [0; 1024];
         loop {
@@ -619,7 +681,7 @@ fn scenario_variables_expand_in_request_body() {
         .arg("--scenario")
         .arg(&file)
         .arg("--json")
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(file).unwrap();
     server.join().unwrap();
@@ -685,7 +747,7 @@ fn scenario_assertions_check_status_body_and_final_url() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut request = [0; 4096];
             assert!(stream.read(&mut request).unwrap() > 0);
             write!(
@@ -709,7 +771,7 @@ fn scenario_assertions_check_status_body_and_final_url() {
             .arg("--scenario")
             .arg(&file)
             .args(["--json", "-v"])
-            .output()
+            .output_timeout()
             .unwrap();
         std::fs::remove_file(file).unwrap();
         server.join().unwrap();
@@ -733,7 +795,7 @@ fn scenario_extracts_header_and_json_for_later_url_and_header() {
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         for index in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut data = [0; 4096];
             let n = stream.read(&mut data).unwrap();
             let request = String::from_utf8_lossy(&data[..n]).to_ascii_lowercase();
@@ -761,7 +823,7 @@ fn scenario_extracts_header_and_json_for_later_url_and_header() {
         .arg("--scenario")
         .arg(&path)
         .args(["--json", "-v"])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     server.join().unwrap();
@@ -782,7 +844,7 @@ fn extracted_values_do_not_leak_into_the_next_iteration() {
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         for index in 0..3 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut request = [0; 4096];
             assert!(stream.read(&mut request).unwrap() > 0);
             let header = if index == 0 { "X-Token: first\r\n" } else { "" };
@@ -806,7 +868,7 @@ fn extracted_values_do_not_leak_into_the_next_iteration() {
         .arg("--scenario")
         .arg(&path)
         .args(["-n", "2", "-c", "1", "--json", "-v"])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     server.join().unwrap();
@@ -827,7 +889,7 @@ fn invalid_dynamic_url_counts_as_variable_failure_without_status() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = common::accept(&listener);
         let mut data = [0; 4096];
         assert!(stream.read(&mut data).unwrap() > 0);
         write!(
@@ -846,7 +908,7 @@ fn invalid_dynamic_url_counts_as_variable_failure_without_status() {
         .arg("--scenario")
         .arg(&path)
         .args(["--json", "-v"])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     server.join().unwrap();
@@ -869,7 +931,7 @@ fn structured_form_and_json_escape_extracted_values() {
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         for index in 0..3 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut data = Vec::new();
             let mut chunk = [0; 4096];
             let (header_end, body_len) = loop {
@@ -937,7 +999,7 @@ fn structured_form_and_json_escape_extracted_values() {
         .arg("--scenario")
         .arg(&path)
         .args(["--json", "-v"])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     server.join().unwrap();
@@ -957,7 +1019,7 @@ fn extraction_accepts_limit_and_rejects_larger_bodies() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = common::accept(&listener);
             let mut request = [0; 4096];
             assert!(stream.read(&mut request).unwrap() > 0);
             let prefix = b"{\"token\":\"ok\",\"padding\":\"";
@@ -985,7 +1047,7 @@ fn extraction_accepts_limit_and_rejects_larger_bodies() {
             .arg("--scenario")
             .arg(&path)
             .args(["--json", "-v"])
-            .output()
+            .output_timeout()
             .unwrap();
         std::fs::remove_file(path).unwrap();
         server.join().unwrap();

@@ -1,3 +1,5 @@
+mod common;
+use common::CommandTimeout;
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
@@ -53,7 +55,7 @@ fn local_examples_cover_journey_authentication_and_session_isolation() {
             .arg("--scenario")
             .arg(&path)
             .args(["-n", "2", "-c", "2", "--json", "--verbose"])
-            .output()
+            .output_timeout()
             .unwrap();
         assert!(
             output.status.success(),
@@ -74,7 +76,7 @@ fn local_examples_cover_journey_authentication_and_session_isolation() {
         .arg("--scenario")
         .arg(&path)
         .args(["-n", "2", "-c", "2", "--json"])
-        .output()
+        .output_timeout()
         .unwrap();
     assert!(
         output.status.success(),

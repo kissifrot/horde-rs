@@ -1,0 +1,30 @@
+[package]
+name = "horde-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hdrhistogram = { version = "=7.6.0", default-features = false, features = ["serialization"] }
+horde-rs = { path = "..", features = ["distributed-offline"] }
+
+[[bin]]
+name = "histogram_decode"
+path = "fuzz_targets/histogram_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "histogram_generated"
+path = "fuzz_targets/histogram_generated.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -1,3 +1,5 @@
+mod common;
+use common::CommandTimeout;
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -24,6 +26,12 @@ fn validation_checks_scenario_without_connecting() {
             while !stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                            .unwrap();
                         connections.fetch_add(1, Ordering::Relaxed);
                         stream
                             .set_read_timeout(Some(Duration::from_secs(1)))
@@ -56,7 +64,7 @@ fn validation_checks_scenario_without_connecting() {
         } else {
             command.env_remove("HORDE_VALIDATE_TEST_SECRET");
         }
-        command.output().unwrap()
+        command.output_timeout().unwrap()
     };
     let text = run(&["--validate"], Some("SAMPLE_SECRET_VALUE"));
     let json = run(&["--validate", "--json"], Some("SAMPLE_SECRET_VALUE"));
@@ -89,7 +97,7 @@ fn validation_checks_scenario_without_connecting() {
     std::fs::remove_file(path).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_horde"))
         .arg("--validate")
-        .output()
+        .output_timeout()
         .unwrap();
     assert!(!output.status.success());
 }
@@ -109,7 +117,7 @@ fn validation_reports_invalid_scenario() {
         .arg("--scenario")
         .arg(&path)
         .args(["--validate", "--json"])
-        .output()
+        .output_timeout()
         .unwrap();
     std::fs::remove_file(path).unwrap();
     assert!(!output.status.success());

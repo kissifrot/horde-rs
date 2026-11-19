@@ -1,6 +1,9 @@
+mod signals;
 use clap::Parser;
-use horde_rs::scenario::{Counts, Scenario, ScenarioOptions, StartWindow, run_scenario_config};
-use horde_rs::{LatencyStats, TestPlan, run};
+use horde_rs::scenario::{
+    Counts, Scenario, ScenarioOptions, StartWindow, run_scenario_with_cancellation,
+};
+use horde_rs::{Cancellation, LatencyStats, TestPlan, run_with_cancellation};
 use reqwest::{
     Method, Url,
     header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT},
@@ -108,6 +111,8 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
+    let cancellation = Cancellation::new();
+    let interrupts = signals::install(cancellation.clone())?;
     if args
         .max_failure_rate
         .is_some_and(|v| !v.is_finite() || !(0.0..=100.0).contains(&v))
@@ -130,6 +135,9 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         let scenario = Scenario::from_json(&input)
             .map_err(|error| ScenarioDiagnostic(format!("scenario {}: {error}", path.display())))?;
         if args.validate {
+            if interrupts.borrow().is_some() {
+                return Ok(signals::report(&interrupts, args.json));
+            }
             if args.json {
                 println!(
                     "{}",
@@ -140,7 +148,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
             }
             return Ok(ExitCode::SUCCESS);
         }
-        let mut report = run_scenario_config(
+        let result = run_scenario_with_cancellation(
             scenario,
             args.requests.unwrap_or(if args.duration.is_some() {
                 usize::MAX
@@ -162,8 +170,12 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
                     .map(|seconds| Duration::from_secs(seconds.get())),
                 rate: args.rate,
             },
+            cancellation.clone(),
         )
         .await?;
+        let Some(mut report) = result else {
+            return Ok(signals::report(&interrupts, args.json));
+        };
         fn mean(count: &Counts) -> Option<f64> {
             (count.completed > 0)
                 .then(|| count.elapsed.as_secs_f64() * 1000.0 / count.completed as f64)
@@ -320,29 +332,35 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         .map(std::fs::read)
         .transpose()?
         .map(Into::into);
-    let mut report = run(TestPlan {
-        url: args.url.expect("URL is required without --scenario"),
-        requests: args.requests.unwrap_or(if args.duration.is_some() {
-            usize::MAX
-        } else {
-            1
-        }),
-        concurrency: args.concurrency,
-        timeout: Duration::from_secs(args.timeout),
-        method: args.method,
-        headers,
-        body,
-        duration: args
-            .duration
-            .map(|seconds| Duration::from_secs(seconds.get())),
-        rate: args.rate,
-        verbose: args.verbose,
-        bounded_latency: args.bounded_latency,
-        reuse_connections: !args.no_connection_reuse,
-        follow_redirects: args.follow_redirects,
-        max_redirects: args.max_redirects.map_or(10, NonZeroUsize::get),
-    })
+    let result = run_with_cancellation(
+        TestPlan {
+            url: args.url.expect("URL is required without --scenario"),
+            requests: args.requests.unwrap_or(if args.duration.is_some() {
+                usize::MAX
+            } else {
+                1
+            }),
+            concurrency: args.concurrency,
+            timeout: Duration::from_secs(args.timeout),
+            method: args.method,
+            headers,
+            body,
+            duration: args
+                .duration
+                .map(|seconds| Duration::from_secs(seconds.get())),
+            rate: args.rate,
+            verbose: args.verbose,
+            bounded_latency: args.bounded_latency,
+            reuse_connections: !args.no_connection_reuse,
+            follow_redirects: args.follow_redirects,
+            max_redirects: args.max_redirects.map_or(10, NonZeroUsize::get),
+        },
+        cancellation,
+    )
     .await?;
+    let Some(mut report) = result else {
+        return Ok(signals::report(&interrupts, args.json));
+    };
     let stats = match report.bounded_latencies.take() {
         Some(histogram) => Some(LatencyStats::from_bounded(histogram)),
         None => LatencyStats::from_samples(std::mem::take(&mut report.latencies)),

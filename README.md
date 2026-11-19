@@ -49,6 +49,8 @@ Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 
 Each worker sends requests sequentially. Use `--duration` to stop starting requests after a time limit; in-flight requests finish. With both `--duration` and `-n`, the first limit reached applies. Without either, Horde sends one request. The timeout covers each request, including redirects and the response body.
 
+Press Ctrl+C to cancel a run and close its active requests. On Unix, SIGTERM behaves likewise. Horde reports an interrupted, partial run without metrics or passing CI thresholds and exits with 130 for SIGINT or 143 for SIGTERM. With `--json`, the interruption is a JSON object with `type: "interrupted"` and `thresholds.status: "not_evaluable"`. A second signal, or a shutdown taking more than five seconds, forces immediate exit and may prevent the report from being printed.
+
 For single-URL tests, `--rate` spaces logical request starts across all workers. Concurrency, response time and scheduling affect the achieved rate. Redirects are not separately rate-limited, and waiting for a rate slot is excluded from latency and timeout.
 
 To send a body, select a method and provide a file:
@@ -188,7 +190,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-The library separates the test plan, local execution and report from the CLI. Distributed mode is not implemented and no remote listener is enabled.
+The library separates the test plan, local execution and report from the CLI. Distributed mode is not implemented and no remote listener is enabled. A future remote load generator will be called a Grunt. The optional `distributed-offline` feature contains experimental, offline histogram validation and aggregation building blocks; `--all-features` includes their tests. They are not a network protocol or a security boundary.
 
 ### Local performance benchmark
 
@@ -208,3 +210,30 @@ CI comparisons are informational and have no regression threshold. Shared runner
 ## License
 
 GPL-3.0-only; see [LICENSE](LICENSE).
+
+### Fuzzing the offline histogram decoder
+
+The `fuzz/` project exercises the experimental distributed histogram decoder with
+coverage-guided libFuzzer. Install `cargo-fuzz`, a nightly Rust toolchain and a C++
+compiler. From the repository root, for example:
+
+```sh
+cargo install cargo-fuzz --locked
+rustup toolchain install nightly --profile minimal
+mkdir -p /tmp/horde-fuzz-decode /tmp/horde-fuzz-generated
+cargo +nightly fuzz run histogram_decode /tmp/horde-fuzz-decode fuzz/corpus/histogram_decode -- -max_len=506964 -max_total_time=3600 -timeout=15 -rss_limit_mb=2048
+cargo +nightly fuzz run histogram_generated /tmp/horde-fuzz-generated fuzz/corpus/histogram_generated -- -max_len=1024 -max_total_time=3600 -timeout=15 -rss_limit_mb=2048
+```
+
+On systems where LeakSanitizer cannot inspect processes, prefix the commands with `ASAN_OPTIONS=detect_leaks=0`.
+
+The first corpus directory receives new inputs; retain it across runs. The second
+contains the checked-in seeds. Use `--dev` before the target name for a debug
+build; the default uses optimizations, debug assertions, overflow checks and
+AddressSanitizer. Crash inputs are saved under `fuzz/artifacts/`; reproduce one
+with `cargo +nightly fuzz run histogram_decode path/to/artifact` (substitute the
+other target when appropriate). Preserve and minimize findings, then add a
+regression test. The raw target checks arbitrary envelopes and receiver limits;
+the generated target constructs valid histograms and checks decoded results
+against the pinned HDR library. These campaigns do not prove bounded memory or
+replace the security and transport work required before exposing a listener.
