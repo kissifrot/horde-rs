@@ -38,22 +38,29 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: rust:trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8
     timeout-minutes: 20
+    env:
+      MUSL_VERSION: '1.2.5-3.1~deb13u1'
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Install native musl toolchain
         env:
           TARGET: ${{ matrix.target }}
-          MUSL_VERSION: '1.2.5-3.1~deb13u1'
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
             "musl=$MUSL_VERSION" "musl-dev=$MUSL_VERSION" "musl-tools=$MUSL_VERSION"
           rustup target add "$TARGET"
+      - name: Cache Rust build dependencies
+        if: github.ref_type != 'tag'
+        uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: trixie-${{ matrix.target }}-${{ env.MUSL_VERSION }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build and package Horde
         env:
           ARCH: ${{ matrix.arch }}
