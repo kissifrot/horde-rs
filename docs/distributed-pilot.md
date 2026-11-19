@@ -4,6 +4,9 @@ The pilot exercises the control channel across three machines. Each Grunt
 runs only against an HTTP server on its own loopback address. The sample
 private addresses below are placeholders for addresses assigned to the pilot.
 
+See the [illustrated overview](distributed.md#how-distributed-mode-works)
+for the control channel, workload flow and partial reports.
+
 | Role | Private address | Control identity | HTTP workload |
 | --- | --- | --- | --- |
 | Controller | `10.20.0.10` | Dedicated client leaf, explicitly allowed on both Grunts | None |

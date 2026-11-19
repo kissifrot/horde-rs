@@ -213,6 +213,9 @@ GPL-3.0-only; see [LICENSE](LICENSE).
 
 ### Distributed testing with local HTTP targets
 
+See the [illustrated overview](docs/distributed.md#how-distributed-mode-works)
+for how the controller and Grunts share a run and handle a missing peer.
+
 Build with `cargo build --features distributed-transport`. Start each Grunt with a
 fixed local HTTP(S) target and its own certificate and key. The Grunt prints the
 listening address. A listen port of zero lets the OS select the port.

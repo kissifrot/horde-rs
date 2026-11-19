@@ -4,6 +4,69 @@
 
 This document describes the planned distributed mode and the current offline and control transport implementations. The Grunt CLI listens on loopback by default and can opt into an explicitly configured private address. It executes a locally configured loopback workload.
 
+## How distributed mode works
+
+Horde has two roles. The **controller** splits the run budget and combines
+the results. Each **Grunt** runs its share against an HTTP target configured
+locally on that Grunt.
+
+```text
+                     Control channel (mutual TLS)       Workload (HTTP)
+
+                  +<---------------------------> Grunt A ----> A's localhost
+                  |
+  Controller -----+
+                  |
+                  +<---------------------------> Grunt B ----> B's localhost
+```
+
+The controller reads its local settings and a JSON inventory of Grunt
+addresses and expected TLS identities. Each Grunt has its own settings for
+the listen address, allowed controllers, TLS files and loopback target.
+With mutual TLS, the controller verifies the Grunt's identity and the
+Grunt checks that the controller's certificate is authorized.
+
+### From preflight to report
+
+```text
+  preflight        Open mutual TLS -> receive hello from each Grunt -> report
+
+  controller       Divide budget across Grunts
+                        |
+                        v
+                   Submit shares and check progress
+                        |
+                        v
+                   Collect and merge validated results
+                        |
+                        v
+                   Print JSON report
+```
+
+`preflight` stops at the authenticated `hello` and sends no workload.
+The controller takes the request budget, concurrency and rate from the
+CLI. For example, with two Grunts, 40 requests, two workers and a target
+rate of four starts per second, each Grunt gets 20 requests, one worker
+and a target rate of two starts per second. The controller merges the
+returned latency histograms before computing p95 and p99.
+
+### When a Grunt becomes unreachable
+
+```text
+  Grunt A    finishes its 20 requests -----> validated result --+
+                                                               +--> Partial report
+  Grunt B    loses its control link -------> marked missing ----+    with A's metrics
+```
+
+A keeps its original budget. B's share stays tied to B because some
+requests may already have reached its target. Once B detects the loss
+of the connection, it cancels its run if the controller fails to
+reconnect within the grace period. A configured threshold is
+unevaluable in a partial report.
+
+To try this on one machine, follow the [Docker pilot](distributed-pilot.md#single-host-alternative-using-containers).
+For configuration and commands, see the [two-Grunt walkthrough](distributed-pilot.md#start-each-grunt).
+
 ## Roles and trust
 
 A controller submits a constrained test plan to explicitly configured agents. Each agent runs the local load generator and returns a result; it never accepts shell commands, executable code, arbitrary file paths or configuration changes from the controller.
