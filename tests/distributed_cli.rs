@@ -175,6 +175,89 @@ fn report(output: &Output) -> Value {
 }
 
 #[test]
+fn inventory_flags_save_a_valid_snapshot_before_preflight_and_run() {
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let mut nonce = [0; 8];
+    getrandom::fill(&mut nonce).unwrap();
+    let directory = std::env::temp_dir().join(format!(
+        "horde-inventory-{:016x}",
+        u64::from_ne_bytes(nonce)
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let scratch = Scratch(directory);
+    let inventory = scratch.0.join("grunts.json");
+
+    let unused_target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (first, _first) = start_grunt(unused_target.local_addr().unwrap());
+    let (target, target_server) = start_target(1, 0);
+    let (second, _second) = start_grunt(target);
+    let command = |name| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_horde"));
+        command.args([name, "--inventory"]).arg(&inventory);
+        identity(&mut command, "controller", "ca.der");
+        command
+    };
+    let output = command("preflight")
+        .args(["--add-grunt", &first.to_string()])
+        .output_timeout()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(report(&output)["grunts"][0]["address"], first.to_string());
+    let baseline = std::fs::read(&inventory).unwrap();
+
+    let output = command("preflight")
+        .args([
+            "--remove-grunt",
+            &first.to_string(),
+            "--add-grunt",
+            &second.to_string(),
+            "--add-grunt",
+            "10.0.0.3:7071",
+        ])
+        .output_timeout()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(&inventory).unwrap(), baseline);
+
+    let output = command("controller")
+        .args([
+            "--remove-grunt",
+            &first.to_string(),
+            "--add-grunt",
+            &second.to_string(),
+            "--requests",
+            "1",
+            "--concurrency",
+            "1",
+            "--rate",
+            "1",
+        ])
+        .output_timeout()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let result = report(&output);
+    assert_eq!(result["metrics"]["completed"], 1);
+    assert_eq!(result["agents"][0]["address"], second.to_string());
+    assert_eq!(result["agents"].as_array().unwrap().len(), 1);
+    let saved: Value = serde_json::from_slice(&std::fs::read(&inventory).unwrap()).unwrap();
+    assert_eq!(
+        saved["grunts"],
+        serde_json::json!([{"address": second.to_string()}])
+    );
+    target_server.join().unwrap();
+    unused_target.set_nonblocking(true).unwrap();
+    assert_eq!(
+        unused_target.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
 fn preflight_requires_the_hello_after_controller_authorization() {
     let target = TcpListener::bind("127.0.0.1:0").unwrap();
     let (address, _grunt) = start_grunt(target.local_addr().unwrap());

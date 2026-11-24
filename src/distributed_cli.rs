@@ -1,3 +1,5 @@
+mod inventory;
+
 use clap::{Args, Subcommand};
 use horde_rs::{
     Cancellation, TestPlan,
@@ -34,6 +36,8 @@ pub(crate) enum Command {
     Controller(ControllerArgs),
     /// Verify Grunt control connections through the authenticated hello.
     Preflight(PreflightArgs),
+    /// Manage the Grunts available for future runs.
+    Inventory(inventory::InventoryArgs),
 }
 
 #[derive(Args)]
@@ -73,14 +77,20 @@ pub(crate) struct GruntArgs {
 #[derive(Args)]
 struct Peers {
     /// Load the inventory path, control policy and TLS settings from a JSON file.
-    #[arg(long, conflicts_with_all = ["grunt", "inventory", "private_network", "server_name", "ca", "cert", "key"])]
+    #[arg(long, group = "inventory_source", conflicts_with_all = ["grunt", "inventory", "private_network", "server_name", "ca", "cert", "key"])]
     config: Option<PathBuf>,
     /// Grunt socket address, optionally followed by =TLS_IDENTITY. Repeat in allocation order.
     #[arg(long, required_unless_present_any = ["inventory", "config"], value_name = "ADDRESS[=TLS_IDENTITY]", value_parser = parse_grunt)]
     grunt: Vec<GruntSpec>,
     /// Read Grunt addresses and TLS identities from a JSON inventory.
-    #[arg(long, conflicts_with = "grunt")]
+    #[arg(long, group = "inventory_source", conflicts_with = "grunt")]
     inventory: Option<PathBuf>,
+    /// Add a peer to the inventory before connecting. Repeat to add several peers.
+    #[arg(long, requires = "inventory_source", value_name = "ADDRESS[=TLS_IDENTITY]", value_parser = parse_grunt)]
+    add_grunt: Vec<GruntSpec>,
+    /// Remove an address from the inventory before connecting. Repeat to remove several peers.
+    #[arg(long, requires = "inventory_source", value_name = "ADDRESS")]
+    remove_grunt: Vec<SocketAddr>,
     /// Connect to explicitly listed private Grunt addresses instead of loopback.
     #[arg(long)]
     private_network: bool,
@@ -153,17 +163,13 @@ struct ControllerConfig {
     tls: Identity,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Inventory {
-    grunts: Vec<InventoryEntry>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InventoryEntry {
-    address: SocketAddr,
-    tls_identity: Option<String>,
+impl ControllerConfig {
+    fn inventory_path(&self, config_path: &Path) -> PathBuf {
+        config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(&self.inventory)
+    }
 }
 
 fn deserialize_target<'de, D: serde::Deserializer<'de>>(
@@ -219,11 +225,12 @@ impl Peers {
     fn prepare(self) -> Result<(Controller, Vec<Grunt>), BoxError> {
         let (inventory, private_network, server_name, tls) = if let Some(path) = self.config {
             let settings: ControllerConfig = read_json(&path, "controller configuration")?;
+            let inventory = settings.inventory_path(&path);
             let directory = path.parent().unwrap_or(Path::new("."));
             let mut tls = settings.tls;
             tls.resolve_paths(directory);
             (
-                Some(directory.join(settings.inventory)),
+                Some(inventory),
                 settings.private_network,
                 settings.server_name,
                 tls,
@@ -236,37 +243,39 @@ impl Peers {
                 self.identity.load()?,
             )
         };
-        let mut specs = self.grunt;
-        if let Some(path) = inventory {
-            let inventory: Inventory = read_json(&path, "Grunt inventory")?;
-            for entry in inventory.grunts {
-                let identity = entry
-                    .tls_identity
-                    .map(ServerName::try_from)
-                    .transpose()
-                    .map_err(|error| {
-                        format!("invalid TLS identity for {}: {error}", entry.address)
-                    })?;
-                specs.push(GruntSpec {
-                    address: entry.address,
-                    identity,
-                });
-            }
-        }
         let default = server_name.map(ServerName::try_from).transpose()?;
-        let grunts = specs
-            .into_iter()
-            .map(|spec| spec.resolve(default.as_ref(), private_network))
-            .collect();
         let controller = Controller::new(tls.roots()?, vec![certificate(&tls.cert)?], tls.key()?)?;
-        Ok((
-            if private_network {
-                controller.with_private_network()
-            } else {
-                controller
-            },
-            grunts,
-        ))
+        let controller = if private_network {
+            controller.with_private_network()
+        } else {
+            controller
+        };
+        let resolve = |specs: Vec<GruntSpec>| {
+            specs
+                .into_iter()
+                .map(|spec| spec.resolve(default.as_ref(), private_network))
+                .collect::<Vec<_>>()
+        };
+        let grunts = match inventory {
+            Some(path) if !self.add_grunt.is_empty() || !self.remove_grunt.is_empty() => {
+                inventory::Inventory::edit(&path, |inventory| {
+                    let mut changed = false;
+                    for address in self.remove_grunt {
+                        inventory.remove(address)?;
+                        changed = true;
+                    }
+                    for grunt in self.add_grunt {
+                        changed |= inventory.add(grunt)?;
+                    }
+                    let grunts = resolve(inventory.specs()?);
+                    controller.validate_grunts(&grunts)?;
+                    Ok((changed, grunts))
+                })?
+            }
+            Some(path) => resolve(inventory::Inventory::read(&path)?.specs()?),
+            None => resolve(self.grunt),
+        };
+        Ok((controller, grunts))
     }
 }
 
@@ -344,6 +353,7 @@ pub(crate) async fn run(command: Command) -> Result<ExitCode, BoxError> {
         Command::Grunt(args) => serve(args.load()?, signals).await,
         Command::Controller(args) => coordinate(args, cancel, signals).await,
         Command::Preflight(args) => preflight(args, cancel, signals).await,
+        Command::Inventory(args) => args.run(),
     }
 }
 

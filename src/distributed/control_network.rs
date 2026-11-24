@@ -5,7 +5,8 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-pub(super) fn is_private_control_ip(ip: IpAddr) -> bool {
+/// Check whether an IP address can be used for private control traffic.
+pub fn is_private_control_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(ip) => ip.is_private(),
         IpAddr::V6(ip) => ip.is_unique_local(),

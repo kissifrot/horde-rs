@@ -174,6 +174,31 @@ Inventory order is allocation order. The file-based settings and their
 equivalent flags are mutually exclusive. The controller's request
 budget, concurrency, rate, deadline and thresholds are CLI options.
 
+Use the inventory commands to register or remove Grunts between runs.
+`add` creates the JSON file if needed. You can also point these commands
+directly at a JSON file with `--inventory grunts.json`.
+
+```sh
+target/release/horde inventory --config controller.json add 10.0.0.12:7071
+target/release/horde inventory --config controller.json add 10.0.0.13:7071=grunt-b.example.internal
+target/release/horde inventory --config controller.json list
+target/release/horde inventory --config controller.json remove 10.0.0.12:7071
+```
+
+A running controller keeps the peers and budgets it selected at startup.
+The next preflight or run reads the updated inventory. Prepare each
+Grunt's listener, TLS certificate and controller allowlist as usual.
+
+Both `preflight` and `controller` also accept repeatable `--add-grunt`
+and `--remove-grunt` flags with `--config` or `--inventory`. The command
+applies removals first and saves the validated list before connecting.
+Later runs reuse the saved inventory.
+
+```sh
+target/release/horde preflight --config controller.json \
+  --add-grunt 10.0.0.13:7071=grunt-b.example.internal
+```
+
 From the controller machine, use a small budget first:
 
 ```sh
@@ -280,6 +305,9 @@ ports are published.
   The last HTTP connection must occur by 1.5 seconds after `SIGINT` or
   four seconds after `SIGKILL`. The pilot finishes with an authenticated
   preflight to verify that both Grunts are still reachable.
+- The inventory scenario adds a second Grunt during a one-peer run,
+  verifies that the next run uses both peers, and removes the original
+  Grunt before the following run.
 
 The script removes its containers, network, image and temporary
 credentials on exit, including on failure, SIGINT or SIGTERM. It writes

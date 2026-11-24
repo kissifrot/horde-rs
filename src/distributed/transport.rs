@@ -1,5 +1,5 @@
 //! Experimental control protocol. Callers supply already accepted TCP streams.
-pub use super::control_network::ListenerPolicy;
+pub use super::control_network::{ListenerPolicy, is_private_control_ip};
 use super::{
     AgentLimits, Budget, Cancellation, CompletedResult, GruntPolicy, LocalOutcome, StopReason,
     encode_histogram, preflight, run_reserved,

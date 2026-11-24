@@ -319,6 +319,8 @@ of repeated `--grunt` flags. Preflight checks the authenticated control hello
 for each peer without generating HTTP traffic. `--config` loads local
 settings from JSON. The same controller configuration works with
 `preflight` and `controller`. Pass the request budget and rate on the CLI.
+Use `horde inventory --config controller.json` with `add`, `list` or
+`remove` to manage the peers for the next run.
 See the [configuration and inventory examples](docs/distributed-pilot.md#start-each-grunt).
 
 The controller emits JSON with per-Grunt states, merged metrics and percentiles.

@@ -265,9 +265,9 @@ def pilot(binary):
                     "Preflight reached a workload target", connections)
             return {"report": report, "target_connections": connections}
 
-        def verify(report, completed, states, partial, isolated_address=None):
+        def verify(report, completed, states, partial, agent_addresses=None):
             metrics = report["metrics"]
-            expected_agents = (addresses["grunt-a"], isolated_address or addresses["grunt-b"])
+            expected_agents = addresses.values() if agent_addresses is None else agent_addresses
             require(report["partial"] is partial, "Unexpected partial status", report)
             require({agent["address"]: agent["status"] for agent in report["agents"]}
                     == dict(zip(expected_agents, states)), "Unexpected Grunt states", report)
@@ -321,6 +321,40 @@ def pilot(binary):
             print(f"{signal_name} passed: both Grunts stopped at {stopped_counts}.", flush=True)
             return {"exit_code": expected_exit, "controller_report": report, "targets": targets,
                     "post_stop_preflight": ready}
+
+        def inventory_changes():
+            inventory_file = "managed-grunts.json"
+            _, config = controller_config("new", ("new",), inventory_file)
+            command = (binary, "inventory", "--config", work / "controller" / Path(config).name)
+            run(*command, "add", addresses["grunt-a"])
+            start_controller("inventory-first", 12, inventory_file)
+            wait_for(lambda: requests("grunt-a") > 0, "inventory run before adding Grunt B")
+            run(*command, "add", f"{addresses['grunt-b']}=grunt-b.pilot.test")
+            require(docker("inspect", "--format", "{{.State.Running}}", f"{prefix}-inventory-first")
+                    .stdout.strip() == "true", "Expected the first run to still be active", inventory_file)
+            listed = json.loads(run(*command, "list").stdout)
+            require([peer["address"] for peer in listed["grunts"]] == list(addresses.values()),
+                    "Inventory order changed", listed)
+            first = collect("inventory-first", 0)
+            verify(first, 12, ("complete",), partial=False, agent_addresses=(addresses["grunt-a"],))
+            require(target_connections() == {"grunt-a": 12, "grunt-b": 0},
+                    "Inventory addition changed an active run", target_connections())
+
+            start_controller("inventory-next", 4, inventory_file)
+            following = collect("inventory-next", 0)
+            verify(following, 4, ("complete", "complete"), partial=False)
+            require(target_connections() == {"grunt-a": 14, "grunt-b": 2},
+                    "Next run did not use the added peer", target_connections())
+
+            run(*command, "remove", addresses["grunt-a"])
+            start_controller("inventory-removed", 2, inventory_file)
+            removed = collect("inventory-removed", 0)
+            verify(removed, 2, ("complete",), partial=False, agent_addresses=(addresses["grunt-b"],))
+            require(target_connections() == {"grunt-a": 14, "grunt-b": 4},
+                    "Removed peer received traffic", target_connections())
+            print("Inventory changes passed: the active run kept its peers and later runs picked up edits.",
+                  flush=True)
+            return {"during_addition": first, "after_addition": following, "after_removal": removed}
 
         try:
             both_ready = ("ready", "ready")
@@ -402,7 +436,7 @@ def pilot(binary):
                     "Unexpected controller detection delay after relay paused", detection_seconds)
             silent_report = collect("silent-failure", 1)
             verify(silent_report, 20, ("complete", "missing"), partial=True,
-                   isolated_address=relay_address)
+                   agent_addresses=(addresses["grunt-a"], relay_address))
             require(silent_report["thresholds"]["failure_rate"] == "not_evaluable",
                     "Silent failure did not invalidate the threshold", silent_report["thresholds"])
             starts = {role: timestamps(grunt_names[role], "pilot-http: connection") for role in GRUNTS}
@@ -475,6 +509,8 @@ def pilot(binary):
                 "sigint": controller_stop("SIGINT", 130, latest_request_limit=1.5),
                 "sigkill": controller_stop("SIGKILL", 137, latest_request_limit=4.0),
             }
+            start_grunts("inventory", ("new", "new"), ("new",), ("new",))
+            managed_inventory = inventory_changes()
         except Exception:
             for container in containers:
                 result = docker("logs", container, check=False)
@@ -508,6 +544,7 @@ def pilot(binary):
                 "recovery": {"controller_report": recovery, "target_connections": recovered},
             },
             "controller_stop": stopped_controllers,
+            "inventory_changes": managed_inventory,
         }
 
 

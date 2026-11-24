@@ -83,7 +83,8 @@ impl Controller {
         self
     }
 
-    fn validate_grunts(&self, grunts: &[Grunt]) -> Result<(), BoxError> {
+    /// Validate peer addresses and identities without opening a connection.
+    pub fn validate_grunts(&self, grunts: &[Grunt]) -> Result<(), BoxError> {
         if grunts.is_empty()
             || grunts.iter().any(|g| {
                 let ip = g.address.ip().to_canonical();
