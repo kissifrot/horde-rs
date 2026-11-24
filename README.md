@@ -213,20 +213,14 @@ GPL-3.0-only; see [LICENSE](LICENSE).
 
 ### Linux and macOS prereleases
 
-To install the standalone binary without `sudo`,
-download the installer and pass the release tag you want:
+Install the latest compatible release on Linux (AMD64 or ARM64) or
+macOS 15+ (Apple Silicon).
 
 ```sh
-curl -fsSLo install.sh https://raw.githubusercontent.com/kissifrot/horde-rs/main/install.sh
-sh install.sh v0.1.0-rc.2
-"$HOME/.local/bin/horde" --version
+curl -fsSLo horde-install.sh https://raw.githubusercontent.com/kissifrot/horde-rs/main/install.sh && sh horde-install.sh
 ```
 
-The installer selects Linux AMD64, Linux ARM64 or macOS Apple Silicon,
-verifies the binary against the release's `SHA256SUMS`, and installs or
-updates `$HOME/.local/bin/horde`. Set `HORDE_INSTALL_DIR` to use a
-different directory. The example tag contains Linux binaries. For macOS 15
-or later on Apple Silicon, select a tag with the `horde-macos-arm64` asset.
+To install a specific release, run `sh horde-install.sh TAG`.
 
 The [release workflow](.github/workflows/linux-packages.yml) builds
 Horde on Debian 13 with static musl for AMD64 and ARM64. It checks package
