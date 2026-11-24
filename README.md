@@ -1,5 +1,7 @@
 # Horde
 
+<img src="docs/horde-logo.svg" width="120" height="120" alt="Horde logo">
+
 For the Horde! Horde is a standalone HTTP load-testing tool written in Rust.
 
 ## Ready to work: install and run
@@ -210,6 +212,9 @@ CI comparisons are informational and have no regression threshold. Shared runner
 ## License
 
 GPL-3.0-only; see [LICENSE](LICENSE).
+
+The [Horde logo](docs/horde-logo.svg) is dedicated to the public domain
+under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
 
 ### Linux and macOS prereleases
 

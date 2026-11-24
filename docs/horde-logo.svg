@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-labelledby="title desc">
+  <!-- SPDX-License-Identifier: CC0-1.0 -->
+  <title id="title">Horde</title>
+  <desc id="desc">Three friendly terminal-shaped robots, with an orange leader and two mint companions.</desc>
+
+  <rect x="4" y="4" width="184" height="184" rx="44" fill="#162632"/>
+
+  <path d="M31 66h11m-9 71h17m102 1h10m-21-84h13"
+        fill="none" stroke="#6E909A" stroke-width="4" stroke-linecap="round"/>
+
+  <g fill="#8AD6B6" stroke="#162632" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M46 78v-9m100 9v-9" fill="none" stroke="#8AD6B6" stroke-width="4"/>
+    <rect x="24" y="78" width="51" height="47" rx="15"/>
+    <rect x="117" y="78" width="51" height="47" rx="15"/>
+  </g>
+  <g fill="none" stroke="#162632" stroke-width="4" stroke-linecap="round">
+    <path d="M39 98v3m12-3v3m-13 10q7 6 14 0"/>
+    <path d="M141 98v3m12-3v3m-13 10q7 6 14 0"/>
+  </g>
+
+  <path d="M96 69V48" stroke="#F9AD64" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="96" cy="45" r="7" fill="#F9AD64"/>
+  <rect x="57" y="70" width="78" height="67" rx="22" fill="#F9AD64"
+        stroke="#162632" stroke-width="6"/>
+  <rect x="69" y="82" width="54" height="40" rx="12" fill="#162632"/>
+  <path d="m80 94 8 7-8 7m18 0h9" fill="none" stroke="#FFE4B8"
+        stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M81 137v9m30-9v9" fill="none" stroke="#F9AD64" stroke-width="6" stroke-linecap="round"/>
+</svg>
