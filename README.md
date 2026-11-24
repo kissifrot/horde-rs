@@ -211,13 +211,31 @@ CI comparisons are informational and have no regression threshold. Shared runner
 
 GPL-3.0-only; see [LICENSE](LICENSE).
 
-### Linux prereleases
+### Linux and macOS prereleases
 
-The [Linux packages workflow](.github/workflows/linux-packages.yml) builds
+To install the standalone binary without `sudo`,
+download the installer and pass the release tag you want:
+
+```sh
+curl -fsSLo install.sh https://raw.githubusercontent.com/kissifrot/horde-rs/main/install.sh
+sh install.sh v0.1.0-rc.2
+"$HOME/.local/bin/horde" --version
+```
+
+The installer selects Linux AMD64, Linux ARM64 or macOS Apple Silicon,
+verifies the binary against the release's `SHA256SUMS`, and installs or
+updates `$HOME/.local/bin/horde`. Set `HORDE_INSTALL_DIR` to use a
+different directory. The example tag contains Linux binaries. For macOS 15
+or later on Apple Silicon, select a tag with the `horde-macos-arm64` asset.
+
+The [release workflow](.github/workflows/linux-packages.yml) builds
 Horde on Debian 13 with static musl for AMD64 and ARM64. It checks package
 installation and the distributed CLI on Debian 13 and Ubuntu 24.04
 on both architectures. Each build includes `grunt`, `preflight` and
 `controller`. Installation places `horde` in `/usr/bin` and starts no service.
+
+The release workflow also builds and runs the macOS binary on a native
+Apple Silicon runner. It uses ad-hoc signing without Apple notarization.
 
 Get the package or standalone executable for your architecture from
 [GitHub Releases](https://github.com/kissifrot/horde-rs/releases). Use
@@ -247,8 +265,8 @@ git tag -a v0.1.0-rc.1 -m "Horde 0.1.0 release candidate 1"
 git push origin v0.1.0-rc.1
 ```
 
-After the install checks, GitHub Actions publishes the two packages,
-two standalone binaries and `SHA256SUMS` as a prerelease. The workflow
+After the install checks, GitHub Actions publishes the two Linux packages,
+three standalone binaries and `SHA256SUMS` as a prerelease. The workflow
 also supports manual runs and keeps snapshot outputs as workflow
 artifacts. The build pins the Rust container and musl toolchain versions,
 uses `Cargo.lock` and sets package timestamps from the commit.

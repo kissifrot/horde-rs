@@ -16,7 +16,7 @@ for the control channel, workload flow and partial reports.
 ## Before the run
 
 - Use the same revision on all three machines. Install the
-  [Linux prerelease](../README.md#linux-prereleases) for each machine's
+  [prerelease](../README.md#linux-and-macos-prereleases) for each machine's
   architecture or build locally with
   `cargo build --release --locked --features distributed-transport`.
   When using a package or standalone executable, use that binary in the

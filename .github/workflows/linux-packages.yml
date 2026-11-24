@@ -1,4 +1,4 @@
-name: Linux packages
+name: Release packages
 
 on:
   push:
@@ -10,6 +10,8 @@ on:
       - 'Cargo.lock'
       - 'LICENSE'
       - 'scripts/package-linux.py'
+      - 'install.sh'
+      - 'scripts/test-installer.sh'
       - '.github/workflows/linux-packages.yml'
   pull_request:
     paths:
@@ -18,6 +20,8 @@ on:
       - 'Cargo.lock'
       - 'LICENSE'
       - 'scripts/package-linux.py'
+      - 'install.sh'
+      - 'scripts/test-installer.sh'
       - '.github/workflows/linux-packages.yml'
   workflow_dispatch:
 
@@ -111,20 +115,57 @@ jobs:
           horde preflight --help
           horde controller --help
 
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal --target aarch64-apple-darwin
+      - name: Cache Rust build dependencies
+        if: github.ref_type != 'tag'
+        uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: macos-15-aarch64-1.100.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build and verify the Apple Silicon binary
+        run: |
+          test "$(uname -m)" = arm64
+          cargo +1.100.0 build --release --locked --features distributed-transport --target aarch64-apple-darwin
+          mkdir -p dist
+          install -m 755 target/aarch64-apple-darwin/release/horde dist/horde-macos-arm64
+          test "$(lipo -archs dist/horde-macos-arm64)" = arm64
+          codesign --force --sign - --timestamp=none dist/horde-macos-arm64
+          codesign --verify --strict dist/horde-macos-arm64
+          sh scripts/test-installer.sh dist/horde-macos-arm64
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: macos-arm64
+          path: dist/horde-macos-arm64
+          if-no-files-found: error
+
   publish:
-    needs: install
+    needs: [install, build-macos]
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: write
     concurrency:
-      group: linux-prerelease-${{ github.ref }}
+      group: prerelease-${{ github.ref }}
     steps:
       - uses: actions/download-artifact@v8.0.2
         with:
           pattern: linux-*
           merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: macos-arm64
           path: dist
       - name: Publish the GitHub prerelease
         working-directory: dist
@@ -144,6 +185,7 @@ jobs:
             fi
           done
           packages=(*.deb)
-          sha256sum -- "${packages[@]}" horde-linux-amd64 horde-linux-arm64 > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" "${packages[@]}" horde-linux-amd64 horde-linux-arm64 SHA256SUMS \
+          binaries=(horde-linux-amd64 horde-linux-arm64 horde-macos-arm64)
+          sha256sum -- "${packages[@]}" "${binaries[@]}" > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" "${packages[@]}" "${binaries[@]}" SHA256SUMS \
             --verify-tag --prerelease --latest=false --generate-notes
