@@ -1,11 +1,14 @@
 #[cfg(feature = "distributed-transport")]
 mod distributed_cli;
+mod live_report;
 mod signals;
+mod text_report;
 use clap::Parser;
 use horde_rs::scenario::{
-    Counts, Scenario, ScenarioOptions, StartWindow, run_scenario_with_cancellation,
+    Counts, Scenario, ScenarioOptions, StartWindow, run_scenario_with_progress,
 };
-use horde_rs::{Cancellation, LatencyStats, TestPlan, run_with_cancellation};
+use horde_rs::{Cancellation, LatencyStats, TestPlan, run_with_progress};
+use live_report::LiveReport;
 use reqwest::{
     Method, Url,
     header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT},
@@ -17,6 +20,7 @@ use std::{
     process::ExitCode,
     time::Duration,
 };
+use text_report::TextReport;
 
 struct ScenarioDiagnostic(String);
 
@@ -123,7 +127,12 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         return distributed_cli::run(command).await;
     }
     let cancellation = Cancellation::new();
-    let interrupts = signals::install(cancellation.clone())?;
+    let reporting = LiveReport::new(
+        !args.json && !args.validate,
+        args.verbose,
+        args.scenario.is_some(),
+    );
+    let interrupts = signals::install(cancellation.clone(), reporting.live)?;
     if args
         .max_failure_rate
         .is_some_and(|v| !v.is_finite() || !(0.0..=100.0).contains(&v))
@@ -159,7 +168,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
             }
             return Ok(ExitCode::SUCCESS);
         }
-        let result = run_scenario_with_cancellation(
+        let run = run_scenario_with_progress(
             scenario,
             args.requests.unwrap_or(if args.duration.is_some() {
                 usize::MAX
@@ -182,10 +191,11 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
                 rate: args.rate,
             },
             cancellation.clone(),
-        )
-        .await?;
+            reporting.progress.as_ref(),
+        );
+        let result = reporting.monitor(&interrupts, run).await?;
         let Some(mut report) = result else {
-            return Ok(signals::report(&interrupts, args.json));
+            return Ok(reporting.interrupted(&interrupts, args.json, args.bounded_latency)?);
         };
         fn mean(count: &Counts) -> Option<f64> {
             (count.completed > 0)
@@ -236,7 +246,8 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
                 .iter()
                 .all(|(_, _, passed)| *passed == Some(true))
         });
-        let exit_code = if failure_passed == Some(false) || step_passed == Some(false) {
+        let thresholds_failed = failure_passed == Some(false) || step_passed == Some(false);
+        let exit_code = if thresholds_failed {
             ExitCode::from(2)
         } else {
             ExitCode::SUCCESS
@@ -247,81 +258,114 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
             let output = serde_json::json!({"schema_version": 1, "type": "scenario", "name": report.name, "elapsed_seconds": report.elapsed.as_secs_f64(), "latency_method": if args.bounded_latency { "hdr_histogram_upper_bound_3_significant_digits" } else { "exact" }, "scenarios": {"completed": report.scenarios.completed, "failed": report.scenarios.failed, "target_starts_per_second": args.rate, "started_per_second": report.starts.per_second, "start_measurement": {"started": report.starts.started, "window_seconds": report.starts.window.as_secs_f64(), "method": start_window_method}, "completed_per_second": completed_per_second, "mean_duration_ms": mean(&report.scenarios), "duration_ms": {"p50": percentile(&scenario_stats, 50), "p95": percentile(&scenario_stats, 95), "p99": percentile(&scenario_stats, 99)}}, "steps": steps, "thresholds": {"failure_rate_percent": args.max_failure_rate.map(|limit| serde_json::json!({"limit":limit,"observed":failure_rate,"passed":failure_passed})), "step_p95_ms": args.max_step_p95_ms.map(|limit| serde_json::json!({"limit":limit,"passed":step_passed,"steps":checks}))}});
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
-            println!(
-                "For the Horde!\nScenario: {}\nCompleted scenarios: {}\nFailed scenarios:    {}\nElapsed:             {:.3} s",
-                report.name,
-                report.scenarios.completed,
-                report.scenarios.failed,
-                report.elapsed.as_secs_f64()
+            let mut output = TextReport::standalone(thresholds_failed, report.scenarios.failed > 0);
+            output.section("Scenarios");
+            output.field("Scenario:", format_args!("{:?}", report.name));
+            output.field("Completed scenarios:", report.scenarios.completed);
+            output.field("Failed scenarios:", report.scenarios.failed);
+            output.field(
+                "Elapsed:",
+                format_args!("{:.3} s", report.elapsed.as_secs_f64()),
             );
+            output.field("Completed/sec:", format_args!("{completed_per_second:.2}"));
             if let Some(rate) = args.rate {
-                println!("Target starts/sec:   {rate}");
+                output.field("Target starts/sec:", rate);
             }
             let start_rate = report
                 .starts
                 .per_second
                 .map_or_else(|| "n/a".to_owned(), |rate| format!("{rate:.2}"));
-            println!("Started/sec:         {start_rate}");
-            println!(
-                "Start window:        {:.3} s ({start_window_method}, {} started)",
-                report.starts.window.as_secs_f64(),
-                report.starts.started
+            output.field("Started/sec:", start_rate);
+            output.field(
+                "Start window:",
+                format_args!(
+                    "{:.3} s ({start_window_method}, {} started)",
+                    report.starts.window.as_secs_f64(),
+                    report.starts.started
+                ),
             );
-            println!("Completed/sec:       {completed_per_second:.2}");
+
+            output.section(if args.bounded_latency {
+                "Iteration duration (HDR histogram, approximate upper bounds)"
+            } else {
+                "Iteration duration (exact)"
+            });
             if let Some(value) = mean(&report.scenarios) {
-                println!("Mean scenario time:  {value:.2} ms");
-            }
-            println!("Steps:");
-            for ((name, count), stats) in report.steps.iter().zip(&step_stats) {
-                let latency =
-                    mean(count).map_or_else(|| "n/a".into(), |value| format!("{value:.2} ms"));
-                println!(
-                    "  {name}: completed={} failed={} mean={latency}",
-                    count.completed, count.failed
-                );
-                for p in [50, 90, 95, 99, 100] {
-                    if let Some(value) = percentile(stats, p) {
-                        println!("    p{p}: {value:.2} ms");
+                for p in [50, 95, 99] {
+                    if let Some(duration) = percentile(&scenario_stats, p) {
+                        output.field(&format!("Duration p{p}:"), format_args!("{duration:.2} ms"));
                     }
                 }
+                output.field("Mean scenario time:", format_args!("{value:.2} ms"));
+            } else {
+                output.line(format_args!("No samples"));
+            }
+
+            output.section("Steps");
+            for ((name, count), stats) in report.steps.iter().zip(&step_stats) {
+                let skipped = report.scenarios.completed - count.completed;
+                output.line(format_args!(
+                    "  {name:?}  |  Completed: {}  Failed: {}  Skipped: {skipped}",
+                    count.completed, count.failed,
+                ));
+                let latency = mean(count).map(|mean| {
+                    std::iter::once(format!("mean {mean:.2} ms"))
+                        .chain([50, 90, 95, 99, 100].into_iter().filter_map(|p| {
+                            percentile(stats, p).map(|value| format!("p{p} {value:.2} ms"))
+                        }))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                });
+                output.line(format_args!(
+                    "    Latency: {}",
+                    latency.as_deref().unwrap_or("no samples")
+                ));
                 if !count.status_codes.is_empty() {
-                    println!("    HTTP status codes: {:?}", count.status_codes);
+                    let codes = count
+                        .status_codes
+                        .iter()
+                        .map(|(code, count)| format!("{code}: {count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    output.line(format_args!("    Lok'tar! HTTP status codes: {codes}"));
                 }
                 if !count.failure_details.is_empty() {
-                    println!("    Failure details: {:?}", count.failure_details);
+                    let failures = count
+                        .failure_details
+                        .iter()
+                        .map(|(category, count)| format!("{category}: {count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    output.line(format_args!(
+                        "    Failure details (may overlap): {failures}"
+                    ));
                 }
             }
-            if args.bounded_latency {
-                println!("Latency method: HDR histogram (approximate upper bounds)");
+            if args.max_failure_rate.is_some() || args.max_step_p95_ms.is_some() {
+                output.section("Thresholds");
             }
             if let Some(limit) = args.max_failure_rate {
                 let observed = failure_rate.map_or_else(
                     || "no completed scenarios".to_owned(),
                     |value| format!("{value:.2}%"),
                 );
-                println!(
-                    "Scenario failure rate threshold: {observed} / {limit:.2}% — {}",
-                    if failure_passed == Some(true) {
-                        "PASS"
-                    } else {
-                        "FAIL"
-                    }
+                let verdict = output.verdict(failure_passed == Some(true));
+                output.field(
+                    "Scenario failure rate:",
+                    format_args!("{observed} / {limit:.2}% — {verdict}"),
                 );
             }
             if let Some(limit) = args.max_step_p95_ms {
                 for (name, observed, passed) in &step_checks {
                     let observed = observed
                         .map_or_else(|| "no samples".to_owned(), |value| format!("{value:.2} ms"));
-                    println!(
-                        "Step {name:?} p95 threshold: {observed} / {limit:.2} ms — {}",
-                        if *passed == Some(true) {
-                            "PASS"
-                        } else {
-                            "FAIL"
-                        }
-                    );
+                    let verdict = output.verdict(*passed == Some(true));
+                    output.line(format_args!(
+                        "Step {name:?} p95: {observed} / {limit:.2} ms — {verdict}",
+                    ));
                 }
             }
+            output.print()?;
         }
         return Ok(exit_code);
     }
@@ -343,7 +387,7 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         .map(std::fs::read)
         .transpose()?
         .map(Into::into);
-    let result = run_with_cancellation(
+    let run = run_with_progress(
         TestPlan {
             url: args.url.expect("URL is required without --scenario"),
             requests: args.requests.unwrap_or(if args.duration.is_some() {
@@ -367,15 +411,13 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
             max_redirects: args.max_redirects.map_or(10, NonZeroUsize::get),
         },
         cancellation,
-    )
-    .await?;
+        reporting.progress.as_ref(),
+    );
+    let result = reporting.monitor(&interrupts, run).await?;
     let Some(mut report) = result else {
-        return Ok(signals::report(&interrupts, args.json));
+        return Ok(reporting.interrupted(&interrupts, args.json, args.bounded_latency)?);
     };
-    let stats = match report.bounded_latencies.take() {
-        Some(histogram) => Some(LatencyStats::from_bounded(histogram)),
-        None => LatencyStats::from_samples(std::mem::take(&mut report.latencies)),
-    };
+    let stats = report.take_latency_stats();
     let failure_rate =
         (report.completed > 0).then(|| report.failed as f64 * 100.0 / report.completed as f64);
     let p95_ms = stats
@@ -442,85 +484,97 @@ async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
         println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(exit_code);
     }
-    println!("For the Horde!\nWork complete!");
-    println!("{:<25}{}", "Completed requests:", report.completed);
-    println!("{:<25}{}", "Failed requests:", report.failed);
-    println!("{:<25}{}", "Connections opened:", report.connections_opened);
-    println!("Failure details (may overlap):");
-    println!("  {:<23}{}", "HTTP 4xx/5xx:", report.http_failures);
-    println!("  {:<23}{}", "Timeout:", report.timeout_failures);
-    println!("  {:<23}{}", "Connection:", report.connection_failures);
-    println!("  {:<23}{}", "Body read:", report.body_failures);
-    println!("  {:<23}{}", "Other:", report.other_failures);
-    println!("{:<25}{}", "Redirects followed:", report.redirects_followed);
-    println!(
-        "{:<25}{}",
-        "Redirect limit failures:", report.redirect_limit_failures
-    );
-    println!("{:<25}{}", "Response bytes:", report.bytes);
-    println!("{:<25}{:.3} s", "Elapsed:", report.elapsed.as_secs_f64());
-    println!(
-        "{:<25}{:.2}",
+    let mut output = TextReport::standalone(!passed, report.failed > 0);
+    output.section("Requests");
+    output.field("Completed requests:", report.completed);
+    output.field("Failed requests:", report.failed);
+    let elapsed = report.elapsed.as_secs_f64();
+    output.field("Elapsed:", format_args!("{elapsed:.3} s"));
+    output.field(
         "Requests/sec:",
-        report.completed as f64 / report.elapsed.as_secs_f64()
+        format_args!("{:.2}", report.completed as f64 / elapsed),
     );
-    println!("Lok'tar! HTTP status codes:");
-    if report.status_codes.is_empty() {
-        println!("  No HTTP responses received");
+
+    output.section(if args.bounded_latency {
+        "Latency (HDR histogram, approximate upper bounds)"
     } else {
-        for (code, count) in &report.status_codes {
-            println!("  {code}: {count}");
-        }
-    }
-    if args.bounded_latency {
-        println!("Ready for action: latency statistics (HDR histogram, approximate upper bounds)");
-    } else {
-        println!("Ready for action: latency statistics (exact)");
-    }
+        "Latency (exact)"
+    });
     if let Some(stats) = &stats {
+        for p in [50, 90, 95, 99, 100] {
+            if let Some(latency) = stats.percentile(p) {
+                output.field(
+                    &format!("Latency p{p}:"),
+                    format_args!("{:.2} ms", latency.as_secs_f64() * 1000.0),
+                );
+            }
+        }
         for (label, value) in [
             ("Latency min:", stats.min().as_secs_f64() * 1000.0),
             ("Latency mean:", stats.mean_ms),
             ("Latency median:", stats.median().as_secs_f64() * 1000.0),
             ("Latency max:", stats.max().as_secs_f64() * 1000.0),
         ] {
-            println!("{label:<25}{value:.2} ms");
+            output.field(label, format_args!("{value:.2} ms"));
+        }
+    } else {
+        output.line(format_args!("No samples"));
+    }
+
+    output.section("HTTP and connections");
+    output.field("Connections opened:", report.connections_opened);
+    output.field("Redirects followed:", report.redirects_followed);
+    output.field("Redirect limit failures:", report.redirect_limit_failures);
+    output.field("Response bytes:", report.bytes);
+    if report.status_codes.is_empty() {
+        output.line(format_args!("No HTTP responses received"));
+    } else {
+        output.line(format_args!("Lok'tar! HTTP status codes:"));
+        for (code, count) in &report.status_codes {
+            output.line(format_args!("  {code}: {count}"));
         }
     }
-    for p in [50, 90, 95, 99, 100] {
-        if let Some(latency) = stats.as_ref().and_then(|s| s.percentile(p)) {
-            println!(
-                "{:<25}{:.2} ms",
-                format!("Latency p{p}:"),
-                latency.as_secs_f64() * 1000.0
-            );
-        }
+    output.section("Failure details (may overlap)");
+    for (label, count) in [
+        ("HTTP 4xx/5xx:", report.http_failures),
+        ("Timeout:", report.timeout_failures),
+        ("Connection:", report.connection_failures),
+        ("Body read:", report.body_failures),
+        ("Other:", report.other_failures),
+    ] {
+        output.line(format_args!("  {label:<23}{count}"));
     }
-    if let Some(limit) = args.max_failure_rate {
-        match failure_rate {
-            Some(value) => println!(
-                "Failure rate threshold: {value:.2}% / {limit:.2}% — {}",
-                if failure_rate_passed == Some(true) {
-                    "PASS"
-                } else {
-                    "FAIL"
-                }
-            ),
-            None => println!("Failure rate threshold: no completed requests / {limit:.2}% — FAIL"),
-        }
+
+    if args.max_failure_rate.is_some() || args.max_p95_ms.is_some() {
+        output.section("Thresholds");
     }
-    if let Some(limit) = args.max_p95_ms {
-        match p95_ms {
-            Some(value) => println!(
-                "Latency p95 threshold: {value:.2} ms / {limit:.2} ms — {}",
-                if p95_passed == Some(true) {
-                    "PASS"
-                } else {
-                    "FAIL"
-                }
-            ),
-            None => println!("Latency p95 threshold: no samples / {limit:.2} ms — FAIL"),
-        }
+    for (label, limit, observed, unit, missing, passed) in [
+        (
+            "Failure rate:",
+            args.max_failure_rate,
+            failure_rate,
+            "%",
+            "no completed requests",
+            failure_rate_passed,
+        ),
+        (
+            "Latency p95:",
+            args.max_p95_ms,
+            p95_ms,
+            " ms",
+            "no samples",
+            p95_passed,
+        ),
+    ] {
+        let Some(limit) = limit else { continue };
+        let observed =
+            observed.map_or_else(|| missing.to_owned(), |value| format!("{value:.2}{unit}"));
+        let verdict = output.verdict(passed == Some(true));
+        output.field(
+            label,
+            format_args!("{observed} / {limit:.2}{unit} — {verdict}"),
+        );
     }
+    output.print()?;
     Ok(exit_code)
 }

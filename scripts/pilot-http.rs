@@ -19,6 +19,7 @@ fn respond(mut connection: TcpStream) -> io::Result<()> {
             "unexpected request",
         ));
     }
+    let mut user_agents = Vec::new();
     loop {
         line.clear();
         if request.read_line(&mut line)? == 0 {
@@ -30,8 +31,19 @@ fn respond(mut connection: TcpStream) -> io::Result<()> {
         if line == "\r\n" {
             break;
         }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("User-Agent")
+        {
+            user_agents.push(value.trim().to_owned());
+        }
     }
     connection.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")?;
+    let user_agent = match user_agents.as_slice() {
+        [value] => value,
+        [] => "<missing>",
+        _ => "<multiple>",
+    };
+    println!("pilot-http: user-agent: {user_agent}");
     println!("pilot-http: 200");
     Ok(())
 }

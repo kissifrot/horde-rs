@@ -984,7 +984,7 @@ impl Counts {
         if bounded {
             if self
                 .bounded_latencies
-                .get_or_insert_with(crate::BoundedLatency::new)
+                .get_or_insert_with(crate::BoundedLatency::new_growing)
                 .record(latency)
                 .is_err()
             {
@@ -1183,7 +1183,7 @@ pub async fn run_scenario_config(
     timeout: Duration,
     options: ScenarioOptions,
 ) -> Result<ScenarioReport, RunError> {
-    run_scenario_impl(scenario, iterations, users, timeout, options, None)
+    run_scenario_impl(scenario, iterations, users, timeout, options, None, None)
         .await?
         .ok_or_else(|| "unexpected scenario cancellation".into())
 }
@@ -1197,7 +1197,29 @@ pub async fn run_scenario_with_cancellation(
     options: ScenarioOptions,
     cancel: crate::Cancellation,
 ) -> Result<Option<ScenarioReport>, RunError> {
-    run_scenario_impl(scenario, iterations, users, timeout, options, Some(cancel)).await
+    run_scenario_with_progress(scenario, iterations, users, timeout, options, cancel, None).await
+}
+
+/// Run a cancellable scenario with optional tracking of completed iterations.
+pub async fn run_scenario_with_progress(
+    scenario: Scenario,
+    iterations: usize,
+    users: usize,
+    timeout: Duration,
+    options: ScenarioOptions,
+    cancel: crate::Cancellation,
+    progress: Option<&crate::RunProgress>,
+) -> Result<Option<ScenarioReport>, RunError> {
+    run_scenario_impl(
+        scenario,
+        iterations,
+        users,
+        timeout,
+        options,
+        Some(cancel),
+        progress,
+    )
+    .await
 }
 
 async fn run_scenario_impl(
@@ -1207,6 +1229,7 @@ async fn run_scenario_impl(
     timeout: Duration,
     options: ScenarioOptions,
     cancel: Option<crate::Cancellation>,
+    progress: Option<&crate::RunProgress>,
 ) -> Result<Option<ScenarioReport>, RunError> {
     let ScenarioOptions {
         verbose,
@@ -1243,19 +1266,30 @@ async fn run_scenario_impl(
     let scenario = Arc::new(scenario);
     let next = Arc::new(AtomicUsize::new(0));
     let mut tasks = tokio::task::JoinSet::new();
-    let mut cancel_rx = cancel.as_ref().map(crate::Cancellation::subscribe);
+    let mut cancel_rx = if progress.is_none() {
+        cancel.as_ref().map(crate::Cancellation::subscribe)
+    } else {
+        None
+    };
     let started = Instant::now();
+    let worker_progress = progress
+        .map(|progress| progress.start(started, users.min(iterations)))
+        .transpose()?;
     let next_start = rate.map(|_| Arc::new(Mutex::new(started)));
     for user_id in 1..=users.min(iterations) {
         if cancel
             .as_ref()
             .is_some_and(crate::Cancellation::is_cancelled)
         {
+            if progress.is_some() {
+                break;
+            }
             tasks.abort_all();
             while tasks.join_next().await.is_some() {}
             return Ok(None);
         }
         let worker_cancel = cancel.clone();
+        let progress = worker_progress.clone();
         let scenario = Arc::clone(&scenario);
         let next = Arc::clone(&next);
         let next_start = next_start.clone();
@@ -1271,196 +1305,206 @@ async fn run_scenario_impl(
             let mut previous_url: Option<Url> = None;
             let mut first_start = None;
             let mut last_start = None;
-            while let Ok(index) = next.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    (n < iterations).then(|| n + 1)
-                }) {
-                if worker_cancel.as_ref().is_some_and(crate::Cancellation::is_cancelled) { break; }
-                let iteration = index + 1;
-                if let (Some(rate), Some(next_start)) = (rate, &next_start) {
-                    let scheduled = {
-                        let mut next_time = next_start.lock().unwrap();
-                        let scheduled = (*next_time).max(Instant::now());
-                        *next_time = scheduled + Duration::from_secs_f64(1.0 / f64::from(rate));
-                        scheduled
-                    };
-                    if duration.is_some_and(|duration| scheduled.duration_since(started) >= duration) {
+            let retained_cancel = progress.as_ref().and(worker_cancel.as_ref());
+            let work = async {
+                'iterations: while let Ok(index) = next.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        (n < iterations).then(|| n + 1)
+                    }) {
+                    if worker_cancel.as_ref().is_some_and(crate::Cancellation::is_cancelled) { break; }
+                    let iteration = index + 1;
+                    if let (Some(rate), Some(next_start)) = (rate, &next_start) {
+                        let scheduled = {
+                            let mut next_time = next_start.lock().unwrap();
+                            let scheduled = (*next_time).max(Instant::now());
+                            *next_time = scheduled + Duration::from_secs_f64(1.0 / f64::from(rate));
+                            scheduled
+                        };
+                        if duration.is_some_and(|duration| scheduled.duration_since(started) >= duration) {
+                            break;
+                        }
+                        tokio::time::sleep_until(scheduled.into()).await;
+                    }
+                    if worker_cancel.as_ref().is_some_and(crate::Cancellation::is_cancelled) { break; }
+                    let run_started = Instant::now();
+                    if duration.is_some_and(|duration| run_started.duration_since(started) >= duration) {
                         break;
                     }
-                    tokio::time::sleep_until(scheduled.into()).await;
-                }
-                let run_started = Instant::now();
-                if duration.is_some_and(|duration| run_started.duration_since(started) >= duration) {
-                    break;
-                }
-                first_start.get_or_insert(run_started);
-                last_start = Some(run_started);
-                if verbose {
-                    use std::io::Write;
-                    let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] started", started.elapsed().as_secs_f64());
-                }
-                let mut run_failed = false;
-                // Extracted values are isolated per user and reset for each iteration.
-                let mut variables = BTreeMap::new();
-                for (index, step) in scenario.steps.iter().enumerate() {
-                    if !step.wait.is_zero() {
-                        if verbose {
-                            use std::io::Write;
-                            let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] waiting {} ms before step {:?}", started.elapsed().as_secs_f64(), step.wait.as_millis(), step.name);
-                        }
-                        tokio::time::sleep(step.wait).await;
-                    }
-                    if worker_cancel.as_ref().is_some_and(crate::Cancellation::is_cancelled) { run_failed = true; break; }
+                    first_start.get_or_insert(run_started);
+                    last_start = Some(run_started);
                     if verbose {
                         use std::io::Write;
-                        let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} started", started.elapsed().as_secs_f64(), step.name);
+                        let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] started", started.elapsed().as_secs_f64());
                     }
-                    let step_started = Instant::now();
-                    let (target_url, headers, request_body) = match step.prepare(&variables) {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
+                    let mut run_failed = false;
+                    // Extracted values are isolated per user and reset for each iteration.
+                    let mut variables = BTreeMap::new();
+                    for (index, step) in scenario.steps.iter().enumerate() {
+                        if !step.wait.is_zero() {
                             if verbose {
                                 use std::io::Write;
-                                let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} failed errors=variable field={} reason={:?}", started.elapsed().as_secs_f64(), step.name, error.field, error.reason);
+                                let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] waiting {} ms before step {:?}", started.elapsed().as_secs_f64(), step.wait.as_millis(), step.name);
                             }
-                            steps[index].record(step_started.elapsed(), true, None, &[(true, "variable")], bounded_latency);
+                            tokio::time::sleep(step.wait).await;
+                        }
+                        if worker_cancel.as_ref().is_some_and(crate::Cancellation::is_cancelled) {
+                            break 'iterations;
+                        }
+                        if verbose {
+                            use std::io::Write;
+                            let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} started", started.elapsed().as_secs_f64(), step.name);
+                        }
+                        let step_started = Instant::now();
+                        let (target_url, headers, request_body) = match step.prepare(&variables) {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                if verbose {
+                                    use std::io::Write;
+                                    let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} failed errors=variable field={} reason={:?}", started.elapsed().as_secs_f64(), step.name, error.field, error.reason);
+                                }
+                                steps[index].record(step_started.elapsed(), true, None, &[(true, "variable")], bounded_latency);
+                                run_failed = true;
+                                break;
+                            }
+                        };
+                        let referer = if auto_referer && !headers.contains_key(REFERER) {
+                            previous_url.as_ref().and_then(|previous| step_referer(previous, &target_url))
+                        } else { None };
+                        let mut request = client.request(step.method.clone(), target_url).headers(headers);
+                        if let Some(referer) = referer {
+                            request = request.header(REFERER, referer);
+                        }
+                        if let Some(body) = request_body {
+                            request = request.body(body);
+                        }
+                        let mut status = None;
+                        let mut bytes = 0u64;
+                        let mut http_error = false;
+                        let mut timeout_error = false;
+                        let mut connection_error = false;
+                        let mut body_error = false;
+                        let mut redirect_error = false;
+                        let mut url_assertion_error = false;
+                        let mut header_assertion_error = false;
+                        let mut body_assertion_error = false;
+                        let mut extraction_error = false;
+                        let mut extraction_detail = None;
+                        let mut other_error = false;
+                        let result = if let Some(limit) = max_redirects {
+                            match request.build() {
+                                Ok(request) => crate::redirect::send(&client, request, limit, timeout, None).await,
+                                Err(error) => Err(crate::redirect::RedirectError::Request(error)),
+                            }
+                        } else {
+                            request.send().await.map_err(crate::redirect::RedirectError::Request)
+                        };
+                        let failed = match result {
+                            Ok(response) => {
+                                if auto_referer {
+                                    previous_url = Some(response.url().clone());
+                                }
+                                status = Some(response.status().as_u16());
+                                let code = response.status().as_u16();
+                                let status_matches = step.expect.status.as_ref().map_or_else(|| response.status().is_success(), |allowed| allowed.contains(&code));
+                                http_error = !status_matches;
+                                url_assertion_error = step.expect.final_url.as_ref().is_some_and(|expected| expected != response.url());
+                                header_assertion_error = step.expect.headers.iter().any(|(name, value)| !response.headers().get_all(name).iter().any(|actual| actual == value));
+                                let headers = if step.extract.is_empty() { HeaderMap::new() } else { response.headers().clone() };
+                                let capture_body = step.extract.values().any(|source| matches!(source, Extract::Json(_) | Extract::Html { .. }));
+                                let mut captured = Vec::new();
+                                let mut found = step.expect.body_contains.is_none();
+                                let mut tail = Vec::new();
+                                let mut body = response.bytes_stream();
+                                while let Some(chunk) = body.next().await {
+                                    match chunk {
+                                        Ok(chunk) => {
+                                            if verbose { bytes = bytes.saturating_add(chunk.len() as u64); }
+                                            if capture_body {
+                                                const MAX_EXTRACT_BODY: usize = 2 * 1024 * 1024;
+                                                if chunk.len() > MAX_EXTRACT_BODY.saturating_sub(captured.len()) {
+                                                    extraction_error = true;
+                                                    extraction_detail = Some(ExtractionError {
+                                                        variable: None,
+                                                        reason: "response body exceeds the 2 MiB extraction limit",
+                                                    });
+                                                    break;
+                                                }
+                                                captured.extend_from_slice(&chunk);
+                                            }
+                                            if let Some(needle) = step.expect.body_contains.as_ref().filter(|_| !found) {
+                                                let keep = needle.len() - 1;
+                                                let prefix = keep.min(chunk.len());
+                                                tail.extend_from_slice(&chunk[..prefix]);
+                                                found = tail.windows(needle.len()).any(|window| window == needle.as_ref())
+                                                    || chunk.windows(needle.len()).any(|window| window == needle.as_ref());
+                                                if chunk.len() >= keep {
+                                                    tail.clear();
+                                                    tail.extend_from_slice(&chunk[chunk.len() - keep..]);
+                                                } else if tail.len() > keep {
+                                                    tail.drain(..tail.len() - keep);
+                                                }
+                                            }
+                                        }
+                                        Err(error) => { body_error = true; timeout_error = error.is_timeout(); break; }
+                                    }
+                                }
+                                body_assertion_error = !found;
+                                if !step.extract.is_empty() && !http_error && !body_error && !url_assertion_error && !header_assertion_error && !body_assertion_error && !extraction_error {
+                                    match extract_values(&step.extract, &headers, &captured) {
+                                        Ok(extracted) => variables.extend(extracted),
+                                        Err(error) => { extraction_error = true; extraction_detail = Some(error); }
+                                    }
+                                }
+                                http_error || body_error || url_assertion_error || header_assertion_error || body_assertion_error || extraction_error
+                            }
+                            Err(error) => {
+                                timeout_error = error.is_timeout();
+                                connection_error = error.is_connect();
+                                redirect_error = matches!(error, crate::redirect::RedirectError::Limit | crate::redirect::RedirectError::InvalidScheme);
+                                other_error = !timeout_error && !connection_error && !redirect_error;
+                                true
+                            },
+                        };
+                        let latency = step_started.elapsed();
+                        let errors = [(http_error, "status"), (url_assertion_error, "final_url"), (header_assertion_error, "header_assertion"), (body_assertion_error, "body_assertion"), (extraction_error, "extraction"), (timeout_error, "timeout"), (connection_error, "connection"), (body_error, "body"), (redirect_error, "redirect"), (other_error, "other")];
+                        if verbose {
+                            use std::io::Write;
+                            let mut stderr = std::io::stderr().lock();
+                            let status = status.map_or_else(|| "none".to_owned(), |code| code.to_string());
+                            let _ = write!(stderr, "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} completed status={status} bytes={bytes} latency_ms={:.2}", started.elapsed().as_secs_f64(), step.name, latency.as_secs_f64() * 1000.0);
+                            if failed {
+                                let _ = write!(stderr, " errors=");
+                                let mut separator = "";
+                                for (_, label) in errors.into_iter().filter(|(active, _)| *active) {
+                                    let _ = write!(stderr, "{separator}{label}");
+                                    separator = ",";
+                                }
+                            }
+                            if let Some(detail) = extraction_detail {
+                                if let Some(variable) = detail.variable {
+                                    let _ = write!(stderr, " extraction_variable={variable:?}");
+                                }
+                                let _ = write!(stderr, " extraction_reason={:?}", detail.reason);
+                            }
+                            let _ = writeln!(stderr);
+                        }
+                        steps[index].record(latency, failed, status, &errors, bounded_latency);
+                        if failed {
                             run_failed = true;
                             break;
                         }
-                    };
-                    let referer = if auto_referer && !headers.contains_key(REFERER) {
-                        previous_url.as_ref().and_then(|previous| step_referer(previous, &target_url))
-                    } else { None };
-                    let mut request = client.request(step.method.clone(), target_url).headers(headers);
-                    if let Some(referer) = referer {
-                        request = request.header(REFERER, referer);
                     }
-                    if let Some(body) = request_body {
-                        request = request.body(body);
-                    }
-                    let mut status = None;
-                    let mut bytes = 0u64;
-                    let mut http_error = false;
-                    let mut timeout_error = false;
-                    let mut connection_error = false;
-                    let mut body_error = false;
-                    let mut redirect_error = false;
-                    let mut url_assertion_error = false;
-                    let mut header_assertion_error = false;
-                    let mut body_assertion_error = false;
-                    let mut extraction_error = false;
-                    let mut extraction_detail = None;
-                    let mut other_error = false;
-                    let result = if let Some(limit) = max_redirects {
-                        match request.build() {
-                            Ok(request) => crate::redirect::send(&client, request, limit, timeout, None).await,
-                            Err(error) => Err(crate::redirect::RedirectError::Request(error)),
-                        }
-                    } else {
-                        request.send().await.map_err(crate::redirect::RedirectError::Request)
-                    };
-                    let failed = match result {
-                        Ok(response) => {
-                            if auto_referer {
-                                previous_url = Some(response.url().clone());
-                            }
-                            status = Some(response.status().as_u16());
-                            let code = response.status().as_u16();
-                            let status_matches = step.expect.status.as_ref().map_or_else(|| response.status().is_success(), |allowed| allowed.contains(&code));
-                            http_error = !status_matches;
-                            url_assertion_error = step.expect.final_url.as_ref().is_some_and(|expected| expected != response.url());
-                            header_assertion_error = step.expect.headers.iter().any(|(name, value)| !response.headers().get_all(name).iter().any(|actual| actual == value));
-                            let headers = if step.extract.is_empty() { HeaderMap::new() } else { response.headers().clone() };
-                            let capture_body = step.extract.values().any(|source| matches!(source, Extract::Json(_) | Extract::Html { .. }));
-                            let mut captured = Vec::new();
-                            let mut found = step.expect.body_contains.is_none();
-                            let mut tail = Vec::new();
-                            let mut body = response.bytes_stream();
-                            while let Some(chunk) = body.next().await {
-                                match chunk {
-                                    Ok(chunk) => {
-                                        if verbose { bytes = bytes.saturating_add(chunk.len() as u64); }
-                                        if capture_body {
-                                            const MAX_EXTRACT_BODY: usize = 2 * 1024 * 1024;
-                                            if chunk.len() > MAX_EXTRACT_BODY.saturating_sub(captured.len()) {
-                                                extraction_error = true;
-                                                extraction_detail = Some(ExtractionError {
-                                                    variable: None,
-                                                    reason: "response body exceeds the 2 MiB extraction limit",
-                                                });
-                                                break;
-                                            }
-                                            captured.extend_from_slice(&chunk);
-                                        }
-                                        if let Some(needle) = step.expect.body_contains.as_ref().filter(|_| !found) {
-                                            let keep = needle.len() - 1;
-                                            let prefix = keep.min(chunk.len());
-                                            tail.extend_from_slice(&chunk[..prefix]);
-                                            found = tail.windows(needle.len()).any(|window| window == needle.as_ref())
-                                                || chunk.windows(needle.len()).any(|window| window == needle.as_ref());
-                                            if chunk.len() >= keep {
-                                                tail.clear();
-                                                tail.extend_from_slice(&chunk[chunk.len() - keep..]);
-                                            } else if tail.len() > keep {
-                                                tail.drain(..tail.len() - keep);
-                                            }
-                                        }
-                                    }
-                                    Err(error) => { body_error = true; timeout_error = error.is_timeout(); break; }
-                                }
-                            }
-                            body_assertion_error = !found;
-                            if !step.extract.is_empty() && !http_error && !body_error && !url_assertion_error && !header_assertion_error && !body_assertion_error && !extraction_error {
-                                match extract_values(&step.extract, &headers, &captured) {
-                                    Ok(extracted) => variables.extend(extracted),
-                                    Err(error) => { extraction_error = true; extraction_detail = Some(error); }
-                                }
-                            }
-                            http_error || body_error || url_assertion_error || header_assertion_error || body_assertion_error || extraction_error
-                        }
-                        Err(error) => {
-                            timeout_error = error.is_timeout();
-                            connection_error = error.is_connect();
-                            redirect_error = matches!(error, crate::redirect::RedirectError::Limit | crate::redirect::RedirectError::InvalidScheme);
-                            other_error = !timeout_error && !connection_error && !redirect_error;
-                            true
-                        },
-                    };
-                    let latency = step_started.elapsed();
-                    let errors = [(http_error, "status"), (url_assertion_error, "final_url"), (header_assertion_error, "header_assertion"), (body_assertion_error, "body_assertion"), (extraction_error, "extraction"), (timeout_error, "timeout"), (connection_error, "connection"), (body_error, "body"), (redirect_error, "redirect"), (other_error, "other")];
                     if verbose {
                         use std::io::Write;
-                        let mut stderr = std::io::stderr().lock();
-                        let status = status.map_or_else(|| "none".to_owned(), |code| code.to_string());
-                        let _ = write!(stderr, "[+{:.3}s] [user {user_id} scenario {iteration}] step {:?} completed status={status} bytes={bytes} latency_ms={:.2}", started.elapsed().as_secs_f64(), step.name, latency.as_secs_f64() * 1000.0);
-                        if failed {
-                            let _ = write!(stderr, " errors=");
-                            let mut separator = "";
-                            for (_, label) in errors.into_iter().filter(|(active, _)| *active) {
-                                let _ = write!(stderr, "{separator}{label}");
-                                separator = ",";
-                            }
-                        }
-                        if let Some(detail) = extraction_detail {
-                            if let Some(variable) = detail.variable {
-                                let _ = write!(stderr, " extraction_variable={variable:?}");
-                            }
-                            let _ = write!(stderr, " extraction_reason={:?}", detail.reason);
-                        }
-                        let _ = writeln!(stderr);
+                        let outcome = if run_failed { "failed" } else { "succeeded" };
+                        let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] {outcome}", started.elapsed().as_secs_f64());
                     }
-                    steps[index].record(latency, failed, status, &errors, bounded_latency);
-                    if failed {
-                        run_failed = true;
-                        break;
+                    totals.record(run_started.elapsed(), run_failed, None, &[], bounded_latency);
+                    if let Some(progress) = &progress {
+                        progress[user_id - 1].record(totals.completed, totals.failed, run_failed);
                     }
                 }
-                if verbose {
-                    use std::io::Write;
-                    let outcome = if run_failed { "failed" } else { "succeeded" };
-                    let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [user {user_id} scenario {iteration}] {outcome}", started.elapsed().as_secs_f64());
-                }
-                totals.record(run_started.elapsed(), run_failed, None, &[], bounded_latency);
-            }
+            };
+            crate::cancellation::run_until_cancelled(retained_cancel, work).await;
             (totals, steps, first_start, last_start)
         });
     }
@@ -1502,6 +1546,12 @@ async fn run_scenario_impl(
             last_start = Some(last_start.map_or(last, |current| current.max(last)));
         }
         report.scenarios.merge(totals)?;
+        if cancel
+            .as_ref()
+            .is_some_and(crate::Cancellation::is_cancelled)
+        {
+            continue;
+        }
         for ((_, aggregate), step) in report.steps.iter_mut().zip(steps) {
             aggregate.merge(step)?;
         }
@@ -1510,6 +1560,9 @@ async fn run_scenario_impl(
         .as_ref()
         .is_some_and(crate::Cancellation::is_cancelled)
     {
+        if let Some(progress) = progress {
+            progress.finish_interrupted(started.elapsed(), report.scenarios.take_latency_stats());
+        }
         return Ok(None);
     }
     report.elapsed = started.elapsed();

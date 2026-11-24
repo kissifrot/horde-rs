@@ -1,14 +1,17 @@
 mod inventory;
 
-use clap::{Args, Subcommand};
+use crate::text_report::{TextReport, Tone};
+use clap::{Args, Subcommand, ValueEnum};
 use horde_rs::{
     Cancellation, TestPlan,
     distributed::{
-        AgentLimits, Budget, GruntPolicy, MAX_ENVELOPE_BYTES, ResourceLimits, ThresholdResult,
-        controller::{Controller, Grunt},
+        AgentLimits, AgentStatus, Budget, GruntPolicy, MAX_ENVELOPE_BYTES, ResourceLimits,
+        ThresholdResult, ThresholdResults,
+        controller::{CapacityFailure, Controller, ControllerReport, Grunt},
         transport::{Endpoint, EndpointLimits, ListenerPolicy, MAX_RETAINED_RESULT_BYTES, Profile},
     },
 };
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -32,7 +35,7 @@ const MAX_RUN_RECORDS: usize = 64;
 pub(crate) enum Command {
     /// Serve a fixed loopback HTTP GET profile over mutual TLS.
     Grunt(GruntArgs),
-    /// Split a request budget across Grunts and print merged JSON results.
+    /// Split a request budget across Grunts and print merged results.
     Controller(ControllerArgs),
     /// Verify Grunt control connections through the authenticated hello.
     Preflight(PreflightArgs),
@@ -129,6 +132,15 @@ pub(crate) struct ControllerArgs {
     /// CI threshold for the merged p95 in milliseconds.
     #[arg(long)]
     max_p95_ms: Option<f64>,
+    /// Output format for the final report.
+    #[arg(long, value_enum, default_value = "json")]
+    format: ReportFormat,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ReportFormat {
+    Json,
+    Text,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +159,7 @@ struct GruntConfig {
     allow_controller_ip: Vec<IpAddr>,
     #[serde(deserialize_with = "deserialize_target")]
     target: reqwest::Url,
+    user_agent: Option<String>,
     controller_cert: Vec<PathBuf>,
     tls: Identity,
     max_records: Option<usize>,
@@ -212,6 +225,7 @@ impl GruntArgs {
                 listen: self.listen.ok_or("missing --listen")?,
                 allow_controller_ip: self.allow_controller_ip,
                 target: self.target.ok_or("missing --target")?,
+                user_agent: None,
                 controller_cert: self.controller_cert,
                 tls: self.identity.load()?,
                 max_records: None,
@@ -348,7 +362,7 @@ fn certificate(path: &Path) -> Result<CertificateDer<'static>, BoxError> {
 
 pub(crate) async fn run(command: Command) -> Result<ExitCode, BoxError> {
     let cancel = Cancellation::new();
-    let signals = crate::signals::install(cancel.clone())?;
+    let signals = crate::signals::install(cancel.clone(), false)?;
     match command {
         Command::Grunt(args) => serve(args.load()?, signals).await,
         Command::Controller(args) => coordinate(args, cancel, signals).await,
@@ -374,6 +388,15 @@ async fn serve(
         )
         .into());
     }
+    let mut headers = HeaderMap::new();
+    let mut max_header_bytes = 0;
+    if let Some(user_agent) = args.user_agent {
+        let value = HeaderValue::from_str(&user_agent)
+            .map_err(|_| "Grunt user_agent is not a valid HTTP header value")?;
+        // The controller selects this local profile without supplying headers.
+        max_header_bytes = USER_AGENT.as_str().len() + value.as_bytes().len();
+        headers.insert(USER_AGENT, value);
+    }
     let listener_policy = ListenerPolicy::for_listener(args.listen, args.allow_controller_ip)?;
     let target_ip = args
         .target
@@ -395,7 +418,7 @@ async fn serve(
             max_request_timeout: Duration::from_secs(10),
             max_redirects: 0,
             max_body_bytes: 0,
-            max_header_bytes: 0,
+            max_header_bytes,
         },
     )?;
     let plan = TestPlan {
@@ -404,7 +427,7 @@ async fn serve(
         concurrency: 1,
         timeout: Duration::from_secs(10),
         method: reqwest::Method::GET,
-        headers: reqwest::header::HeaderMap::new(),
+        headers,
         body: None,
         duration: None,
         rate: None,
@@ -546,59 +569,159 @@ async fn coordinate(
         )
         .await?;
     let signal = *signals.borrow();
-    let aggregate = report.aggregate;
+    let aggregate = &report.aggregate;
     let partial = aggregate.is_partial() || report.interrupted || signal.is_some();
     let thresholds = aggregate.evaluate_thresholds(args.max_failure_rate, args.max_p95_ms)?;
-    let threshold = |configured: Option<f64>, value| match (configured, partial, value) {
-        (None, _, _) => "not_configured",
-        (_, true, _) | (_, _, ThresholdResult::NotEvaluable) => "not_evaluable",
-        (_, _, ThresholdResult::Passed) => "passed",
-        (_, _, ThresholdResult::Failed) => "failed",
-        _ => "not_configured",
+    let thresholds_failed = matches!(thresholds.failure_rate, ThresholdResult::Failed)
+        || matches!(thresholds.p95, ThresholdResult::Failed);
+    let effective = |limit: Option<f64>, value| match (limit, partial) {
+        (None, _) => ThresholdResult::NotConfigured,
+        (Some(_), true) => ThresholdResult::NotEvaluable,
+        (Some(_), false) => value,
     };
-    let agents = aggregate.agents().iter().map(|(agent, status)| {
-        use horde_rs::distributed::AgentStatus::*;
-        let status = match status {
-            Some(Complete) => "complete",
-            Some(Cancelled) => "cancelled",
-            Some(Failed) => "failed",
-            Some(TimedOut) => "timed_out",
-            Some(SampleLimit) => "sample_limit",
-            Some(AgentDeadline) => "agent_deadline",
-            Some(Invalid) => "invalid",
-            None => "missing",
-        };
-        let mut entry = serde_json::json!({"address": agent, "status": status, "elapsed_seconds": aggregate.agent_elapsed(agent).map(|v| v.as_secs_f64())});
-        if let Some(reason) = report.capacity_failures.get(agent) {
-            entry["reason"] = serde_json::json!(reason);
-        }
-        entry
-    }).collect::<Vec<_>>();
+    let thresholds = ThresholdResults {
+        failure_rate: effective(args.max_failure_rate, thresholds.failure_rate),
+        p95: effective(args.max_p95_ms, thresholds.p95),
+    };
     let percentile = |percent| {
         aggregate
             .histogram()
             .and_then(|histogram| histogram.percentile(percent))
             .map(|v| v.as_secs_f64() * 1000.0)
     };
-    println!(
-        "{}",
-        serde_json::json!({
-            "schema_version": 1, "type": "distributed", "partial": partial,
-            "interruption": signal.map(|signal| signal.label()),
-            "elapsed_seconds": report.elapsed.as_secs_f64(), "agents": agents,
-            "metrics": aggregate.metrics(), "requests_per_second": aggregate.throughput(report.elapsed),
-            "latency_ms": {"p50": percentile(50), "p95": percentile(95), "p99": percentile(99)},
-            "thresholds": {"failure_rate": threshold(args.max_failure_rate, thresholds.failure_rate), "p95": threshold(args.max_p95_ms, thresholds.p95)},
-        })
-    );
-    if let Some(signal) = signal {
-        return Ok(ExitCode::from(signal.code()));
+    match args.format {
+        ReportFormat::Json => {
+            let threshold = |value| match value {
+                ThresholdResult::NotConfigured => "not_configured",
+                ThresholdResult::NotEvaluable => "not_evaluable",
+                ThresholdResult::Passed => "passed",
+                ThresholdResult::Failed => "failed",
+            };
+            let agents = aggregate.agents().iter().map(|(agent, status)| {
+                let (status, _, _) = agent_status(*status);
+                let mut entry = serde_json::json!({"address": agent, "status": status, "elapsed_seconds": aggregate.agent_elapsed(agent).map(|v| v.as_secs_f64())});
+                if let Some(reason) = report.capacity_failures.get(agent) {
+                    entry["reason"] = serde_json::json!(reason);
+                }
+                entry
+            }).collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1, "type": "distributed", "partial": partial,
+                    "interruption": signal.map(|signal| signal.label()),
+                    "elapsed_seconds": report.elapsed.as_secs_f64(), "agents": agents,
+                    "metrics": aggregate.metrics(), "requests_per_second": aggregate.throughput(report.elapsed),
+                    "latency_ms": {"p50": percentile(50), "p95": percentile(95), "p99": percentile(99)},
+                    "thresholds": {"failure_rate": threshold(thresholds.failure_rate), "p95": threshold(thresholds.p95)},
+                })
+            );
+        }
+        ReportFormat::Text => {
+            let (status, tone) = if partial {
+                ("PARTIAL", Tone::Warning)
+            } else if thresholds_failed {
+                ("THRESHOLD FAILED", Tone::Error)
+            } else if aggregate.metrics().failed > 0 {
+                ("COMPLETE WITH ERRORS", Tone::Warning)
+            } else {
+                ("COMPLETE", Tone::Good)
+            };
+            let mut output = TextReport::new("Distributed", status, tone);
+            if let Some(signal) = signal {
+                output.field("Interruption:", signal.label());
+            }
+            let metrics = aggregate.metrics();
+            output.section("Requests");
+            output.field(
+                "Completed requests:",
+                format_args!("{} / {}", metrics.completed, args.requests),
+            );
+            if partial {
+                output.line(format_args!("Counts include confirmed Grunt results only."));
+            }
+            output.field("Failed requests:", metrics.failed);
+            output.field(
+                "Elapsed:",
+                format_args!("{:.3} s", report.elapsed.as_secs_f64()),
+            );
+            if let Some(throughput) = aggregate.throughput(report.elapsed) {
+                output.field("Requests/sec:", format_args!("{throughput:.2}"));
+            }
+            output.section("Latency (merged HDR histogram, approximate upper bounds)");
+            if aggregate.histogram().is_some() {
+                for p in [50, 95, 99] {
+                    if let Some(value) = percentile(p) {
+                        output.field(&format!("Latency p{p}:"), format_args!("{value:.2} ms"));
+                    }
+                }
+            } else {
+                output.line(format_args!("No samples"));
+            }
+            write_grunts(&mut output, &report);
+            if args.max_failure_rate.is_some() || args.max_p95_ms.is_some() {
+                output.section("Thresholds");
+            }
+            for (label, limit, unit, result) in [
+                (
+                    "Failure rate:",
+                    args.max_failure_rate,
+                    "%",
+                    thresholds.failure_rate,
+                ),
+                ("Latency p95:", args.max_p95_ms, " ms", thresholds.p95),
+            ] {
+                let Some(limit) = limit else { continue };
+                let verdict = match result {
+                    ThresholdResult::Passed => output.status("PASS", Tone::Good),
+                    ThresholdResult::Failed => output.status("FAIL", Tone::Error),
+                    _ => output.status("NOT EVALUABLE", Tone::Warning),
+                };
+                output.field(label, format_args!("limit {limit:.2}{unit} — {verdict}"));
+            }
+            output.print()?;
+        }
     }
-    Ok(ExitCode::from(u8::from(
-        partial
-            || matches!(thresholds.failure_rate, ThresholdResult::Failed)
-            || matches!(thresholds.p95, ThresholdResult::Failed),
+    Ok(ExitCode::from(signal.map_or(
+        u8::from(partial || thresholds_failed),
+        |signal| signal.code(),
     )))
+}
+
+fn agent_status(status: Option<AgentStatus>) -> (&'static str, &'static str, Tone) {
+    match status {
+        Some(AgentStatus::Complete) => ("complete", "Complete", Tone::Good),
+        Some(AgentStatus::Cancelled) => ("cancelled", "Cancelled", Tone::Warning),
+        Some(AgentStatus::Failed) => ("failed", "Failed", Tone::Error),
+        Some(AgentStatus::TimedOut) => ("timed_out", "Timed out", Tone::Warning),
+        Some(AgentStatus::SampleLimit) => ("sample_limit", "Sample limit reached", Tone::Warning),
+        Some(AgentStatus::AgentDeadline) => {
+            ("agent_deadline", "Grunt deadline reached", Tone::Warning)
+        }
+        Some(AgentStatus::Invalid) => ("invalid", "Invalid result", Tone::Error),
+        None => ("missing", "Missing", Tone::Warning),
+    }
+}
+
+fn write_grunts(output: &mut TextReport, report: &ControllerReport) {
+    output.section("Grunts");
+    for (address, status) in report.aggregate.agents() {
+        let (_, label, tone) = agent_status(*status);
+        let status = output.status(label, tone);
+        let detail = match report.capacity_failures.get(address) {
+            Some(CapacityFailure::RunRecordCapacity) => " (run record capacity reached)".to_owned(),
+            Some(CapacityFailure::ResultStorageCapacity) => {
+                " (result storage capacity reached)".to_owned()
+            }
+            None => report
+                .aggregate
+                .agent_elapsed(address)
+                .map_or_else(String::new, |elapsed| {
+                    format!(" ({:.3} s)", elapsed.as_secs_f64())
+                }),
+        };
+        output.line(format_args!("  {address}  {status}{detail}"));
+    }
 }
 
 #[cfg(test)]

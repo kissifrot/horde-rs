@@ -62,7 +62,9 @@ Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
 
 Each worker sends requests sequentially. Use `--duration` to stop starting requests after a time limit; in-flight requests finish. With both `--duration` and `-n`, the first limit reached applies. Without either, Horde sends one request. The timeout covers each request, including redirects and the response body.
 
-Press Ctrl+C to cancel a run and close its active requests. On Unix, SIGTERM behaves likewise. Horde reports an interrupted, partial run without metrics or passing CI thresholds and exits with 130 for SIGINT or 143 for SIGTERM. With `--json`, the interruption is a JSON object with `type: "interrupted"` and `thresholds.status: "not_evaluable"`. A second signal, or a shutdown taking more than five seconds, forces immediate exit and may prevent the report from being printed.
+Standalone text runs show a progress line in an interactive terminal once per second. It shows completed requests or scenario iterations, failures, and average throughput. Verbose runs use their per-request logs.
+
+Press Ctrl+C to cancel a run and close its active requests. On Unix, SIGTERM behaves likewise. The partial text report includes completed and failed counts, elapsed time, average throughput, and p95/p99 for completed requests or scenario iterations. Horde calculates these percentiles once after the workers stop. The report excludes work still in flight and marks CI thresholds as not evaluable. Horde exits with 130 for SIGINT or 143 for SIGTERM. With `--json`, the interruption is a JSON object with `type: "interrupted"` and `thresholds.status: "not_evaluable"`. A second signal, or a shutdown taking more than five seconds, forces immediate exit and may prevent the report from being printed.
 
 For single-URL tests, `--rate` spaces logical request starts across all workers. Concurrency, response time and scheduling affect the achieved rate. Redirects are not separately rate-limited, and waiting for a rate slot is excluded from latency and timeout. The scheduler normally waits on Tokio’s timer. The timer cutoff is the larger of 1,000 starts/s per process and a worker-based allowance. The allowance is 600 starts/s per worker for up to 2 local workers, 550 for 3–4, 525 for 5–7, and 500 for 8 or more. Above the cutoff, it uses a shared admission clock and yields until the next start. Each Grunt applies the cutoff to its own share. This avoids millisecond rounding at high rates, at a higher CPU cost. Missed slots do not accumulate in this path.
 
@@ -171,6 +173,10 @@ For separate scenario steps, `--auto-referer` derives the header from the previo
 
 For single-URL tests, the report shows completed and failed requests, throughput, response bytes, HTTP status counts and latency statistics. Completed requests include failures. Response bytes include partial bodies; latency ends when the body is read or an error occurs. Scenario reports provide iteration and per-step statistics as described above.
 
+Standalone runs print a text report by default. Scenario reports include a summary
+for each step, with completed, failed and skipped counts. Use `--json` for scripts.
+Text reports color their status in a terminal. Set `NO_COLOR=1` to disable color.
+
 For single-URL tests, failures include HTTP 4xx/5xx, timeouts, connection errors, body-read errors and redirect-limit errors. Failure categories can overlap, but each failed request is counted only once. A completed run exits successfully by default even if requests or scenarios fail; invalid configuration and internal errors return a nonzero code.
 
 Status counts use the final response when redirects are followed. A status is counted when its headers arrive, even if the body later fails. A request with no final response has no status. In single-URL reports, redirect counts include decisions to follow redirects even if a later request fails.
@@ -183,7 +189,7 @@ Use `--json` for a machine-readable summary (schema version 1, elapsed time in s
 
 ### Bounded-memory latency statistics
 
-For long tests, `--bounded-latency` uses fixed-size HDR histograms per active worker; scenarios use one per executed step as well as one for iteration duration. Percentiles and the median are approximate upper bounds, with about 0.1% precision; minimum, maximum and mean use observed latencies. Memory depends on concurrency and the number of steps, and may exceed exact mode for small tests. The report and JSON identify the method.
+For long tests, `--bounded-latency` uses bounded-memory HDR histograms per active worker. Scenarios use one per executed step and one for iteration duration. Each scenario histogram grows to cover the recorded latencies, with a bounded range. Percentiles and the median are approximate upper bounds, with about 0.1% precision; minimum, maximum and mean use observed latencies. Memory depends on concurrency and the number of steps, and may exceed exact mode for small tests. The report and JSON identify the method.
 
 A sample beyond the histogram's range (about 584 years) fails the run rather than being clipped.
 
@@ -323,7 +329,8 @@ Use `horde inventory --config controller.json` with `add`, `list` or
 `remove` to manage the peers for the next run.
 See the [configuration and inventory examples](docs/distributed-pilot.md#start-each-grunt).
 
-The controller emits JSON with per-Grunt states, merged metrics and percentiles.
+The controller emits JSON by default. Add `--format text` for a terminal
+summary of the completed budget, merged percentiles, per-Grunt states and CI thresholds.
 It returns a nonzero exit code for partial runs or failed configured thresholds.
 On interruption it requests cancellation concurrently and keeps metrics from
 validated completed Grunts. Unconfirmed Grunts are reported as missing.

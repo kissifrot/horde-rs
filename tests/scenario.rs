@@ -1,7 +1,7 @@
 mod common;
 use common::CommandTimeout;
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     process::Command,
     sync::{
@@ -165,15 +165,25 @@ fn scenario_rate_is_global_and_respects_duration_and_iteration_limits() {
     assert!(!invalid.status.success());
     assert!(text_report.status.success());
     let text_report = String::from_utf8_lossy(&text_report.stdout);
-    assert!(
-        text_report.contains("Target starts/sec:   2"),
-        "{text_report}"
-    );
-    assert!(text_report.contains("Completed/sec:"), "{text_report}");
-    assert!(
-        text_report.contains("Started/sec:         n/a"),
-        "{text_report}"
-    );
+    assert!(text_report.starts_with("For the Horde! | Standalone | COMPLETE\n"));
+    assert!(!text_report.contains('\x1b'));
+    for expected in [
+        "Target starts/sec:       2",
+        "Started/sec:             n/a",
+        "Completed/sec:",
+        "Iteration duration (exact)",
+        "Duration p95:",
+        "Duration p99:",
+        "\"first\"  |  Completed: 1  Failed: 0  Skipped: 0",
+        "\"second\"  |  Completed: 1  Failed: 0  Skipped: 0",
+        "Lok'tar! HTTP status codes: 200: 1",
+    ] {
+        assert!(
+            text_report.contains(expected),
+            "Missing {expected:?}:\n{text_report}"
+        );
+    }
+    assert!(text_report.find("\"first\"").unwrap() < text_report.find("\"second\"").unwrap());
     assert!(saturated.status.success());
     let saturated: serde_json::Value = serde_json::from_slice(&saturated.stdout).unwrap();
     assert_eq!(saturated["scenarios"]["completed"], 2);
@@ -452,14 +462,25 @@ fn failed_step_stops_scenario_and_reports_skipped_steps() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = common::accept(&listener);
-        let mut data = [0; 4096];
-        assert!(stream.read(&mut data).unwrap() > 0);
-        write!(
-            stream,
-            "HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
+        for _ in 0..2 {
+            let (mut stream, _) = common::accept(&listener);
+            let mut request = BufReader::new(&mut stream);
+            let mut line = String::new();
+            assert!(request.read_line(&mut line).unwrap() > 0);
+            assert!(line.starts_with("GET / HTTP/"), "{line}");
+            loop {
+                line.clear();
+                assert!(request.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        }
     });
     let file = std::env::temp_dir().join(format!(
         "horde-scenario-failure-{}.json",
@@ -471,6 +492,12 @@ fn failed_step_stops_scenario_and_reports_skipped_steps() {
         .arg(&file)
         .arg("-v")
         .arg("--json")
+        .output_timeout()
+        .unwrap();
+    let text = Command::new(env!("CARGO_BIN_EXE_horde"))
+        .arg("--scenario")
+        .arg(&file)
+        .args(["--bounded-latency", "--max-step-p95-ms", "250"])
         .output_timeout()
         .unwrap();
     std::fs::remove_file(file).unwrap();
@@ -492,6 +519,20 @@ fn failed_step_stops_scenario_and_reports_skipped_steps() {
     assert!(log.contains("] failed"), "{log}");
     assert!(!log.contains("skipped"), "{log}");
     assert!(report["steps"][1]["mean_latency_ms"].is_null());
+
+    assert_eq!(text.status.code(), Some(2));
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.starts_with("For the Horde! | Standalone | THRESHOLD FAILED\n"));
+    for expected in [
+        "Iteration duration (HDR histogram, approximate upper bounds)",
+        "\"first\"  |  Completed: 1  Failed: 1  Skipped: 0",
+        "Lok'tar! HTTP status codes: 500: 1",
+        "Failure details (may overlap): status: 1",
+        "\"skipped\"  |  Completed: 0  Failed: 0  Skipped: 1\n    Latency: no samples",
+        "Step \"skipped\" p95: no samples / 250.00 ms — FAIL",
+    ] {
+        assert!(text.contains(expected), "Missing {expected:?}:\n{text}");
+    }
 }
 
 #[test]

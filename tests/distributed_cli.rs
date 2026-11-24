@@ -38,6 +38,25 @@ impl Process {
     }
 }
 
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(prefix: &str) -> Self {
+        let mut nonce = [0; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("horde-{prefix}-{:016x}", u64::from_ne_bytes(nonce)));
+        std::fs::create_dir(&directory).unwrap();
+        Self(directory)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/grunt-tls")
@@ -176,20 +195,7 @@ fn report(output: &Output) -> Value {
 
 #[test]
 fn inventory_flags_save_a_valid_snapshot_before_preflight_and_run() {
-    struct Scratch(PathBuf);
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let mut nonce = [0; 8];
-    getrandom::fill(&mut nonce).unwrap();
-    let directory = std::env::temp_dir().join(format!(
-        "horde-inventory-{:016x}",
-        u64::from_ne_bytes(nonce)
-    ));
-    std::fs::create_dir(&directory).unwrap();
-    let scratch = Scratch(directory);
+    let scratch = Scratch::new("inventory");
     let inventory = scratch.0.join("grunts.json");
 
     let unused_target = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -278,6 +284,71 @@ fn preflight_requires_the_hello_after_controller_authorization() {
     assert_eq!(
         target.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn grunt_config_sets_the_user_agent_and_rejects_invalid_values() {
+    const CUSTOM: &str = "Horde-Pilot/1.0";
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for expected in [concat!("Horde/", env!("CARGO_PKG_VERSION")), CUSTOM] {
+            let (mut stream, _) = common::accept(&target);
+            let mut lines = BufReader::new(&mut stream).lines().map(Result::unwrap);
+            assert!(lines.next().unwrap().starts_with("GET / "));
+            let headers = lines
+                .take_while(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            let agents = headers
+                .iter()
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(name, _)| name.eq_ignore_ascii_case("User-Agent"))
+                .map(|(_, value)| value.trim())
+                .collect::<Vec<_>>();
+            assert_eq!(agents, [expected]);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        }
+    });
+    let scratch = Scratch::new("grunt-config");
+    let path = scratch.0.join("grunt.json");
+    let command = |user_agent: Option<&str>| {
+        let mut config = serde_json::json!({
+            "listen": "127.0.0.1:0",
+            "target": format!("http://{target_addr}/"),
+            "controller_cert": [fixture("controller.der")],
+            "tls": {"ca": [fixture("ca.der")], "cert": fixture("server.der"), "key": fixture("server-key.der")},
+        });
+        if let Some(value) = user_agent {
+            config["user_agent"] = value.into();
+        }
+        std::fs::write(&path, config.to_string()).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_horde"));
+        command.args(["grunt", "--config"]).arg(&path);
+        command
+    };
+
+    for user_agent in [None, Some(CUSTOM)] {
+        let (address, _grunt) = start_grunt_command(command(user_agent));
+        let output = controller(&[address], 1).output_timeout().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(report(&output)["metrics"]["completed"], 1);
+    }
+    server.join().unwrap();
+
+    let output = common::output_with_timeout(
+        &mut command(Some("Horde\r\nInjected: value")),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Grunt user_agent is not a valid HTTP header value"),
+        "{stderr}"
     );
 }
 
@@ -409,6 +480,33 @@ fn unavailable_grunt_leaves_a_partial_report_without_reassigning_its_share() {
             .iter()
             .any(|agent| agent["address"] == missing.to_string() && agent["status"] == "missing")
     );
+    target_server.join().unwrap();
+}
+
+#[test]
+fn controller_text_shows_confirmed_metrics_and_missing_grunt() {
+    let (target, target_server) = start_target(1, 0);
+    let (working, _process) = start_grunt(target);
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let missing = unavailable.local_addr().unwrap();
+    let output = controller(&[working, missing], 2)
+        .args(["--format", "text"])
+        .output_timeout()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    for expected in [
+        "For the Horde! | Distributed | PARTIAL",
+        "Completed requests:      1 / 2",
+        "Latency p95:",
+        "Latency p99:",
+        &format!("{working}  Complete"),
+        &format!("{missing}  Missing"),
+        "limit 250.00 ms — NOT EVALUABLE",
+    ] {
+        assert!(stdout.contains(expected), "Missing {expected:?}:\n{stdout}");
+    }
+    assert!(!stdout.contains('\x1b'), "{stdout}");
     target_server.join().unwrap();
 }
 

@@ -1,7 +1,7 @@
 use hdrhistogram::Histogram;
 use std::time::Duration;
 
-/// Fixed-range histogram; percentile values are upper bounds on the recorded values.
+/// Bounded-memory histogram; percentile values are upper bounds on the recorded values.
 #[derive(Clone, Debug)]
 pub struct BoundedLatency {
     histogram: Histogram<u64>,
@@ -58,9 +58,19 @@ impl BoundedLatency {
     }
 
     pub(crate) fn new() -> Self {
+        Self::with_histogram(
+            Histogram::new_with_bounds(1, u64::MAX, 3).expect("valid histogram configuration"),
+        )
+    }
+
+    /// Grow the same three-digit buckets as needed instead of reserving the full range up front.
+    pub(crate) fn new_growing() -> Self {
+        Self::with_histogram(Histogram::new(3).expect("valid histogram configuration"))
+    }
+
+    fn with_histogram(histogram: Histogram<u64>) -> Self {
         Self {
-            histogram: Histogram::new_with_bounds(1, u64::MAX, 3)
-                .expect("valid histogram configuration"),
+            histogram,
             min: Duration::MAX,
             max: Duration::ZERO,
             total_seconds: 0.0,
@@ -120,5 +130,48 @@ impl BoundedLatency {
             }
         }
         unreachable!("rank is within histogram sample count")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn growing_histograms_match_fixed_buckets_across_recording_and_merge() {
+        let mut growing = BoundedLatency::new_growing();
+        let mut fixed = BoundedLatency::new();
+        for nanos in [0, 35, 87_654, 1_234_567] {
+            let duration = Duration::from_nanos(nanos);
+            growing.record(duration).unwrap();
+            fixed.record(duration).unwrap();
+        }
+        assert!(growing.histogram.distinct_values() < fixed.histogram.distinct_values());
+
+        let mut growing_long = BoundedLatency::new_growing();
+        let mut fixed_long = BoundedLatency::new();
+        for nanos in [35, 1_234_568, 999_999_999, 1 << 62] {
+            let duration = Duration::from_nanos(nanos);
+            growing_long.record(duration).unwrap();
+            fixed_long.record(duration).unwrap();
+        }
+
+        fixed.merge(&fixed_long).unwrap();
+        for (destination, source) in [(&growing, &growing_long), (&growing_long, &growing)] {
+            let mut destination = destination.clone();
+            destination.merge(source).unwrap();
+            assert_eq!(destination.len(), fixed.len());
+            assert_eq!(destination.min(), fixed.min());
+            assert_eq!(destination.max(), fixed.max());
+            for rank in 1..=fixed.len() {
+                assert_eq!(destination.rank(rank), fixed.rank(rank), "rank {rank}");
+            }
+        }
+
+        let largest = Duration::from_nanos(u64::MAX);
+        for histogram in [&mut growing_long, &mut fixed_long] {
+            histogram.record(largest).unwrap();
+            assert_eq!(histogram.rank(histogram.len()), largest);
+        }
     }
 }

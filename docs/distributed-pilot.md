@@ -119,6 +119,9 @@ controller IP with the source address from the controller's route lookup.
 }
 ```
 
+Add `"user_agent": "Horde-Pilot/1.0"` to `grunt.json` to set the User-Agent
+sent to this Grunt's HTTP target. The default is `Horde/<version>`.
+
 ```sh
 target/release/horde grunt --config "$HOME/horde-pilot/grunt.json"
 ```
@@ -273,7 +276,9 @@ ports are published.
   connections. The pilot stages credentials in separate role directories
   on the Docker host and copies only public CSRs to the signer directory.
 - The nominal run checks 10 requests per Grunt, 20 successful responses,
-  40 body bytes and populated merged p95/p99.
+  40 body bytes and populated merged p95/p99. Both HTTP targets record the
+  User-Agent on every request. The report checks `Horde-Docker-Pilot/1.0`
+  from Grunt A's configuration and the default `Horde/<version>` from Grunt B.
 - The interruption run disconnects Grunt B from the Docker network
   after its first HTTP request. It checks that B stops before spending
   its 20-request share, A completes its own 20 requests, and the

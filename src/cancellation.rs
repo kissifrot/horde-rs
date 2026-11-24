@@ -1,4 +1,5 @@
 //! One-way cancellation shared by local execution modes.
+use std::future::Future;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -30,5 +31,22 @@ impl Cancellation {
     }
     pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
         self.sender.subscribe()
+    }
+}
+
+// Drop the in-flight work while leaving the worker's results with its caller.
+pub(crate) async fn run_until_cancelled<T>(
+    cancel: Option<&Cancellation>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    if let Some(cancel) = cancel {
+        let mut receiver = cancel.subscribe();
+        tokio::select! {
+            biased;
+            _ = crate::wait_for_cancel(&mut receiver) => None,
+            result = work => Some(result),
+        }
+    } else {
+        Some(work.await)
     }
 }

@@ -5,12 +5,14 @@ mod counter;
 pub mod distributed;
 mod latency;
 mod pacing;
+mod progress;
 mod redirect;
 pub mod scenario;
 use bytes::Bytes;
 pub use cancellation::Cancellation;
 use futures_util::StreamExt;
 pub use latency::BoundedLatency;
+pub use progress::{ProgressSnapshot, RunProgress};
 use reqwest::{
     Client, Method, Url,
     header::{CONNECTION, HeaderMap, HeaderValue},
@@ -101,6 +103,14 @@ impl Report {
             Some(LatencyStats::from_bounded(histogram.clone()))
         } else {
             LatencyStats::from_samples(self.latencies.clone())
+        }
+    }
+
+    /// Consume the samples and calculate latency statistics without cloning.
+    pub fn take_latency_stats(&mut self) -> Option<LatencyStats> {
+        match self.bounded_latencies.take() {
+            Some(histogram) => Some(LatencyStats::from_bounded(histogram)),
+            None => LatencyStats::from_samples(std::mem::take(&mut self.latencies)),
         }
     }
 
@@ -206,6 +216,7 @@ pub async fn run(plan: TestPlan) -> Result<Report, Box<dyn std::error::Error + S
         #[cfg(feature = "distributed-offline")]
         None,
         None,
+        None,
     )
     .await?
     {
@@ -219,11 +230,21 @@ pub async fn run_with_cancellation(
     plan: TestPlan,
     cancel: Cancellation,
 ) -> Result<Option<Report>, Box<dyn std::error::Error + Send + Sync>> {
+    run_with_progress(plan, cancel, None).await
+}
+
+/// Run a cancellable local test with optional progress tracking.
+pub async fn run_with_progress(
+    plan: TestPlan,
+    cancel: Cancellation,
+    progress: Option<&RunProgress>,
+) -> Result<Option<Report>, Box<dyn std::error::Error + Send + Sync>> {
     match run_impl(
         plan,
         #[cfg(feature = "distributed-offline")]
         None,
         Some(cancel),
+        progress,
     )
     .await?
     {
@@ -238,6 +259,7 @@ async fn run_impl(
     mut plan: TestPlan,
     #[cfg(feature = "distributed-offline")] mut control: Option<distributed::LocalControl>,
     local_cancel: Option<Cancellation>,
+    progress: Option<&RunProgress>,
 ) -> Result<RunOutcome, Box<dyn std::error::Error + Send + Sync>> {
     if plan.requests == 0 || plan.concurrency == 0 || plan.timeout.is_zero() {
         return Err("requests, concurrency and timeout must be greater than zero".into());
@@ -316,22 +338,33 @@ async fn run_impl(
     let stop_signal = gate.as_ref().map(|_| tokio::sync::watch::channel(false));
     let next_start = Arc::new(Mutex::new(start));
     let worker_count = plan.concurrency.min(plan.requests);
+    let worker_progress = progress
+        .map(|progress| progress.start(start, worker_count))
+        .transpose()?;
     let fast_pacer = plan
         .rate
         .and_then(|rate| pacing::FastPacer::new(rate, worker_count, start))
         .map(Arc::new);
     let mut workers = tokio::task::JoinSet::new();
-    let mut local_cancel_rx = local_cancel.as_ref().map(Cancellation::subscribe);
+    let mut local_cancel_rx = if progress.is_none() {
+        local_cancel.as_ref().map(Cancellation::subscribe)
+    } else {
+        None
+    };
     for worker_id in 1..=worker_count {
         if local_cancel
             .as_ref()
             .is_some_and(Cancellation::is_cancelled)
         {
+            if progress.is_some() {
+                break;
+            }
             workers.abort_all();
             while workers.join_next().await.is_some() {}
             return Ok(RunOutcome::Cancelled);
         }
         let worker_local_cancel = local_cancel.clone();
+        let progress = worker_progress.clone();
         #[cfg(feature = "distributed-offline")]
         let worker_gate = gate.clone();
         #[cfg(feature = "distributed-offline")]
@@ -352,179 +385,187 @@ async fn run_impl(
         );
         workers.spawn(async move {
             let mut results = WorkerReport::default();
-            loop {
-                if plan
-                    .duration
-                    .is_some_and(|duration| start.elapsed() >= duration)
-                {
-                    break;
-                }
-                // try_update prevents the counter from wrapping at usize::MAX.
-                let request_id = match next
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        (n < plan.requests).then(|| n + 1)
-                    })
-                {
-                    Ok(index) => index + 1,
-                    Err(_) => break,
-                };
-                if let Some(rate) = plan.rate {
-                    let pace = async {
-                        if let Some(pacer) = &fast_pacer {
-                            return pacer.wait(plan.duration).await;
-                        }
-                        let scheduled = {
-                            let mut next_time = next_start.lock().unwrap();
-                            let scheduled = (*next_time).max(Instant::now());
-                            *next_time = scheduled + Duration::from_nanos(1_000_000_000u64.div_ceil(u64::from(rate)));
-                            scheduled
+            let retained_cancel = progress.as_ref().and(worker_local_cancel.as_ref());
+            let work = async {
+                loop {
+                    if plan
+                        .duration
+                        .is_some_and(|duration| start.elapsed() >= duration)
+                    {
+                        break;
+                    }
+                    // try_update prevents the counter from wrapping at usize::MAX.
+                    let request_id = match next
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                            (n < plan.requests).then(|| n + 1)
+                        })
+                    {
+                        Ok(index) => index + 1,
+                        Err(_) => break,
+                    };
+                    if let Some(rate) = plan.rate {
+                        let pace = async {
+                            if let Some(pacer) = &fast_pacer {
+                                return pacer.wait(plan.duration).await;
+                            }
+                            let scheduled = {
+                                let mut next_time = next_start.lock().unwrap();
+                                let scheduled = (*next_time).max(Instant::now());
+                                *next_time = scheduled + Duration::from_nanos(1_000_000_000u64.div_ceil(u64::from(rate)));
+                                scheduled
+                            };
+                            if plan.duration.is_some_and(|duration| scheduled.duration_since(start) >= duration) {
+                                return false;
+                            }
+                            tokio::time::sleep_until(scheduled.into()).await;
+                            !plan.duration.is_some_and(|duration| start.elapsed() >= duration)
                         };
-                        if plan.duration.is_some_and(|duration| scheduled.duration_since(start) >= duration) {
-                            return false;
-                        }
-                        tokio::time::sleep_until(scheduled.into()).await;
-                        !plan.duration.is_some_and(|duration| start.elapsed() >= duration)
-                    };
-                    #[cfg(feature = "distributed-offline")]
-                    let admitted = if let Some(stop) = &mut worker_stop_rx {
-                        tokio::select! {
-                            biased;
-                            _ = wait_for_cancel(stop) => false,
-                            admitted = pace => admitted,
-                        }
-                    } else {
-                        pace.await
-                    };
-                    #[cfg(not(feature = "distributed-offline"))]
-                    let admitted = pace.await;
-                    if !admitted {
-                        break;
-                    }
-                }
-                if worker_local_cancel.as_ref().is_some_and(Cancellation::is_cancelled) { break; }
-                #[cfg(feature = "distributed-offline")]
-                if let Some(gate) = &worker_gate {
-                    let mut state = gate.lock().map_err(|_| "start gate poisoned")?;
-                    if worker_cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
-                        state.cancel(Instant::now())?;
-                        break;
-                    }
-                    let decision = state.try_start(Instant::now())?;
-                    match decision {
-                        distributed::StartDecision::Start => {}
-                        distributed::StartDecision::Stopped(_) => {
-                            if let Some(tx) = &worker_stop_tx { tx.send_replace(true); }
+                        #[cfg(feature = "distributed-offline")]
+                        let admitted = if let Some(stop) = &mut worker_stop_rx {
+                            tokio::select! {
+                                biased;
+                                _ = wait_for_cancel(stop) => false,
+                                admitted = pace => admitted,
+                            }
+                        } else {
+                            pace.await
+                        };
+                        #[cfg(not(feature = "distributed-offline"))]
+                        let admitted = pace.await;
+                        if !admitted {
                             break;
                         }
-                        distributed::StartDecision::AtConcurrency => return Err("agent concurrency invariant violated".into()),
                     }
-                }
-                let started = Instant::now();
-                if plan.verbose {
-                    use std::io::Write;
-                    let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [worker {worker_id} request {request_id}] started", started.duration_since(start).as_secs_f64());
-                }
-                let mut bytes = 0u64;
-                let mut failed = false;
-                let mut status_code = None;
-                let mut http_failure = false;
-                let mut timeout_failure = false;
-                let mut connection_failure = false;
-                let mut body_failure = false;
-                let mut other_failure = false;
-                let mut redirect_limit_failure = false;
-                let mut request = client
-                    .request(plan.method.clone(), plan.url.clone())
-                    .headers(plan.headers.clone());
-                if let Some(body) = &plan.body {
-                    request = request.body(body.clone());
-                }
-                let result = if plan.follow_redirects {
-                    match request.build() {
-                        Ok(request) => {
-                            #[cfg(feature = "distributed-offline")]
-                            let allowed = |request: &reqwest::Request| worker_policy.as_ref().is_none_or(|policy| {
-                                policy.allows_url(request.url()) && policy.allows_headers(request.headers())
-                            });
-                            #[cfg(not(feature = "distributed-offline"))]
-                            let allowed = |_: &reqwest::Request| true;
-                            redirect::send_checked(&client, request, plan.max_redirects, plan.timeout, Some(&redirects_followed), allowed).await
+                    if worker_local_cancel.as_ref().is_some_and(Cancellation::is_cancelled) { break; }
+                    #[cfg(feature = "distributed-offline")]
+                    if let Some(gate) = &worker_gate {
+                        let mut state = gate.lock().map_err(|_| "start gate poisoned")?;
+                        if worker_cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+                            state.cancel(Instant::now())?;
+                            break;
                         }
-                        Err(error) => Err(redirect::RedirectError::Request(error)),
+                        let decision = state.try_start(Instant::now())?;
+                        match decision {
+                            distributed::StartDecision::Start => {}
+                            distributed::StartDecision::Stopped(_) => {
+                                if let Some(tx) = &worker_stop_tx { tx.send_replace(true); }
+                                break;
+                            }
+                            distributed::StartDecision::AtConcurrency => return Err("agent concurrency invariant violated".into()),
+                        }
                     }
-                } else {
-                    request.send().await.map_err(redirect::RedirectError::Request)
-                };
-                match result {
-                    Ok(response) => {
-                        status_code = Some(response.status().as_u16());
-                        http_failure = response.status().is_client_error()
-                            || response.status().is_server_error();
-                        failed |= http_failure;
-                        let mut body = response.bytes_stream();
-                        while let Some(chunk) = body.next().await {
-                            match chunk {
-                                Ok(chunk) => counter::add_bytes(&mut bytes, chunk.len() as u64, &mut results.bytes_overflow),
-                                Err(error) => {
-                                    failed = true;
-                                    body_failure = true;
-                                    timeout_failure = error.is_timeout();
-                                    break;
+                    let started = Instant::now();
+                    if plan.verbose {
+                        use std::io::Write;
+                        let _ = writeln!(std::io::stderr().lock(), "[+{:.3}s] [worker {worker_id} request {request_id}] started", started.duration_since(start).as_secs_f64());
+                    }
+                    let mut bytes = 0u64;
+                    let mut failed = false;
+                    let mut status_code = None;
+                    let mut http_failure = false;
+                    let mut timeout_failure = false;
+                    let mut connection_failure = false;
+                    let mut body_failure = false;
+                    let mut other_failure = false;
+                    let mut redirect_limit_failure = false;
+                    let mut request = client
+                        .request(plan.method.clone(), plan.url.clone())
+                        .headers(plan.headers.clone());
+                    if let Some(body) = &plan.body {
+                        request = request.body(body.clone());
+                    }
+                    let result = if plan.follow_redirects {
+                        match request.build() {
+                            Ok(request) => {
+                                #[cfg(feature = "distributed-offline")]
+                                let allowed = |request: &reqwest::Request| worker_policy.as_ref().is_none_or(|policy| {
+                                    policy.allows_url(request.url()) && policy.allows_headers(request.headers())
+                                });
+                                #[cfg(not(feature = "distributed-offline"))]
+                                let allowed = |_: &reqwest::Request| true;
+                                redirect::send_checked(&client, request, plan.max_redirects, plan.timeout, Some(&redirects_followed), allowed).await
+                            }
+                            Err(error) => Err(redirect::RedirectError::Request(error)),
+                        }
+                    } else {
+                        request.send().await.map_err(redirect::RedirectError::Request)
+                    };
+                    match result {
+                        Ok(response) => {
+                            status_code = Some(response.status().as_u16());
+                            http_failure = response.status().is_client_error()
+                                || response.status().is_server_error();
+                            failed |= http_failure;
+                            let mut body = response.bytes_stream();
+                            while let Some(chunk) = body.next().await {
+                                match chunk {
+                                    Ok(chunk) => counter::add_bytes(&mut bytes, chunk.len() as u64, &mut results.bytes_overflow),
+                                    Err(error) => {
+                                        failed = true;
+                                        body_failure = true;
+                                        timeout_failure = error.is_timeout();
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(error) => {
-                        failed = true;
-                        timeout_failure = error.is_timeout();
-                        connection_failure = error.is_connect();
-                        redirect_limit_failure = matches!(error, redirect::RedirectError::Limit);
-                        other_failure =
-                            !timeout_failure && !connection_failure && !redirect_limit_failure;
-                    }
-                }
-                let latency = started.elapsed();
-                if plan.verbose {
-                    use std::io::Write;
-                    let status = status_code.map_or_else(|| "none".to_owned(), |code| code.to_string());
-                    let errors = [(http_failure, "http"), (timeout_failure, "timeout"), (connection_failure, "connection"), (body_failure, "body"), (redirect_limit_failure, "redirect_limit"), (other_failure, "other")];
-                    let mut stderr = std::io::stderr().lock();
-                    let _ = write!(stderr, "[+{:.3}s] [worker {worker_id} request {request_id}] completed status={status} bytes={bytes} latency_ms={:.2}", started.duration_since(start).as_secs_f64() + latency.as_secs_f64(), latency.as_secs_f64() * 1000.0);
-                    if failed {
-                        let _ = write!(stderr, " errors=");
-                        let mut separator = "";
-                        for (_, name) in errors.into_iter().filter(|(active, _)| *active) {
-                            let _ = write!(stderr, "{separator}{name}");
-                            separator = ",";
+                        Err(error) => {
+                            failed = true;
+                            timeout_failure = error.is_timeout();
+                            connection_failure = error.is_connect();
+                            redirect_limit_failure = matches!(error, redirect::RedirectError::Limit);
+                            other_failure =
+                                !timeout_failure && !connection_failure && !redirect_limit_failure;
                         }
                     }
-                    let _ = writeln!(stderr);
-                }
-                results.completed += 1;
-                results.failed += usize::from(failed);
-                results.http_failures += usize::from(http_failure);
-                results.timeout_failures += usize::from(timeout_failure);
-                results.connection_failures += usize::from(connection_failure);
-                results.body_failures += usize::from(body_failure);
-                results.other_failures += usize::from(other_failure);
-                results.redirect_limit_failures += usize::from(redirect_limit_failure);
-                counter::add_bytes(&mut results.bytes, bytes, &mut results.bytes_overflow);
-                if let Some(code) = status_code {
-                    *results.status_codes.entry(code).or_default() += 1;
-                }
-                if plan.bounded_latency {
-                    let histogram = results.bounded_latencies.get_or_insert_with(BoundedLatency::new);
-                    if histogram.record(latency).is_err() {
-                        results.latency_overflow = true;
+                    let latency = started.elapsed();
+                    if plan.verbose {
+                        use std::io::Write;
+                        let status = status_code.map_or_else(|| "none".to_owned(), |code| code.to_string());
+                        let errors = [(http_failure, "http"), (timeout_failure, "timeout"), (connection_failure, "connection"), (body_failure, "body"), (redirect_limit_failure, "redirect_limit"), (other_failure, "other")];
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = write!(stderr, "[+{:.3}s] [worker {worker_id} request {request_id}] completed status={status} bytes={bytes} latency_ms={:.2}", started.duration_since(start).as_secs_f64() + latency.as_secs_f64(), latency.as_secs_f64() * 1000.0);
+                        if failed {
+                            let _ = write!(stderr, " errors=");
+                            let mut separator = "";
+                            for (_, name) in errors.into_iter().filter(|(active, _)| *active) {
+                                let _ = write!(stderr, "{separator}{name}");
+                                separator = ",";
+                            }
+                        }
+                        let _ = writeln!(stderr);
                     }
-                } else {
-                    results.latencies.push(latency);
+                    results.completed += 1;
+                    results.failed += usize::from(failed);
+                    results.http_failures += usize::from(http_failure);
+                    results.timeout_failures += usize::from(timeout_failure);
+                    results.connection_failures += usize::from(connection_failure);
+                    results.body_failures += usize::from(body_failure);
+                    results.other_failures += usize::from(other_failure);
+                    results.redirect_limit_failures += usize::from(redirect_limit_failure);
+                    counter::add_bytes(&mut results.bytes, bytes, &mut results.bytes_overflow);
+                    if let Some(code) = status_code {
+                        *results.status_codes.entry(code).or_default() += 1;
+                    }
+                    if plan.bounded_latency {
+                        let histogram = results.bounded_latencies.get_or_insert_with(BoundedLatency::new);
+                        if histogram.record(latency).is_err() {
+                            results.latency_overflow = true;
+                        }
+                    } else {
+                        results.latencies.push(latency);
+                    }
+                    if let Some(progress) = &progress {
+                        progress[worker_id - 1].record(results.completed, results.failed, failed);
+                    }
+                    #[cfg(feature = "distributed-offline")]
+                    if let Some(gate) = &worker_gate {
+                        gate.lock().map_err(|_| "start gate poisoned")?.complete_at(Instant::now())?;
+                    }
                 }
-                #[cfg(feature = "distributed-offline")]
-                if let Some(gate) = &worker_gate {
-                    gate.lock().map_err(|_| "start gate poisoned")?.complete_at(Instant::now())?;
-                }
-            }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            };
+            cancellation::run_until_cancelled(retained_cancel, work).await.transpose()?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results)
         });
     }
@@ -684,6 +725,9 @@ async fn run_impl(
         .as_ref()
         .is_some_and(Cancellation::is_cancelled)
     {
+        if let Some(progress) = progress {
+            progress.finish_interrupted(start.elapsed(), report.take_latency_stats());
+        }
         return Ok(RunOutcome::Cancelled);
     }
     report.elapsed = start.elapsed();

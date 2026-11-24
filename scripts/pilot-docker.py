@@ -2,6 +2,7 @@
 """Run the distributed pilot against two container-local HTTP fixtures."""
 
 import argparse
+from collections import Counter
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import ipaddress
@@ -20,6 +21,8 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 GRUNTS = ("grunt-a", "grunt-b")
+CUSTOM_USER_AGENT = "Horde-Docker-Pilot/1.0"
+USER_AGENT_LOG = "pilot-http: user-agent: "
 LABEL = "io.horde-rs.docker-pilot"
 
 
@@ -221,14 +224,17 @@ def pilot(binary):
                 remove("rm", "-f", f"{prefix}-{name}")
             configs = {}
             for role, leaf in zip(GRUNTS, leaves):
-                configs[role] = config_args(role, f"{stage}.json", {
+                settings = {
                     "listen": addresses[role],
                     "allow_controller_ip": [(controller_ips or {}).get(role, peers["controller"])],
                     "target": "http://127.0.0.1:18080/",
                     "controller_cert": [f"{controller}-controller.der" for controller in controllers],
                     "tls": tls_config(leaf, roots),
                     **(limits or {}).get(role, {}),
-                })
+                }
+                if role == "grunt-a":
+                    settings["user_agent"] = CUSTOM_USER_AGENT
+                configs[role] = config_args(role, f"{stage}.json", settings)
                 launch_grunt(role, f"{stage}-{role}", configs[role])
             return configs
 
@@ -401,10 +407,21 @@ def pilot(binary):
 
             start_controller("nominal", 20)
             nominal = collect("nominal", 0)
-            counts = {role: requests(role) for role in GRUNTS}
+            nominal_logs = {role: logs(grunt_names[role]).stdout.splitlines() for role in GRUNTS}
+            counts = {role: lines.count("pilot-http: 200") for role, lines in nominal_logs.items()}
             verify(nominal, 20, ("complete", "complete"), partial=False)
             require(counts == {"grunt-a": 10, "grunt-b": 10}, "Unexpected nominal split", counts)
-            print(f"Nominal run passed: {counts}", flush=True)
+            _, version = run(binary, "--version").stdout.strip().split(maxsplit=1)
+            expected_agents = {"grunt-a": CUSTOM_USER_AGENT, "grunt-b": f"Horde/{version}"}
+            user_agents = {
+                role: dict(Counter(line.removeprefix(USER_AGENT_LOG)
+                                   for line in lines if line.startswith(USER_AGENT_LOG)))
+                for role, lines in nominal_logs.items()
+            }
+            expected = {role: {agent: counts[role]} for role, agent in expected_agents.items()}
+            require(user_agents == expected, "Unexpected nominal User-Agent headers",
+                    {"observed": user_agents, "expected": expected})
+            print(f"Nominal run passed: {counts}, User-Agent per target: {user_agents}", flush=True)
 
             start_controller("disconnect", 40)
             wait_for(lambda: requests("grunt-b") > counts["grunt-b"], "Grunt B workload")
@@ -527,7 +544,11 @@ def pilot(binary):
                 "unlisted_source": {"source_ip": unlisted_ip, **source_denied},
             },
             "certificate_rotation": rotation,
-            "nominal": {"controller_report": nominal, "requests_per_target": counts},
+            "nominal": {
+                "controller_report": nominal,
+                "requests_per_target": counts,
+                "user_agents_per_target": user_agents,
+            },
             "link_disconnect": {"controller_report": fault, "requests_per_target": after_drop},
             "silent_failure": {
                 "controller_report": silent_report,

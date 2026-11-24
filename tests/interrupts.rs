@@ -38,7 +38,9 @@ fn wait(child: &mut Child, timeout: Duration) {
         thread::sleep(Duration::from_millis(10));
     }
 }
-fn slow_server() -> (
+fn slow_server(
+    warmup: &'static [u16],
+) -> (
     u16,
     mpsc::Receiver<()>,
     mpsc::Receiver<bool>,
@@ -49,6 +51,22 @@ fn slow_server() -> (
     let (ready_tx, ready_rx) = mpsc::channel();
     let (closed_tx, closed_rx) = mpsc::channel();
     let server = thread::spawn(move || {
+        for status in warmup {
+            let (mut stream, _) = common::accept(&listener);
+            let mut headers = BufReader::new(&mut stream);
+            loop {
+                let mut line = String::new();
+                assert!(headers.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status} Result\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        }
         let (mut stream, _) = common::accept(&listener);
         let mut buf = [0u8; 4096];
         assert!(stream.read(&mut buf).unwrap() > 0);
@@ -71,12 +89,15 @@ fn slow_server() -> (
     });
     (port, ready_rx, closed_rx, server)
 }
-fn exercise_cli(signal: &str, code: i32, scenario: bool, json: bool) {
-    let (port, ready, closed, server) = slow_server();
+fn exercise_cli(signal: &str, code: i32, scenario: bool, json: bool, warmup: &'static [u16]) {
+    let (port, ready, closed, server) = slow_server(warmup);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_horde"));
     cmd.args(["-n", "100", "-c", "1", "--max-failure-rate", "0"]);
     if json {
         cmd.arg("--json");
+    }
+    if scenario {
+        cmd.arg("--bounded-latency");
     }
     let scenario_path =
         std::env::temp_dir().join(format!("horde-signal-{}-{port}.json", std::process::id()));
@@ -108,14 +129,55 @@ fn exercise_cli(signal: &str, code: i32, scenario: bool, json: bool) {
         assert_eq!(output["type"], "interrupted");
         assert_eq!(output["partial"], true);
         assert_eq!(output["thresholds"]["status"], "not_evaluable");
+        assert!(output.get("latency_ms").is_none());
         assert_eq!(
             output["reason"],
             if code == 130 { "sigint" } else { "sigterm" }
         );
     } else {
         let text = String::from_utf8(out.stdout).unwrap();
-        assert!(text.contains("Run interrupted"));
-        assert!(text.contains("not evaluable"));
+        assert!(text.starts_with("For the Horde! | Standalone | PARTIAL\n"));
+        assert!(text.contains("Run interrupted"), "{text}");
+        assert!(text.contains("CI thresholds: not evaluable"), "{text}");
+        let label = if scenario { "scenarios" } else { "requests" };
+        let completed = warmup.len();
+        let failed = warmup.iter().filter(|&&status| status >= 400).count();
+        assert!(
+            text.contains(&format!("{:<25}{completed}", format!("Completed {label}:"))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{:<25}{failed}", format!("Failed {label}:"))),
+            "{text}"
+        );
+        assert!(!text.contains('\x1b'), "{text}");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("Zug zug!"));
+        let (prefix, heading) = if scenario {
+            (
+                "Duration",
+                "Iteration duration (HDR histogram, approximate upper bounds)",
+            )
+        } else {
+            ("Latency", "Latency (exact)")
+        };
+        assert!(text.contains(heading), "{text}");
+        if warmup.is_empty() {
+            assert!(text.contains("No samples"), "{text}");
+            assert!(!text.contains("p95:") && !text.contains("p99:"), "{text}");
+        } else {
+            let [p95, p99] = [95, 99].map(|p| {
+                let label = format!("{prefix} p{p}:");
+                text.lines()
+                    .find_map(|line| line.strip_prefix(&label))
+                    .unwrap_or_else(|| panic!("Missing {label} in {text}"))
+                    .trim()
+                    .strip_suffix(" ms")
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap()
+            });
+            assert!(p95.is_finite() && p95 >= 0.0 && p99 == p95, "{text}");
+        }
     }
     assert!(closed.recv_timeout(Duration::from_secs(2)).unwrap());
     server.join().unwrap();
@@ -125,15 +187,25 @@ fn exercise_cli(signal: &str, code: i32, scenario: bool, json: bool) {
 }
 #[test]
 fn sigint_single_url_closes_request_and_emits_partial_json() {
-    exercise_cli("-INT", 130, false, true);
+    exercise_cli("-INT", 130, false, true, &[200, 500]);
 }
 #[test]
 fn sigterm_scenario_closes_request_and_emits_partial_json() {
-    exercise_cli("-TERM", 143, true, true);
+    exercise_cli("-TERM", 143, true, true, &[200, 500]);
 }
 #[test]
 fn sigterm_single_url_emits_partial_text() {
-    exercise_cli("-TERM", 143, false, false);
+    exercise_cli("-TERM", 143, false, false, &[200, 500]);
+}
+
+#[test]
+fn sigint_scenario_emits_partial_text() {
+    exercise_cli("-INT", 130, true, false, &[200, 500]);
+}
+
+#[test]
+fn sigint_before_first_completion_reports_no_latency_samples() {
+    exercise_cli("-INT", 130, false, false, &[]);
 }
 
 #[test]
@@ -147,7 +219,7 @@ fn signal_watchdog_fixture() {
         .unwrap();
     runtime.block_on(async {
         let cancel = horde_rs::Cancellation::new();
-        let _rx = signals::install(cancel).unwrap();
+        let _rx = signals::install(cancel, false).unwrap();
         println!("WATCHDOG_READY");
         std::io::stdout().flush().unwrap();
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -220,7 +292,7 @@ fn grunt_signal_fixture() {
             },
         };
         let cancel = horde_rs::Cancellation::new();
-        let signals = signals::install(cancel.clone()).unwrap();
+        let signals = signals::install(cancel.clone(), false).unwrap();
         let plan = TestPlan {
             url: reqwest::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
             requests: 1,
@@ -277,7 +349,7 @@ fn grunt_signal_fixture() {
 #[cfg(feature = "distributed-offline")]
 #[test]
 fn sigint_cancels_local_grunt_and_closes_request() {
-    let (port, ready, closed, server) = slow_server();
+    let (port, ready, closed, server) = slow_server(&[]);
     let mut child = ChildGuard(Some(
         Command::new(std::env::current_exe().unwrap())
             .args([
