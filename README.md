@@ -6,15 +6,26 @@ For the Horde! Horde is a standalone HTTP load-testing tool written in Rust.
 
 ## Ready to work: install and run
 
-Install the current stable Rust toolchain, then run:
+Install the latest compatible release on Linux (AMD64 or ARM64) or
+macOS 15+ (Apple Silicon).
 
 ```sh
-cargo build --release
-./target/release/horde -n 1000 -c 10 https://example.com/
-./target/release/horde -n 100 -c 5 -t 10 -X GET -H 'Accept: application/json' https://example.com/
+curl -fsSLo horde-install.sh https://raw.githubusercontent.com/kissifrot/horde-rs/main/install.sh && sh horde-install.sh
+```
+
+The installer puts `horde` in `$HOME/.local/bin`. To install a specific
+release, run `sh horde-install.sh TAG`. Debian packages are available
+under [Linux and macOS prereleases](#linux-and-macos-prereleases).
+
+```sh
+horde -n 1000 -c 10 https://example.com/
+horde -n 100 -c 5 -t 10 -X GET -H 'Accept: application/json' https://example.com/
 ```
 
 Use `horde --help` for all options. Only test services you are authorized to load test.
+
+To build from source with stable Rust, run `cargo build --release` and use
+`./target/release/horde`.
 
 ## Assemble the Horde: command-line options
 
@@ -217,15 +228,6 @@ The [Horde logo](docs/horde-logo.svg) is dedicated to the public domain
 under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
 
 ### Linux and macOS prereleases
-
-Install the latest compatible release on Linux (AMD64 or ARM64) or
-macOS 15+ (Apple Silicon).
-
-```sh
-curl -fsSLo horde-install.sh https://raw.githubusercontent.com/kissifrot/horde-rs/main/install.sh && sh horde-install.sh
-```
-
-To install a specific release, run `sh horde-install.sh TAG`.
 
 The [release workflow](.github/workflows/linux-packages.yml) builds
 Horde on Debian 13 with static musl for AMD64 and ARM64. It checks package
