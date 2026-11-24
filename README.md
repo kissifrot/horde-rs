@@ -9,12 +9,12 @@ For the Horde! Horde is a standalone HTTP load-testing tool written in Rust.
 Install the latest compatible release on Linux (AMD64 or ARM64) or
 macOS 15+ (Apple Silicon).
 
-```sh
-curl -fsSLo horde-install.sh https://raw.githubusercontent.com/kissifrot/horde-rs/main/install.sh && sh horde-install.sh
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/kissifrot/horde-rs/main/install.sh)"
 ```
 
 The installer puts `horde` in `$HOME/.local/bin`. To install a specific
-release, run `sh horde-install.sh TAG`. Debian packages are available
+release, append `-- TAG` to the command above. Debian packages are available
 under [Linux and macOS prereleases](#linux-and-macos-prereleases).
 
 ```sh
