@@ -659,6 +659,14 @@ fn extract_values<'a>(
 impl Scenario {
     /// Parse and validate a JSON scenario, resolving declared environment variables before requests.
     pub fn from_json(input: &[u8]) -> Result<Self, RunError> {
+        Self::from_json_with_env(input, |name| std::env::var(name))
+    }
+
+    /// Parse and validate with an explicit resolver for declared environment variables.
+    pub fn from_json_with_env(
+        input: &[u8],
+        mut resolve_env: impl FnMut(&str) -> Result<String, std::env::VarError>,
+    ) -> Result<Self, RunError> {
         let document: serde_json::Value = serde_json::from_slice(input).map_err(|error| {
             format!(
                 "invalid JSON at line {}, column {}: {}",
@@ -705,7 +713,7 @@ impl Scenario {
                 let value = match value {
                     VariableFile::Literal(value) => value,
                     VariableFile::Environment(source) => {
-                        std::env::var(&source.env).map_err(|error| match error {
+                        resolve_env(&source.env).map_err(|error| match error {
                             std::env::VarError::NotPresent => {
                                 format!(
                                     "variable {name:?}: environment variable {} is not set",

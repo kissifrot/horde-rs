@@ -1,4 +1,6 @@
 mod inventory;
+#[cfg(feature = "mcp")]
+pub(crate) mod mcp;
 
 use crate::text_report::{TextReport, Tone};
 use clap::{Args, Subcommand, ValueEnum};
@@ -30,6 +32,14 @@ const MAX_SAMPLES: u64 = 10_000;
 const MAX_CONCURRENCY: u64 = 8;
 const MAX_RATE: u64 = 1_000;
 const MAX_RUN_RECORDS: usize = 64;
+const DEFAULT_PROFILE: &str = "default";
+const DEFAULT_DEADLINE_SECONDS: u64 = 30;
+const DEFAULT_PROFILE_LIMITS: AgentLimits = AgentLimits {
+    max_samples: MAX_SAMPLES,
+    max_concurrency: MAX_CONCURRENCY,
+    max_rate_per_second: MAX_RATE,
+    max_duration: Duration::from_secs(60),
+};
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
@@ -124,7 +134,7 @@ pub(crate) struct ControllerArgs {
     #[arg(long)]
     rate: u64,
     /// Controller deadline in seconds.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_DEADLINE_SECONDS)]
     deadline: u64,
     /// CI threshold for the percentage of failed requests.
     #[arg(long)]
@@ -177,6 +187,14 @@ struct ControllerConfig {
 }
 
 impl ControllerConfig {
+    fn read(path: &Path) -> Result<Self, BoxError> {
+        let mut settings: Self = read_json(path, "controller configuration")?;
+        settings
+            .tls
+            .resolve_paths(path.parent().unwrap_or(Path::new(".")));
+        Ok(settings)
+    }
+
     fn inventory_path(&self, config_path: &Path) -> PathBuf {
         config_path
             .parent()
@@ -238,16 +256,13 @@ impl GruntArgs {
 impl Peers {
     fn prepare(self) -> Result<(Controller, Vec<Grunt>), BoxError> {
         let (inventory, private_network, server_name, tls) = if let Some(path) = self.config {
-            let settings: ControllerConfig = read_json(&path, "controller configuration")?;
+            let settings = ControllerConfig::read(&path)?;
             let inventory = settings.inventory_path(&path);
-            let directory = path.parent().unwrap_or(Path::new("."));
-            let mut tls = settings.tls;
-            tls.resolve_paths(directory);
             (
                 Some(inventory),
                 settings.private_network,
                 settings.server_name,
-                tls,
+                settings.tls,
             )
         } else {
             (
@@ -258,18 +273,8 @@ impl Peers {
             )
         };
         let default = server_name.map(ServerName::try_from).transpose()?;
-        let controller = Controller::new(tls.roots()?, vec![certificate(&tls.cert)?], tls.key()?)?;
-        let controller = if private_network {
-            controller.with_private_network()
-        } else {
-            controller
-        };
-        let resolve = |specs: Vec<GruntSpec>| {
-            specs
-                .into_iter()
-                .map(|spec| spec.resolve(default.as_ref(), private_network))
-                .collect::<Vec<_>>()
-        };
+        let controller = build_controller(&tls, private_network)?;
+        let resolve = |specs| resolve_grunts(specs, default.as_ref(), private_network);
         let grunts = match inventory {
             Some(path) if !self.add_grunt.is_empty() || !self.remove_grunt.is_empty() => {
                 inventory::Inventory::edit(&path, |inventory| {
@@ -291,6 +296,26 @@ impl Peers {
         };
         Ok((controller, grunts))
     }
+}
+
+fn build_controller(tls: &Identity, private_network: bool) -> Result<Controller, BoxError> {
+    let controller = Controller::new(tls.roots()?, vec![certificate(&tls.cert)?], tls.key()?)?;
+    Ok(if private_network {
+        controller.with_private_network()
+    } else {
+        controller
+    })
+}
+
+fn resolve_grunts(
+    specs: Vec<GruntSpec>,
+    default: Option<&ServerName<'static>>,
+    private_network: bool,
+) -> Vec<Grunt> {
+    specs
+        .into_iter()
+        .map(|spec| spec.resolve(default, private_network))
+        .collect()
 }
 
 #[derive(Clone)]
@@ -443,12 +468,6 @@ async fn serve(
         rate_per_second: MAX_RATE,
         duration: None,
     };
-    let limits = AgentLimits {
-        max_samples: MAX_SAMPLES,
-        max_concurrency: MAX_CONCURRENCY,
-        max_rate_per_second: MAX_RATE,
-        max_duration: Duration::from_secs(60),
-    };
     let endpoint = Endpoint::with_listener_policy(
         vec![certificate(&args.tls.cert)?],
         args.tls.key()?,
@@ -458,11 +477,11 @@ async fn serve(
             .map(|path| certificate(path))
             .collect::<Result<_, _>>()?,
         [(
-            "default".into(),
+            DEFAULT_PROFILE.into(),
             Profile {
                 plan,
                 budget,
-                limits,
+                limits: DEFAULT_PROFILE_LIMITS,
                 policy,
             },
         )]
@@ -508,6 +527,18 @@ async fn preflight(
     let (controller, grunts) = args.peers.prepare()?;
     let results = controller.preflight(&grunts, cancel).await?;
     let signal = *signals.borrow();
+    let (ready, report) = preflight_report(&grunts, results, signal);
+    println!("{report}");
+    Ok(ExitCode::from(
+        signal.map_or(u8::from(!ready), |signal| signal.code()),
+    ))
+}
+
+fn preflight_report(
+    grunts: &[Grunt],
+    results: Vec<Result<[u8; 16], BoxError>>,
+    signal: Option<crate::signals::Interrupt>,
+) -> (bool, serde_json::Value) {
     let ready = signal.is_none() && results.iter().all(Result::is_ok);
     let peers = grunts
         .iter()
@@ -526,16 +557,11 @@ async fn preflight(
             })
         })
         .collect::<Vec<_>>();
-    println!(
-        "{}",
-        serde_json::json!({
-            "schema_version": 1, "type": "distributed_preflight", "ready": ready,
-            "interruption": signal.map(|signal| signal.label()), "grunts": peers,
-        })
-    );
-    Ok(ExitCode::from(
-        signal.map_or(u8::from(!ready), |signal| signal.code()),
-    ))
+    let report = serde_json::json!({
+        "schema_version": 1, "type": "distributed_preflight", "ready": ready,
+        "interruption": signal.map(|signal| signal.label()), "grunts": peers,
+    });
+    (ready, report)
 }
 
 async fn coordinate(
@@ -562,7 +588,7 @@ async fn coordinate(
     let report = controller
         .run(
             &grunts,
-            "default",
+            DEFAULT_PROFILE,
             budget,
             Duration::from_secs(args.deadline),
             cancel,

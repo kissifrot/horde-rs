@@ -1,9 +1,13 @@
 #[cfg(feature = "distributed-transport")]
 mod distributed_cli;
 mod live_report;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod signals;
 mod text_report;
 use clap::Parser;
+#[cfg(any(feature = "mcp", feature = "distributed-transport"))]
+use clap::Subcommand;
 use horde_rs::scenario::{
     Counts, Scenario, ScenarioOptions, StartWindow, run_scenario_with_progress,
 };
@@ -38,6 +42,17 @@ impl std::fmt::Debug for ScenarioDiagnostic {
 
 impl Error for ScenarioDiagnostic {}
 
+#[cfg(any(feature = "mcp", feature = "distributed-transport"))]
+#[derive(Subcommand)]
+enum Command {
+    #[cfg(feature = "mcp")]
+    /// Serve scenario, report and configured inventory tools over MCP stdio.
+    Mcp(mcp::McpArgs),
+    #[cfg(feature = "distributed-transport")]
+    #[command(flatten)]
+    Distributed(Box<distributed_cli::Command>),
+}
+
 /// For the Horde! Run an HTTP load test from this machine.
 #[derive(Parser)]
 #[command(
@@ -48,9 +63,9 @@ impl Error for ScenarioDiagnostic {}
     after_help = "Zug zug! Only test services you are authorized to load test."
 )]
 struct Args {
-    #[cfg(feature = "distributed-transport")]
+    #[cfg(any(feature = "mcp", feature = "distributed-transport"))]
     #[command(subcommand)]
-    distributed: Option<distributed_cli::Command>,
+    command: Option<Command>,
     /// HTTP or HTTPS target URL.
     #[arg(required_unless_present = "scenario", conflicts_with = "scenario")]
     url: Option<Url>,
@@ -122,9 +137,17 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<ExitCode, Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
-    #[cfg(feature = "distributed-transport")]
-    if let Some(command) = args.distributed {
-        return distributed_cli::run(command).await;
+    #[cfg(any(feature = "mcp", feature = "distributed-transport"))]
+    if let Some(command) = args.command {
+        return match command {
+            #[cfg(feature = "mcp")]
+            Command::Mcp(args) => {
+                mcp::serve(args).await?;
+                Ok(ExitCode::SUCCESS)
+            }
+            #[cfg(feature = "distributed-transport")]
+            Command::Distributed(command) => distributed_cli::run(*command).await,
+        };
     }
     let cancellation = Cancellation::new();
     let reporting = LiveReport::new(

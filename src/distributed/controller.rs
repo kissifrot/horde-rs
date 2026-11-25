@@ -39,6 +39,18 @@ pub struct Grunt {
     pub server_name: ServerName<'static>,
 }
 
+/// Compute the shares for a prospective run without connecting to any agents.
+pub fn plan_budgets(
+    budget: Budget,
+    grunt_count: usize,
+    deadline: Duration,
+) -> Result<Vec<Budget>, BoxError> {
+    if grunt_count > MAX_RUN_GRUNTS || deadline.is_zero() || deadline > Duration::from_secs(3600) {
+        return Err("invalid controller configuration or Grunt address".into());
+    }
+    Ok(split_budget(budget, grunt_count)?)
+}
+
 pub struct ControllerReport {
     pub aggregate: Aggregate,
     pub elapsed: Duration,
@@ -85,11 +97,16 @@ impl Controller {
 
     /// Validate peer addresses and identities without opening a connection.
     pub fn validate_grunts(&self, grunts: &[Grunt]) -> Result<(), BoxError> {
+        Self::validate_grunt_set(grunts, self.private_network)
+    }
+
+    /// Validate the configured peer set without constructing a TLS client.
+    pub fn validate_grunt_set(grunts: &[Grunt], private_network: bool) -> Result<(), BoxError> {
         if grunts.is_empty()
             || grunts.iter().any(|g| {
                 let ip = g.address.ip().to_canonical();
                 g.address.port() == 0
-                    || if self.private_network {
+                    || if private_network {
                         !super::control_network::is_private_control_ip(ip)
                     } else {
                         !ip.is_loopback()
@@ -104,7 +121,7 @@ impl Controller {
         {
             return Err("invalid controller configuration or Grunt address".into());
         }
-        if self.private_network
+        if private_network
             && grunts
                 .iter()
                 .map(|g| {
@@ -129,8 +146,9 @@ impl Controller {
         cancel: Cancellation,
     ) -> Result<Vec<Result<[u8; 16], BoxError>>, BoxError> {
         self.validate_grunts(grunts)?;
-        Ok(stream::iter(grunts)
-            .map(|grunt| {
+        Ok(stream::iter(0..grunts.len())
+            .map(|index| {
+                let grunt = &grunts[index];
                 let mut cancellation = cancel.subscribe();
                 async move {
                     tokio::select! {
@@ -157,16 +175,11 @@ impl Controller {
         deadline: Duration,
         cancel: Cancellation,
     ) -> Result<ControllerReport, BoxError> {
-        if grunts.len() > MAX_RUN_GRUNTS
-            || deadline.is_zero()
-            || deadline > Duration::from_secs(3600)
-            || profile.is_empty()
-            || profile.len() > 64
-        {
+        if profile.is_empty() || profile.len() > 64 {
             return Err("invalid controller configuration or Grunt address".into());
         }
         self.validate_grunts(grunts)?;
-        let shares = split_budget(budget, grunts.len())?;
+        let shares = plan_budgets(budget, grunts.len(), deadline)?;
         let mut run_id = [0; 16];
         getrandom::fill(&mut run_id).map_err(|_| "could not generate run identifier")?;
         let agents = grunts

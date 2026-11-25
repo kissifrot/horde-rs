@@ -2,362 +2,81 @@
 
 <img src="docs/horde-logo.svg" width="120" height="120" alt="Horde logo">
 
-For the Horde! Horde is a standalone HTTP load-testing tool written in Rust.
+For the Horde! Horde is an HTTP load-testing tool written in Rust. Test a
+single endpoint, replay a multi-step scenario, or split a request budget
+across Grunts.
 
-## Ready to work: install and run
+## Quick start
 
-Install the latest compatible release on Linux (AMD64 or ARM64) or
-macOS 15+ (Apple Silicon).
+Install Horde on Linux (AMD64 or ARM64) or macOS 15+ (Apple Silicon).
 
-```bash
+```sh
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/kissifrot/horde-rs/main/install.sh)"
 ```
 
-The installer puts `horde` in `$HOME/.local/bin`. To install a specific
-release, append `-- TAG` to the command above. Debian packages are available
-under [Linux and macOS prereleases](#linux-and-macos-prereleases).
+The installer puts `horde` in `$HOME/.local/bin`. To build from source with
+stable Rust, run `cargo build --release` and use `./target/release/horde` in place
+of `horde` below.
+
+From the repository root, start the local HTTP demo with
+`python3 examples/login_server.py`. In a second terminal, send 20 requests
+with up to two concurrent workers and a target of five starts per second.
 
 ```sh
-horde -n 1000 -c 10 https://example.com/
-horde -n 100 -c 5 -t 10 -X GET -H 'Accept: application/json' https://example.com/
+horde -n 20 -c 2 --rate 5 -A 'Horde-Demo/1.0' http://127.0.0.1:8080/
 ```
 
-Use `horde --help` for all options. Only test services you are authorized to load test.
+Add `--json` for a machine-readable report. Use `horde --help` to see all
+options. Only send load to services you are authorized to test.
 
-To build from source with stable Rust, run `cargo build --release` and use
-`./target/release/horde`.
+## Run a scenario
 
-## Assemble the Horde: command-line options
-
-Usage: `horde [OPTIONS] <URL>` or `horde --scenario <FILE> [OPTIONS]`
-
-| Argument or option | Description | Default |
-| --- | --- | --- |
-| `<URL>` | Target HTTP or HTTPS URL; required unless using `--scenario`. | — |
-| `--scenario <FILE>` | Run a JSON scenario instead of a single URL. | Disabled |
-| `--validate` | Validate a scenario without sending requests; requires `--scenario`. | Disabled |
-| `--auto-referer` | Derive `Referer` between scenario steps; requires `--scenario`. | Disabled |
-| `-n, --requests <REQUESTS>` | Total requests, or scenario iterations; must be positive. | `1` without `--duration` |
-| `-c, --concurrency <CONCURRENCY>` | Maximum concurrent requests or virtual users; must be positive. | `1` |
-| `-t, --timeout <TIMEOUT>` | Timeout per request, in seconds; must be positive. | `30` |
-| `-X, --method <METHOD>` | HTTP method for single-URL tests. | `GET` |
-| `-H, --header <HEADERS>` | HTTP header as `Name: value`; may be repeated; single-URL tests only. | None |
-| `-A, --user-agent <USER_AGENT>` | Set `User-Agent`; overrides `-H` for single-URL tests. Scenario step headers take precedence. | `Horde/<version>` (e.g. `Horde/0.1.0`) |
-| `--body-file <BODY_FILE>` | Read a request body from a file and reuse it for every request; single-URL tests only. | No body |
-| `--duration <DURATION>` | Stop starting new requests or scenario iterations after this many seconds; must be positive. | No duration limit |
-| `--rate <RATE>` | Target starts per second for logical requests or scenario iterations, from 1 to 1,000,000,000. | Unlimited |
-| `-v, --verbose` | Log the start and result of every request to stderr. | Disabled |
-| `--bounded-latency` | Use bounded-memory HDR histograms for approximate percentiles. | Disabled (exact samples) |
-| `--no-connection-reuse` | Disable reuse of HTTP connections for single-URL tests. | Reuse enabled |
-| `--max-failure-rate <PERCENT>` | Maximum failed request or scenario percentage, from 0 to 100. | Disabled |
-| `--max-p95-ms <MILLISECONDS>` | Maximum p95 request latency for a single-URL test. | Disabled |
-| `--max-step-p95-ms <MILLISECONDS>` | Maximum p95 latency for every scenario step; requires `--scenario`. | Disabled |
-| `--json` | Print a JSON summary instead of the text report. | Disabled |
-| `-L, --follow-redirects` | Follow HTTP redirects. | Disabled |
-| `--max-redirects <MAX_REDIRECTS>` | Maximum redirects per request; positive and requires `-L`. | `10` |
-| `-h, --help` | Show help. | — |
-| `-V, --version` | Show version. | — |
-
-## Load and requests
-
-Each worker sends requests sequentially. Use `--duration` to stop starting requests after a time limit; in-flight requests finish. With both `--duration` and `-n`, the first limit reached applies. Without either, Horde sends one request. The timeout covers each request, including redirects and the response body.
-
-Standalone text runs show a progress line in an interactive terminal once per second. It shows completed requests or scenario iterations, failures, and average throughput. Verbose runs use their per-request logs.
-
-Press Ctrl+C to cancel a run and close its active requests. On Unix, SIGTERM behaves likewise. The partial text report includes completed and failed counts, elapsed time, average throughput, and p95/p99 for completed requests or scenario iterations. Horde calculates these percentiles once after the workers stop. The report excludes work still in flight and marks CI thresholds as not evaluable. Horde exits with 130 for SIGINT or 143 for SIGTERM. With `--json`, the interruption is a JSON object with `type: "interrupted"` and `thresholds.status: "not_evaluable"`. A second signal, or a shutdown taking more than five seconds, forces immediate exit and may prevent the report from being printed.
-
-For single-URL tests, `--rate` spaces logical request starts across all workers. Concurrency, response time and scheduling affect the achieved rate. Redirects are not separately rate-limited, and waiting for a rate slot is excluded from latency and timeout. The scheduler normally waits on Tokio’s timer. The timer cutoff is the larger of 1,000 starts/s per process and a worker-based allowance. The allowance is 600 starts/s per worker for up to 2 local workers, 550 for 3–4, 525 for 5–7, and 500 for 8 or more. Above the cutoff, it uses a shared admission clock and yields until the next start. Each Grunt applies the cutoff to its own share. This avoids millisecond rounding at high rates, at a higher CPU cost. Missed slots do not accumulate in this path.
-
-To send a body, select a method and provide a file:
+With the same demo server running, try the login scenario. It opens a form,
+submits demo credentials and uses the session cookie to open a protected page.
 
 ```sh
-horde -X POST --body-file payload.json -H 'Content-Type: application/json' https://example.com/
+horde --scenario examples/login.json --validate
+horde --scenario examples/login.json -n 4 -c 2 --json
 ```
 
-The file is read once and reused. The method is not changed automatically. When following redirects, 307 and 308 preserve the method and body; 301 and 302 change POST to GET, and 303 uses GET except for HEAD. A switch to GET drops the request body.
+`--validate` checks the JSON without sending HTTP requests. For a scenario,
+`-n` counts iterations and `-c` sets the maximum number of virtual users.
 
-### User journeys
+## Local MCP server
 
-Use `--scenario` to run an ordered sequence of HTTP steps. To run [examples/journey.json](examples/journey.json), start the local demo server in one terminal:
+Build with `cargo build --release --features mcp` and configure your client
+to launch `horde mcp` over standard input and output. Try asking it to draft
+and validate a scenario for the local login form. You can also ask it to
+explain a JSON report.
 
-```sh
-python3 examples/login_server.py
-```
+With both `mcp` and `distributed-transport` enabled, the client can manage named
+Grunt inventories, check their authenticated control connections and preview a
+test budget. Start the workload from the CLI.
 
-Then run the scenario in another terminal:
+## Run a distributed test
 
-```sh
-./target/release/horde --scenario examples/journey.json -n 100 -c 10 --json
-```
+A controller splits a request budget across Grunts. Each Grunt runs a fixed
+GET profile against an HTTP target on its own loopback interface. The
+controller authenticates the Grunts over mutual TLS and merges their results.
 
-Scenarios must declare `"version": 1` and are validated against the bundled [version 1 JSON Schema](schemas/scenario-v1.schema.json) before execution. The optional `$schema` field helps compatible editors find the schema; Horde uses its bundled copy and does not fetch the URI. Horde also validates semantics that JSON Schema cannot express here, including unique step names, variable references, HTTP methods and the expanded URLs.
+## Documentation
 
-Here `-n` is the total number of scenario iterations and `-c` is the maximum number of virtual users. With `--duration`, Horde stops starting iterations at the deadline but lets active iterations finish, including their waits and remaining steps. With both `-n` and `--duration`, the first limit reached applies; with `--duration` alone there is no explicit iteration limit. Without either, Horde runs one iteration. Use `--bounded-latency` to limit latency storage for long tests.
+| If you want to | Read |
+| --- | --- |
+| Set request rates, send a body, or configure CI thresholds | [CLI and reports](docs/cli.md) |
+| Write a login flow with cookies, variables or CSRF extraction | [HTTP scenarios](docs/scenarios.md) |
+| Connect an assistant and try example prompts | [MCP setup and examples](docs/mcp.md) |
+| Run two Grunts locally or set up a private control network | [Distributed quickstart](docs/distributed-quickstart.md) |
+| Check the build, run benchmarks, or fuzz the histogram decoder | [Development and release notes](docs/development.md) |
 
-`--rate` sets a shared target for starting scenario iterations per second, not a limit on individual HTTP requests. Each user runs one iteration at a time; if all users are busy, the achieved rate can be lower. Steps and redirects are not independently rate-limited. Time waiting for a start slot is excluded from scenario and step latencies. No iteration starts after the duration limit, including one waiting for a slot.
+## Linux and macOS prereleases
 
-With a fixed number of users, a slow service can reduce the number of iterations started. Reported latencies cover executed iterations and steps; they do not measure delay for iterations that could not start while all users were busy.
-
-The report shows the target start rate when set, the observed start rate and completed iterations per second. The start rate includes failed iterations and uses one of two windows:
-
-- If the duration limit is reached first, divide the number started by the configured duration. This is the full allowed start window, even when no further slot can be used and the run finishes earlier.
-- If the iteration limit is reached first, divide the number of intervals between starts (`started - 1`) by the elapsed time between the first and last starts. With fewer than two starts or a zero-length interval, the rate is unavailable.
-
-The completed rate divides completed iterations by total elapsed time, including time spent finishing active iterations after the duration limit. JSON reports the rates under `scenarios.target_starts_per_second`, `scenarios.started_per_second` and `scenarios.completed_per_second`. `scenarios.start_measurement` includes the number started, `window_seconds` and `method` (`duration` or `iteration_limit`).
-
-Each user has its own cookie jar, retained across its iterations. Each step has a unique `name`, an absolute HTTP(S) `url`, an optional `method` (default `GET`), `headers`, request body, and `wait_ms` before the step. By default, a step requires a 2xx response. A failed request or assertion stops that iteration; later steps are skipped. Redirects are not followed unless `-L` is set; `--max-redirects` sets the per-step limit. The report shows iteration duration and per-step counts, final HTTP statuses, failure categories and latency percentiles. Iteration duration includes waits; step latency excludes waits but includes assertions and extraction. Error categories can overlap. Skipped steps have no latency sample or HTTP status. Individual failures do not change the exit code unless a CI threshold is set.
-
-With `-v`, stderr shows each user's scenario start, waits, step results and final outcome with relative timestamps. URLs, headers, bodies, cookies and variable values are omitted; step names are shown. JSON remains on stdout. Logging can affect timing and throughput.
-
-Invalid scenario files are rejected before the run. Errors identify the file and, when available, a JSON path or step and field; JSON syntax errors include a line and column. With `-v`, variable preparation and extraction failures also identify the affected field or extraction variable and a reason without printing its value or the response body. File paths, step names, field names and variable names may appear in diagnostics and must not contain secrets.
-
-Use `horde --scenario examples/journey.json --validate` to check a scenario without sending HTTP requests. Horde performs the same loading and validation as a normal run, including resolving required environment variables. Success exits with code 0; errors are reported on stderr with a nonzero exit code. With `--json`, success prints `{"schema_version":1,"type":"scenario_validation","valid":true}`. Execution options such as concurrency, duration and thresholds cannot be combined with `--validate`. Validation does not check server responses, assertions against live responses or dynamic extraction values.
-
-Define values under `variables` and refer to them as `{{name}}` in step URLs, header values and bodies. Values can be literal strings or explicitly loaded from the process environment:
-
-```json
-"variables": {
-  "base_url": "https://example.com",
-  "username": { "env": "HORDE_USERNAME" },
-  "password": { "env": "HORDE_PASSWORD" }
-}
-```
-
-Horde resolves environment variables once when loading the scenario; missing or non-UTF-8 values stop the run before any requests. Environment variable names must start with a letter or underscore and contain only letters, digits and underscores. Scenario variable names contain letters, digits and underscores. Values are omitted from reports and verbose logs. Avoid committing secrets in scenario files; environment variables are not a secret store and their visibility depends on the host and CI system.
-
-Substitution in URLs, headers and raw bodies is literal; use the structured body options below for form or JSON encoding. Unknown variables or malformed placeholders reject the scenario before any requests.
-
-For a request body, choose one of `body` (a raw string), `form` (an object of string fields) or `json_body` (an object or array). Form values are URL-encoded after substitution; JSON string values are escaped during serialization and other JSON types are preserved. Field and object names are literal. Horde sets the appropriate content type for `form` and `json_body` unless the step specifies one. Static structured bodies are prepared once.
-
-### Assertions and extraction
-
-An optional `expect` object checks the final response: `status` lists accepted codes (default: any 2xx), `final_url` matches the final URL, `headers` checks exact header values, and `body_contains` looks for literal UTF-8 text. All specified checks must pass. Static variables may be used in `final_url`, `headers` and `body_contains`.
-
-An optional `extract` object defines variables for later steps, for example `"csrf": {"from": "html", "selector": "input[name=csrf]", "attribute": "value"}`. Sources are response headers (`from: "header"`, `name`), JSON strings (`from: "json"`, JSON `pointer`), and HTML attributes (`from: "html"`, CSS `selector` and `attribute`). HTML uses the first match. Response bodies used for JSON or HTML extraction are limited to 2 MiB; missing values, invalid content or exceeding the limit fail the step. Header extraction does not buffer the body.
-
-Extracted values belong to one user and iteration, and are discarded before the next iteration. Names must be unique and cannot replace static variables; only later steps may reference them. They are not logged in verbose output. See [examples/federated-login.json](examples/federated-login.json) for a form with a per-session CSRF token.
-
-With the local demo server running, try the login scenario:
-
-```sh
-./target/release/horde --scenario examples/login.json -n 10 -c 2 -v
-```
-
-The example opens a form, submits demo credentials and accesses a protected page using the session cookie. The server listens only on loopback and is for demonstration, not production. Its raw form body uses literal substitution; `form` can be used to encode special characters automatically.
-
-For a redirect between a site and a separate authentication service, start the two-service demo in one terminal:
-
-```sh
-python3 examples/federated_login_server.py
-```
-
-Then run the scenario in another terminal:
-
-```sh
-./target/release/horde --scenario examples/federated-login.json -n 10 -c 2 -L -v
-```
-
-The services use different loopback hostnames to demonstrate separate cookies. The scenario extracts a per-session CSRF token from the login form before submitting it. They use demo credentials and a simplified one-time ticket; this is not an OAuth or OpenID Connect implementation. `-L` is required to follow the redirects.
-
-### Connections and redirects
-
-Connections may be reused by default. `--no-connection-reuse` disables the idle pool and sends `Connection: close`, overriding a custom `Connection` header. The server may close connections even when reuse is enabled.
-
-Redirects are not followed by default. Use `-L` to follow up to 10 per request, or `-L --max-redirects 5` to set another limit. Exceeding it counts as a failure.
-
-When following a redirect, Horde sets `Referer` from the previous URL: the full URL without credentials or fragment on the same origin, only the origin across origins, and nothing on HTTPS-to-HTTP transitions. This applies to each redirect in both modes, replacing any explicit `Referer` from the previous request. Cross-origin redirects also remove sensitive request headers such as `Authorization` and explicit cookies. The timeout applies to the complete chain and final response body.
-
-For separate scenario steps, `--auto-referer` derives the header from the previous final response URL for each virtual user, including across iterations, using the same policy. An explicit step `Referer` takes precedence for that step's initial request. Horde does not interpret `Referrer-Policy` response headers or HTML attributes, so it does not fully emulate browser behavior.
-
-## Work complete: the report
-
-For single-URL tests, the report shows completed and failed requests, throughput, response bytes, HTTP status counts and latency statistics. Completed requests include failures. Response bytes include partial bodies; latency ends when the body is read or an error occurs. Scenario reports provide iteration and per-step statistics as described above.
-
-Standalone runs print a text report by default. Scenario reports include a summary
-for each step, with completed, failed and skipped counts. Use `--json` for scripts.
-Text reports color their status in a terminal. Set `NO_COLOR=1` to disable color.
-
-For single-URL tests, failures include HTTP 4xx/5xx, timeouts, connection errors, body-read errors and redirect-limit errors. Failure categories can overlap, but each failed request is counted only once. A completed run exits successfully by default even if requests or scenarios fail; invalid configuration and internal errors return a nonzero code.
-
-Status counts use the final response when redirects are followed. A status is counted when its headers arrive, even if the body later fails. A request with no final response has no status. In single-URL reports, redirect counts include decisions to follow redirects even if a later request fails.
-
-In single-URL reports, `Connections opened` counts successful connections throughout the run, including those for redirects or subsequently failed requests. It is not the number still open at the end; failed connection and TLS setup attempts are excluded. Proxy connections are counted at the connector level.
-
-Latencies include failures. Percentiles use the nearest-rank method; for an even number of samples the median is the midpoint of the two central values, so it can differ from p50. Exact mode stores every sample, and its memory use grows with the request count.
-
-Use `--json` for a machine-readable summary (schema version 1, elapsed time in seconds and latencies in milliseconds). Use `-v` for per-request events on stderr. Verbose timestamps are relative to the start of the test; URLs, headers and bodies are omitted. Logging can affect performance.
-
-### Bounded-memory latency statistics
-
-For long tests, `--bounded-latency` uses bounded-memory HDR histograms per active worker. Scenarios use one per executed step and one for iteration duration. Each scenario histogram grows to cover the recorded latencies, with a bounded range. Percentiles and the median are approximate upper bounds, with about 0.1% precision; minimum, maximum and mean use observed latencies. Memory depends on concurrency and the number of steps, and may exceed exact mode for small tests. The report and JSON identify the method.
-
-A sample beyond the histogram's range (about 584 years) fails the run rather than being clipped.
-
-### CI thresholds
-
-Use `--max-failure-rate 1 --max-p95-ms 250` to set a maximum failure percentage and p95 in milliseconds. Failure rate is `failed / completed * 100`; p95 includes failed requests. Values equal to the limits pass, and comparisons use unrounded values.
-
-If a configured threshold is exceeded or cannot be evaluated because no requests completed, Horde prints the report and exits with code 2. JSON includes the limits and results under `thresholds`. In bounded mode, the approximate p95 upper bound is compared with the limit, so a true p95 just below it may fail.
-
-For scenarios, `--max-failure-rate` applies to iterations and `--max-step-p95-ms` applies to every step. A step with no samples, including one skipped after an earlier failure, fails its p95 threshold. Scenario p95 thresholds use step latencies, including failed steps but excluding waits. JSON reports each step's observed value and result. `--max-p95-ms` applies only to single-URL tests.
-
-## More work? Development
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-```
-
-The library separates the test plan, local execution and report from the CLI. The optional `distributed-offline` feature provides experimental Grunt execution and aggregation. The optional `distributed-transport` feature adds an experimental mutual TLS protocol for loopback or explicitly authorized private control connections. The `grunt` command still runs its HTTP workload on loopback. `--all-features` includes the loopback protocol tests. See [Distributed mode](docs/distributed.md) for the protocol and its scope.
-
-### Local performance benchmark
-
-```sh
-cargo build --release --locked
-python3 benchmarks/local.py --requests 10000 --repeats 5 --output /tmp/horde-benchmark.json
-```
-
-The Python harness compiles a Rust HTTP/1.1 loopback server, warms up, then measures serial, concurrent, no-reuse, rate-limited and same-origin redirect workloads (one or three redirects per request). It also measures one-step and three-step scenarios, including assertions and header extraction, with exact and bounded latency statistics. Single-URL throughput is in logical requests/s; scenario throughput is in iterations/s. Each run, median throughput, binary hashes and environment metadata are recorded; on Linux, the harness also records server CPU and, when GNU `time` is available, client CPU and peak RSS. Use `--binary` or `--server-binary` to select prebuilt binaries, or `python3 benchmarks/local.py --server` to run the server separately. A custom server must implement the same redirect paths and responses.
-
-The server handles up to 128 connections and shares resources with Horde. Either can become a bottleneck; CPU frequency, scheduling and background activity also affect results. Compare repeated runs on the same machine with the same binaries and settings, then profile suspected bottlenecks separately.
-
-GitHub Actions runs five repetitions per workload on pushes and pull requests. The job summary shows medians and ranges; detailed JSON is retained for 90 days as `horde-benchmark-results`. For pull requests, the exact base commit is measured sequentially on the same runner with the pull request's harness. The summary compares compatible workloads; a positive percentage means higher throughput in the pull request. Scenario definitions are hashed to avoid comparing different workloads. `binary_revision` identifies each binary and `git_commit` identifies the harness checkout. If the base cannot run a scenario workload, that workload is marked not comparable; the pull request benchmark must still succeed.
-
-CI comparisons are informational and have no regression threshold. Shared runner variability and run order can affect results; confirm suspected regressions on controlled hardware. Do not use this workflow with privileged pull request events or secrets: it runs pull request code.
+Download the standalone executable or Debian package for your architecture
+from [GitHub Releases](https://github.com/kissifrot/horde-rs/releases).
+The installer accepts a release tag after `--` to select a specific version.
+See the [package and checksum instructions](docs/development.md#release-packages).
 
 ## License
 
-GPL-3.0-only; see [LICENSE](LICENSE).
-
-The [Horde logo](docs/horde-logo.svg) is dedicated to the public domain
-under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
-
-### Linux and macOS prereleases
-
-The [release workflow](.github/workflows/linux-packages.yml) builds
-Horde on Debian 13 with static musl for AMD64 and ARM64. It checks package
-installation and the distributed CLI on Debian 13 and Ubuntu 24.04
-on both architectures. Each build includes `grunt`, `preflight` and
-`controller`. Installation places `horde` in `/usr/bin` and starts no service.
-
-The release workflow also builds and runs the macOS binary on a native
-Apple Silicon runner. It uses ad-hoc signing without Apple notarization.
-
-Get the package or standalone executable for your architecture from
-[GitHub Releases](https://github.com/kissifrot/horde-rs/releases). Use
-`dpkg --print-architecture` to check whether to select `amd64` or `arm64`.
-Download `SHA256SUMS` alongside the asset and verify it before installing.
-For the immutable `v0.1.0-rc.1` release, GitHub changed the `~` in
-the package asset names to a dot. Normalize those two names in the
-checksum input when verifying this release. For example, on AMD64:
-
-```sh
-sed 's/~rc\./.rc./g' SHA256SUMS | sha256sum --ignore-missing -c -
-sudo apt install './horde-rs_0.1.0.rc.1_amd64.deb'
-horde --version
-```
-
-For later prereleases, verify with `sha256sum --ignore-missing -c SHA256SUMS`.
-
-The standalone file contains the same executable as the package.
-It can be run directly with `chmod +x horde-linux-amd64` followed by
-`./horde-linux-amd64 --version`.
-
-To prepare a prerelease, create and push a `vX.Y.Z-rc.N` tag on the
-commit to ship. Its base version must match `Cargo.toml`. For example:
-
-```sh
-git tag -a v0.1.0-rc.1 -m "Horde 0.1.0 release candidate 1"
-git push origin v0.1.0-rc.1
-```
-
-After the install checks, GitHub Actions publishes the two Linux packages,
-three standalone binaries and `SHA256SUMS` as a prerelease. The workflow
-also supports manual runs and keeps snapshot outputs as workflow
-artifacts. The build pins the Rust container and musl toolchain versions,
-uses `Cargo.lock` and sets package timestamps from the commit.
-
-### Distributed testing with local HTTP targets
-
-See the [illustrated overview](docs/distributed.md#how-distributed-mode-works)
-for how the controller and Grunts share a run and handle a missing peer.
-
-Build with `cargo build --features distributed-transport`. Start each Grunt with a
-fixed local HTTP(S) target and its own certificate and key. The Grunt prints the
-listening address. A listen port of zero lets the OS select the port.
-
-```sh
-horde grunt --listen 127.0.0.1:7071 --target http://127.0.0.1:8080/ \
-  --ca ca.der --cert grunt.der --key grunt-key.der --controller-cert controller.der
-horde controller --grunt 127.0.0.1:7071 --grunt 127.0.0.1:7072 \
-  --requests 41 --concurrency 2 --rate 100 --server-name localhost \
-  --ca ca.der --cert controller.der --key controller-key.der
-```
-
-Start the second Grunt on port 7072 before running the controller. Certificates
-are DER, keys are PKCS#8 DER, and each Grunt's certificate must match the server
-name supplied by the controller. The Grunt authorizes the specified controller
-certificate. Control connections use loopback by default. The fixed HTTP
-target must have a literal loopback IP. The Grunt profile sends GET requests
-with redirects disabled.
-
-To opt into private control connections, set `grunt --listen` to the exact
-private address of the Grunt and repeat `--allow-controller-ip` for each allowed
-controller source IP. Start the controller with `--private-network` and the
-explicit private Grunt addresses in `--grunt`. IPv4 RFC 1918 addresses and IPv6
-ULA addresses are accepted. A wildcard bind or an empty private peer list is
-rejected. The IP check applies before TLS, and each peer still needs an
-authorized controller certificate. Use certificates issued for the pilot
-machines. Set the expected TLS identity per Grunt with
-`--grunt 10.0.0.21:7071=grunt-a.example.test`. The controller connects to the
-socket address and checks the certificate's DNS SAN against the identity.
-DNS resolution is unnecessary for that identity. In private mode, omitting
-the suffix defaults to the socket's IP. The certificate must then contain
-that address in an IP SAN, including for IPv6. An IP string in a DNS SAN is
-insufficient. A bare loopback address defaults to `localhost`.
-`--server-name` sets a fallback for entries without an explicit identity.
-Private entries must resolve to distinct expected identities. Issue each
-Grunt a leaf certificate for its own identity.
-
-Both `controller` and `preflight` accept `--inventory grunts.json` in place
-of repeated `--grunt` flags. Preflight checks the authenticated control hello
-for each peer without generating HTTP traffic. `--config` loads local
-settings from JSON. The same controller configuration works with
-`preflight` and `controller`. Pass the request budget and rate on the CLI.
-Use `horde inventory --config controller.json` with `add`, `list` or
-`remove` to manage the peers for the next run.
-See the [configuration and inventory examples](docs/distributed-pilot.md#start-each-grunt).
-
-The controller emits JSON by default. Add `--format text` for a terminal
-summary of the completed budget, merged percentiles, per-Grunt states and CI thresholds.
-It returns a nonzero exit code for partial runs or failed configured thresholds.
-On interruption it requests cancellation concurrently and keeps metrics from
-validated completed Grunts. Unconfirmed Grunts are reported as missing.
-
-### Fuzzing the offline histogram decoder
-
-The `fuzz/` project exercises the experimental distributed histogram decoder with
-coverage-guided libFuzzer. Install `cargo-fuzz`, a nightly Rust toolchain and a C++
-compiler. From the repository root, for example:
-
-```sh
-cargo install cargo-fuzz --locked
-rustup toolchain install nightly --profile minimal
-mkdir -p /tmp/horde-fuzz-decode /tmp/horde-fuzz-generated
-cargo +nightly fuzz run histogram_decode /tmp/horde-fuzz-decode fuzz/corpus/histogram_decode -- -max_len=506964 -max_total_time=3600 -timeout=15 -rss_limit_mb=2048
-cargo +nightly fuzz run histogram_generated /tmp/horde-fuzz-generated fuzz/corpus/histogram_generated -- -max_len=1024 -max_total_time=3600 -timeout=15 -rss_limit_mb=2048
-```
-
-On systems where LeakSanitizer cannot inspect processes, prefix the commands with `ASAN_OPTIONS=detect_leaks=0`.
-
-The first corpus directory receives new inputs; retain it across runs. The second
-contains the checked-in seeds. Use `--dev` before the target name for a debug
-build; the default uses optimizations, debug assertions, overflow checks and
-AddressSanitizer. Crash inputs are saved under `fuzz/artifacts/`; reproduce one
-with `cargo +nightly fuzz run histogram_decode path/to/artifact` (substitute the
-other target when appropriate). Preserve and minimize findings, then add a
-regression test. The raw target checks arbitrary envelopes and receiver limits;
-the generated target constructs valid histograms and checks decoded results
-against the pinned HDR library. These campaigns do not prove bounded memory or
-replace the security and transport work required before exposing a listener.
+[GPL-3.0-only](LICENSE). The [Horde logo](docs/horde-logo.svg) is dedicated to
+the public domain under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
