@@ -7,26 +7,24 @@ inventories and check Grunt control connections. Workloads run from the CLI.
 
 ## Connect your client
 
-From the repository root, build the binary.
-
-```sh
-cargo build --release --features mcp
-```
-
-Configure your MCP client to launch the binary with the argument `mcp`. For
-clients that use an `mcpServers` configuration, replace the path below with
-the absolute path to your checkout.
+Use a Horde binary with MCP support. See
+[feature availability](installation.md#feature-availability) for the available
+builds. Configure your client to launch that binary with the argument `mcp`.
+For clients that use an `mcpServers` configuration, replace the path below
+with the absolute path to your binary.
 
 ```json
 {
   "mcpServers": {
     "horde": {
-      "command": "/absolute/path/to/horde-rs/target/release/horde",
+      "command": "/absolute/path/to/horde",
       "args": ["mcp"]
     }
   }
 }
 ```
+
+The shell examples assume the same `horde` binary is on your PATH.
 
 ## Draft and validate a login scenario
 
@@ -84,8 +82,8 @@ terminal, validate and run with the bundled demo password.
 </details>
 
 ```sh
-HORDE_TEST_PASSWORD=zugzug ./target/release/horde --scenario login-draft.json --validate
-HORDE_TEST_PASSWORD=zugzug ./target/release/horde --scenario login-draft.json -n 4 -c 2 --json > login-report.json
+HORDE_TEST_PASSWORD=zugzug horde --scenario login-draft.json --validate
+HORDE_TEST_PASSWORD=zugzug horde --scenario login-draft.json -n 4 -c 2 --json > login-report.json
 ```
 
 Ask the assistant to summarize the report and explain any failed steps.
@@ -94,13 +92,8 @@ Provide `login-report.json` through the client, or paste its contents. The
 
 ## Configure distributed inventories
 
-Build with both features.
-
-```sh
-cargo build --release --features mcp,distributed-transport
-```
-
-Use this build for the [two-Grunt loopback setup](distributed-quickstart.md)
+Use a Horde binary with MCP and distributed support on the controller.
+Follow the [two-Grunt loopback setup](distributed-quickstart.md)
 to create `controller.json` and start the two Grunts. In the MCP client
 configuration, set the server arguments to the following.
 
@@ -160,7 +153,7 @@ Grunts. The controller reads the inventory again at launch. To run the
 previewed plan manually from the repository root, use the following command.
 
 ```sh
-./target/release/horde controller --config controller.json \
+horde controller --config controller.json \
   --requests 41 --concurrency 2 --rate 20 --deadline 30 > distributed-report.json
 ```
 
@@ -170,3 +163,22 @@ previewed plan manually from the repository root, use the following command.
 `summarize_report` shows the per-Grunt status alongside aggregate metrics.
 If a Grunt is missing in a partial report, the aggregate covers confirmed
 results and any configured thresholds are reported as `not_evaluable`.
+
+### Preview a named scenario
+
+Once the scenario is [installed on the Grunts](distributed-quickstart.md#run-a-named-scenario-with-the-inventory),
+try a prompt like this.
+
+> Prepare the login scenario on local for five iterations, with two
+> concurrent users and four iteration starts per second.
+
+Use `scenario` and `iterations` in the call to `prepare_distributed_test`.
+
+```json
+{"inventory":"local","scenario":"login","iterations":5,"concurrency":2,"rate_per_second":4}
+```
+
+The response labels the budget in iterations and includes the controller
+arguments for manual execution. The controller checks the installed profile
+when it starts. You can pass the resulting JSON to `summarize_report` to
+see the iteration counts, step results and Grunt status together.

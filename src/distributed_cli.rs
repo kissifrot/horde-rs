@@ -1,6 +1,7 @@
 mod inventory;
 #[cfg(feature = "mcp")]
 pub(crate) mod mcp;
+mod scenarios;
 
 use crate::text_report::{TextReport, Tone};
 use clap::{Args, Subcommand, ValueEnum};
@@ -10,12 +11,16 @@ use horde_rs::{
         AgentLimits, AgentStatus, Budget, GruntPolicy, MAX_ENVELOPE_BYTES, ResourceLimits,
         ThresholdResult, ThresholdResults,
         controller::{CapacityFailure, Controller, ControllerReport, Grunt},
-        transport::{Endpoint, EndpointLimits, ListenerPolicy, MAX_RETAINED_RESULT_BYTES, Profile},
+        transport::{
+            Endpoint, EndpointLimits, ListenerPolicy, MAX_RETAINED_RESULT_BYTES, Profile,
+            ProfileSet,
+        },
     },
 };
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 use std::{
+    collections::BTreeMap,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -118,6 +123,9 @@ struct Peers {
 pub(crate) struct PreflightArgs {
     #[command(flatten)]
     peers: Peers,
+    /// Check that every Grunt has the same revision of this installed scenario.
+    #[arg(long, value_parser = parse_scenario_name)]
+    scenario: Option<String>,
 }
 
 #[derive(Args)]
@@ -125,18 +133,29 @@ pub(crate) struct ControllerArgs {
     #[command(flatten)]
     peers: Peers,
     /// Total requests across all Grunts.
-    #[arg(short = 'n', long)]
-    requests: u64,
-    /// Total concurrent requests across all Grunts.
+    #[arg(
+        short = 'n',
+        long,
+        required_unless_present = "scenario",
+        conflicts_with = "scenario"
+    )]
+    requests: Option<u64>,
+    /// Name of a scenario installed on the Grunts.
+    #[arg(long, requires = "iterations")]
+    scenario: Option<String>,
+    /// Total scenario iterations across all Grunts.
+    #[arg(long, requires = "scenario")]
+    iterations: Option<u64>,
+    /// Total concurrent workers across all Grunts.
     #[arg(short = 'c', long)]
     concurrency: u64,
-    /// Total request starts per second across all Grunts.
+    /// Total request or iteration starts per second across all Grunts.
     #[arg(long)]
     rate: u64,
     /// Controller deadline in seconds.
     #[arg(long, default_value_t = DEFAULT_DEADLINE_SECONDS)]
     deadline: u64,
-    /// CI threshold for the percentage of failed requests.
+    /// CI threshold for the percentage of failed requests or iterations.
     #[arg(long)]
     max_failure_rate: Option<f64>,
     /// CI threshold for the merged p95 in milliseconds.
@@ -167,8 +186,10 @@ struct GruntConfig {
     listen: SocketAddr,
     #[serde(default)]
     allow_controller_ip: Vec<IpAddr>,
-    #[serde(deserialize_with = "deserialize_target")]
-    target: reqwest::Url,
+    #[serde(default, deserialize_with = "deserialize_target")]
+    target: Option<reqwest::Url>,
+    #[serde(default)]
+    scenarios: BTreeMap<String, PathBuf>,
     user_agent: Option<String>,
     controller_cert: Vec<PathBuf>,
     tls: Identity,
@@ -205,9 +226,10 @@ impl ControllerConfig {
 
 fn deserialize_target<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<reqwest::Url, D::Error> {
+) -> Result<Option<reqwest::Url>, D::Error> {
     String::deserialize(deserializer)?
         .parse()
+        .map(Some)
         .map_err(serde::de::Error::custom)
 }
 
@@ -237,12 +259,16 @@ impl GruntArgs {
             for cert in &mut settings.controller_cert {
                 *cert = directory.join(&*cert);
             }
+            for scenario in settings.scenarios.values_mut() {
+                *scenario = directory.join(&*scenario);
+            }
             Ok(settings)
         } else {
             Ok(GruntConfig {
                 listen: self.listen.ok_or("missing --listen")?,
                 allow_controller_ip: self.allow_controller_ip,
-                target: self.target.ok_or("missing --target")?,
+                target: self.target,
+                scenarios: BTreeMap::new(),
                 user_agent: None,
                 controller_cert: self.controller_cert,
                 tls: self.identity.load()?,
@@ -413,62 +439,18 @@ async fn serve(
         )
         .into());
     }
-    let mut headers = HeaderMap::new();
-    let mut max_header_bytes = 0;
-    if let Some(user_agent) = args.user_agent {
-        let value = HeaderValue::from_str(&user_agent)
-            .map_err(|_| "Grunt user_agent is not a valid HTTP header value")?;
-        // The controller selects this local profile without supplying headers.
-        max_header_bytes = USER_AGENT.as_str().len() + value.as_bytes().len();
-        headers.insert(USER_AGENT, value);
-    }
     let listener_policy = ListenerPolicy::for_listener(args.listen, args.allow_controller_ip)?;
-    let target_ip = args
+    let requests = args
         .target
-        .host_str()
-        .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
-        .map(|ip| ip.to_canonical())
-        .filter(IpAddr::is_loopback)
-        .ok_or("Grunt target requires a literal loopback IP")?;
-    let mut origin = args.target.clone();
-    origin.set_path("/");
-    origin.set_query(None);
-    let policy = GruntPolicy::new(
-        vec![origin],
-        vec![target_ip.into()],
-        ResourceLimits {
-            max_active_runs: 1,
-            max_active_histogram_bytes: 8 * 1024 * 1024,
-            max_histogram_bytes: MAX_ENVELOPE_BYTES,
-            max_request_timeout: Duration::from_secs(10),
-            max_redirects: 0,
-            max_body_bytes: 0,
-            max_header_bytes,
-        },
-    )?;
-    let plan = TestPlan {
-        url: args.target,
-        requests: 1,
-        concurrency: 1,
-        timeout: Duration::from_secs(10),
-        method: reqwest::Method::GET,
-        headers,
-        body: None,
-        duration: None,
-        rate: None,
-        verbose: false,
-        bounded_latency: true,
-        reuse_connections: true,
-        follow_redirects: false,
-        max_redirects: 0,
-    };
-    let budget = Budget {
-        requests: Some(MAX_SAMPLES),
-        concurrency: MAX_CONCURRENCY,
-        rate_per_second: MAX_RATE,
-        duration: None,
-    };
-    let endpoint = Endpoint::with_listener_policy(
+        .map(|target| {
+            request_profile(target, args.user_agent.as_deref())
+                .map(|profile| (DEFAULT_PROFILE.into(), profile))
+        })
+        .transpose()?
+        .into_iter()
+        .collect();
+    let scenarios = scenarios::load(args.scenarios, args.user_agent)?;
+    let endpoint = Endpoint::with_profiles(
         vec![certificate(&args.tls.cert)?],
         args.tls.key()?,
         args.tls.roots()?,
@@ -476,16 +458,10 @@ async fn serve(
             .iter()
             .map(|path| certificate(path))
             .collect::<Result<_, _>>()?,
-        [(
-            DEFAULT_PROFILE.into(),
-            Profile {
-                plan,
-                budget,
-                limits: DEFAULT_PROFILE_LIMITS,
-                policy,
-            },
-        )]
-        .into(),
+        ProfileSet {
+            requests,
+            scenarios,
+        },
         EndpointLimits {
             max_sessions: 16,
             max_records,
@@ -519,19 +495,99 @@ async fn serve(
     ))
 }
 
+fn request_profile(target: reqwest::Url, user_agent: Option<&str>) -> Result<Profile, BoxError> {
+    let mut headers = HeaderMap::new();
+    let mut max_header_bytes = 0;
+    if let Some(user_agent) = user_agent {
+        let value = HeaderValue::from_str(user_agent)
+            .map_err(|_| "Grunt user_agent is not a valid HTTP header value")?;
+        // The controller selects this local profile without supplying headers.
+        max_header_bytes = USER_AGENT.as_str().len() + value.as_bytes().len();
+        headers.insert(USER_AGENT, value);
+    }
+    let target_ip = target
+        .host_str()
+        .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
+        .map(|ip| ip.to_canonical())
+        .filter(IpAddr::is_loopback)
+        .ok_or("Grunt target requires a literal loopback IP")?;
+    let mut origin = target.clone();
+    origin.set_path("/");
+    origin.set_query(None);
+    let policy = GruntPolicy::new(
+        vec![origin],
+        vec![target_ip.into()],
+        ResourceLimits {
+            max_active_runs: 1,
+            max_active_histogram_bytes: 8 * 1024 * 1024,
+            max_histogram_bytes: MAX_ENVELOPE_BYTES,
+            max_request_timeout: Duration::from_secs(10),
+            max_redirects: 0,
+            max_body_bytes: 0,
+            max_header_bytes,
+        },
+    )?;
+    let plan = TestPlan {
+        url: target,
+        requests: 1,
+        concurrency: 1,
+        timeout: Duration::from_secs(10),
+        method: reqwest::Method::GET,
+        headers,
+        body: None,
+        duration: None,
+        rate: None,
+        verbose: false,
+        bounded_latency: true,
+        reuse_connections: true,
+        follow_redirects: false,
+        max_redirects: 0,
+    };
+    let budget = Budget {
+        requests: Some(MAX_SAMPLES),
+        concurrency: MAX_CONCURRENCY,
+        rate_per_second: MAX_RATE,
+        duration: None,
+    };
+    Ok(Profile {
+        plan,
+        budget,
+        limits: DEFAULT_PROFILE_LIMITS,
+        policy,
+    })
+}
+
 async fn preflight(
     args: PreflightArgs,
     cancel: Cancellation,
     signals: tokio::sync::watch::Receiver<Option<crate::signals::Interrupt>>,
 ) -> Result<ExitCode, BoxError> {
     let (controller, grunts) = args.peers.prepare()?;
-    let results = controller.preflight(&grunts, cancel).await?;
-    let signal = *signals.borrow();
-    let (ready, report) = preflight_report(&grunts, results, signal);
+    let (ready, report, signal) = if let Some(name) = args.scenario {
+        let results = controller
+            .preflight_scenario(&grunts, &name, cancel)
+            .await?;
+        let signal = *signals.borrow();
+        let (ready, report) = scenarios::preflight_report(&name, &grunts, results, signal);
+        (ready, report, signal)
+    } else {
+        let results = controller.preflight(&grunts, cancel).await?;
+        let signal = *signals.borrow();
+        let (ready, report) = preflight_report(&grunts, results, signal);
+        (ready, report, signal)
+    };
     println!("{report}");
     Ok(ExitCode::from(
         signal.map_or(u8::from(!ready), |signal| signal.code()),
     ))
+}
+
+fn parse_scenario_name(name: &str) -> Result<String, &'static str> {
+    if horde_rs::distributed::transport::valid_profile_name(name) {
+        Ok(name.to_owned())
+    } else {
+        Err("use 1 to 64 ASCII letters, digits, hyphens or underscores")
+    }
 }
 
 fn preflight_report(
@@ -570,7 +626,7 @@ async fn coordinate(
     signals: tokio::sync::watch::Receiver<Option<crate::signals::Interrupt>>,
 ) -> Result<ExitCode, BoxError> {
     let budget = Budget {
-        requests: Some(args.requests),
+        requests: args.requests.or(args.iterations),
         concurrency: args.concurrency,
         rate_per_second: args.rate,
         duration: None,
@@ -585,6 +641,31 @@ async fn coordinate(
         return Err("invalid distributed thresholds".into());
     }
     let (controller, grunts) = args.peers.prepare()?;
+    if let Some(name) = args.scenario {
+        let report = controller
+            .run_scenario(
+                &grunts,
+                &name,
+                budget,
+                Duration::from_secs(args.deadline),
+                cancel,
+            )
+            .await;
+        if report.is_err() && signals.borrow().is_some() {
+            return Ok(crate::signals::report(
+                &signals,
+                matches!(args.format, ReportFormat::Json),
+            ));
+        }
+        return scenarios::print_report(
+            &name,
+            report?,
+            args.format,
+            args.max_failure_rate,
+            args.max_p95_ms,
+            *signals.borrow(),
+        );
+    }
     let report = controller
         .run(
             &grunts,
@@ -661,7 +742,11 @@ async fn coordinate(
             output.section("Requests");
             output.field(
                 "Completed requests:",
-                format_args!("{} / {}", metrics.completed, args.requests),
+                format_args!(
+                    "{} / {}",
+                    metrics.completed,
+                    args.requests.expect("request count")
+                ),
             );
             if partial {
                 output.line(format_args!("Counts include confirmed Grunt results only."));

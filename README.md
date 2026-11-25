@@ -14,9 +14,9 @@ Install Horde on Linux (AMD64 or ARM64) or macOS 15+ (Apple Silicon).
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/kissifrot/horde-rs/main/install.sh)"
 ```
 
-The installer puts `horde` in `$HOME/.local/bin`. To build from source with
-stable Rust, run `cargo build --release` and use `./target/release/horde` in place
-of `horde` below.
+The installer puts `horde` in `$HOME/.local/bin`. Add that directory to your
+PATH if needed. See the [installation guide](docs/installation.md) for
+packages and version selection.
 
 From the repository root, start the local HTTP demo with
 `python3 examples/login_server.py`. In a second terminal, send 20 requests
@@ -44,22 +44,21 @@ horde --scenario examples/login.json -n 4 -c 2 --json
 
 ## Local MCP server
 
-Build with `cargo build --release --features mcp` and configure your client
-to launch `horde mcp` over standard input and output. Try asking it to draft
-and validate a scenario for the local login form. You can also ask it to
-explain a JSON report.
+Configure your client to launch an MCP-enabled Horde binary over standard
+input and output with `horde mcp`. Try asking it to draft and validate a
+scenario for the local login form or explain a JSON report.
 
-With both `mcp` and `distributed-transport` enabled, the client can manage named
-Grunt inventories, check their authenticated control connections and preview a
-test budget. Start the workload from the CLI.
+With distributed support enabled, the client can manage named Grunt
+inventories, check their authenticated control connections and preview a test
+budget. Start the workload from the CLI.
 
 ## Run a distributed test
 
-A controller splits a request budget across Grunts. Each Grunt runs a fixed
-GET profile against an HTTP target on its own loopback interface. The
-controller authenticates the Grunts over mutual TLS and merges their results.
+A controller authenticates Grunts over mutual TLS, splits a budget and merges
+their results. Each Grunt runs a configured GET profile or a named HTTP
+scenario against targets on its own loopback interface.
 
-## Documentation
+## Usage guides
 
 | If you want to | Read |
 | --- | --- |
@@ -67,14 +66,16 @@ controller authenticates the Grunts over mutual TLS and merges their results.
 | Write a login flow with cookies, variables or CSRF extraction | [HTTP scenarios](docs/scenarios.md) |
 | Connect an assistant and try example prompts | [MCP setup and examples](docs/mcp.md) |
 | Run two Grunts locally or set up a private control network | [Distributed quickstart](docs/distributed-quickstart.md) |
-| Check the build, run benchmarks, or fuzz the histogram decoder | [Development and release notes](docs/development.md) |
+| Publish a scenario to a fleet of Grunts | [Remote scenario deployment](docs/scenario-deployment.md) |
 
 ## Linux and macOS prereleases
 
-Download the standalone executable or Debian package for your architecture
-from [GitHub Releases](https://github.com/kissifrot/horde-rs/releases).
-The installer accepts a release tag after `--` to select a specific version.
-See the [package and checksum instructions](docs/development.md#release-packages).
+See the [package and checksum instructions](docs/installation.md#linux-and-macos-prereleases).
+
+## Development
+
+See the [development guide](docs/development.md) for source builds,
+feature flags, tests, benchmarks and release packaging.
 
 ## License
 

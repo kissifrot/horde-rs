@@ -260,10 +260,10 @@ fn summarize_report(report: &Value) -> Result<Value, &'static str> {
             &report["requests_per_second"],
             &report["latency_ms"],
         ),
-        (_, Some("scenario")) => {
+        (_, Some(kind @ ("scenario" | "distributed_scenario"))) => {
             let scenarios = &report["scenarios"];
             (
-                "scenario",
+                kind,
                 scenarios,
                 &scenarios["completed_per_second"],
                 &scenarios["duration_ms"],
@@ -297,13 +297,13 @@ fn summarize_report(report: &Value) -> Result<Value, &'static str> {
         "latency_method": report["latency_method"],
         "thresholds": report["thresholds"],
     });
-    if kind == "scenario" {
+    if matches!(kind, "scenario" | "distributed_scenario") {
         summary["name"] = report["name"].clone();
         summary["target_starts_per_second"] = totals["target_starts_per_second"].clone();
         summary["started_per_second"] = totals["started_per_second"].clone();
         summary["steps"] = report["steps"].clone();
     }
-    if kind == "distributed" {
+    if matches!(kind, "distributed" | "distributed_scenario") {
         summary["agents"] = report["agents"].clone();
         summary["interruption"] = report["interruption"].clone();
         summary["metrics_scope"] = json!("confirmed_grunt_results");

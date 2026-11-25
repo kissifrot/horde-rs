@@ -1,4 +1,27 @@
-# Development and release notes
+# Horde development guide
+
+## Build from source
+
+From the repository root, build with stable Rust. Choose the feature set for
+the binary you need.
+
+| Capabilities | Build command |
+| --- | --- |
+| Single-URL tests and local scenarios | `cargo build --release --locked` |
+| Distributed CLI with Grunts, controller and preflight | `cargo build --release --locked --features distributed-transport` |
+| Local MCP server | `cargo build --release --locked --features mcp` |
+| Local MCP server with distributed inventory tools | `cargo build --release --locked --features mcp,distributed-transport` |
+
+Cargo writes the binary to `target/release/horde`. To follow the usage
+guides with this binary, add its directory to the current shell's PATH from
+the repository root.
+
+```sh
+export PATH="$PWD/target/release:$PATH"
+horde --version
+```
+
+For prebuilt packages and the installer, see the [installation guide](installation.md).
 
 ## Checks
 
@@ -24,6 +47,90 @@ The server handles up to 128 connections and shares resources with Horde. Either
 GitHub Actions runs five repetitions per workload on pushes and pull requests. The job summary shows medians and ranges; detailed JSON is retained for 90 days as `horde-benchmark-results`. For pull requests, the exact base commit is measured sequentially on the same runner with the pull request's harness. The summary compares compatible workloads; a positive percentage means higher throughput in the pull request. Scenario definitions are hashed to avoid comparing different workloads. `binary_revision` identifies each binary and `git_commit` identifies the harness checkout. If the base cannot run a scenario workload, that workload is marked not comparable; the pull request benchmark must still succeed.
 
 CI comparisons are informational and have no regression threshold. Shared runner variability and run order can affect results; confirm suspected regressions on controlled hardware. Do not use this workflow with privileged pull request events or secrets: it runs pull request code.
+
+## Docker pilot validation
+
+From the repository root on Linux, use a local Docker daemon, Rust, Python 3,
+OpenSSL and `ldd`.
+
+```sh
+cargo build --release --locked --features distributed-transport
+python3 scripts/pilot-docker.py
+```
+
+The script builds a temporary image from the local release binary and
+HTTP fixture. It allocates private IPs on an internal Docker network,
+issues fresh TLS certificates, and starts two Grunts and a controller.
+It launches the commands with per-role JSON configuration and passes
+the budget and rate directly to the controller.
+Each Grunt's HTTP fixture listens on its own loopback interface. No
+ports are published.
+
+- Preflight checks both Grunts, then repeats with an incorrect TLS identity
+  for Grunt B. It must report A as ready and B as failed. Both loopback HTTP
+  fixtures must observe zero connections in both cases.
+- The source IP check repeats the successful preflight with the same
+  controller certificate and inventory from an unlisted private Docker
+  IP. Both Grunts must close the control connection before the TLS
+  handshake completes. Neither Grunt sends a `hello` or reaches its HTTP
+  target. The JSON report records the source and both failures.
+- Rotation uses two CAs, an IP SAN and a DNS SAN. During overlap, both
+  controller leaves must reach both Grunts, one with the new certificate
+  and one with the old. Removing the old controller leaf must deny it
+  even with both roots installed. With only the new root and leaf
+  configured, the new credentials must work and the old credentials and
+  old-root-only trust must fail. Each preflight checks for zero HTTP
+  connections. The pilot stages credentials in separate role directories
+  on the Docker host and copies only public CSRs to the signer directory.
+- The nominal run checks 10 requests per Grunt, 20 successful responses,
+  40 body bytes and populated merged p95/p99. Both HTTP targets record the
+  User-Agent on every request. The report checks `Horde-Docker-Pilot/1.0`
+  from Grunt A's configuration and the default `Horde/<version>` from Grunt B.
+- The interruption run disconnects Grunt B from the Docker network
+  after its first HTTP request. It checks that B stops before spending
+  its 20-request share, A completes its own 20 requests, and the
+  controller reports B as missing with a partial result and an
+  unevaluable failure threshold.
+- The silent failure run routes B's TLS control stream through a
+  test-only TCP relay on the internal network. After B's first workload
+  request, the relay pauses both directions while keeping both sockets
+  open. The controller must report an I/O timeout and mark B missing
+  while A completes exactly its 20-request share. The failure threshold
+  remains unevaluable. Docker log timestamps measure the controller
+  detection time and the last HTTP connection at B's fixture. The pilot
+  allows 0.5–2.5 seconds for controller detection and 3–6.5 seconds until
+  the last observed connection at B, with at least two more seconds
+  between B's last connection and A's last connection. These windows
+  allow for observation and scheduling around the one-second controller
+  timeout, three-second Grunt frame timeout and two-second reconnection
+  grace.
+- The maintenance run lowers both retention limits on Grunt B. It checks
+  both saturation reasons and their HTTP effects, stops B with SIGTERM,
+  and verifies that only B's epoch changes. A fresh two-request run then
+  completes with one request on each Grunt.
+- The controller stop scenarios send `SIGINT` and `SIGKILL` with both
+  Grunts running. `SIGINT` must exit 130 with a partial report confirming
+  both cancellations. `SIGKILL` must exit 137 with no controller report.
+  For both signals, the Docker pilot observes the HTTP fixtures for seven
+  seconds after sending the signal. Each Grunt must leave part of its
+  20-request share unused and remain quiet for at least three seconds.
+  The last HTTP connection must occur by 1.5 seconds after `SIGINT` or
+  four seconds after `SIGKILL`. The pilot finishes with an authenticated
+  preflight to verify that both Grunts are still reachable.
+- The inventory scenario adds a second Grunt during a one-peer run,
+  verifies that the next run uses both peers, and removes the original
+  Grunt before the following run.
+
+The script removes its containers, network, image and temporary
+credentials on exit, including on failure, SIGINT or SIGTERM. It writes
+the combined report to `target/pilot-docker-report.json` on success.
+Use `--output` to choose another location. The `distributed-pilot`
+GitHub Actions job runs the same script and uploads the JSON report
+as the `horde-distributed-pilot` artifact.
+
+This exercises separate IPs and TLS identities on a single kernel.
+Routing, firewalls and physical link detection remain checks for the
+multi-host pilot.
 
 ## Pacing internals
 
@@ -62,30 +169,10 @@ The [release workflow](../.github/workflows/linux-packages.yml) builds
 Horde on Debian 13 with static musl for AMD64 and ARM64. It checks package
 installation and the distributed CLI on Debian 13 and Ubuntu 24.04
 on both architectures. Each build includes `grunt`, `preflight` and
-`controller`. Installation places `horde` in `/usr/bin` and starts no service.
+`controller`.
 
 The release workflow also builds and runs the macOS binary on a native
 Apple Silicon runner. It uses ad-hoc signing without Apple notarization.
-
-Get the package or standalone executable for your architecture from
-[GitHub Releases](https://github.com/kissifrot/horde-rs/releases). Use
-`dpkg --print-architecture` to check whether to select `amd64` or `arm64`.
-Download `SHA256SUMS` alongside the asset and verify it before installing.
-For the immutable `v0.1.0-rc.1` release, GitHub changed the `~` in
-the package asset names to a dot. Normalize those two names in the
-checksum input when verifying this release. For example, on AMD64:
-
-```sh
-sed 's/~rc\./.rc./g' SHA256SUMS | sha256sum --ignore-missing -c -
-sudo apt install './horde-rs_0.1.0.rc.1_amd64.deb'
-horde --version
-```
-
-For later prereleases, verify with `sha256sum --ignore-missing -c SHA256SUMS`.
-
-The standalone file contains the same executable as the package.
-It can be run directly with `chmod +x horde-linux-amd64` followed by
-`./horde-linux-amd64 --version`.
 
 To prepare a prerelease, create and push a `vX.Y.Z-rc.N` tag on the
 commit to ship. Its base version must match `Cargo.toml`. For example:

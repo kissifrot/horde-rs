@@ -785,6 +785,7 @@ dependencies = [
  "ipnet",
  "jsonschema",
  "reqwest",
+ "ring",
  "rmcp",
  "scraper",
  "serde",

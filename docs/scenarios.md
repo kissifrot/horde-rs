@@ -5,8 +5,9 @@ signing in and opening a protected page.
 
 ## Run a local example
 
-To try [examples/journey.json](../examples/journey.json), start the local
-demo server from the repository root.
+With `horde` on your PATH, start the local demo server from the repository
+root to try [examples/journey.json](../examples/journey.json). See the
+[installation guide](installation.md) if you need the binary.
 
 ```sh
 python3 examples/login_server.py
@@ -16,7 +17,7 @@ Run the scenario in another terminal. If port 8080 is in use, choose
 another with `--port` and update `base_url` in the scenario.
 
 ```sh
-./target/release/horde --scenario examples/journey.json -n 100 -c 10 --json
+horde --scenario examples/journey.json -n 100 -c 10 --json
 ```
 
 ## Scenario format
@@ -68,7 +69,7 @@ Extracted values belong to one user and iteration, and are discarded before the 
 With the local demo server running, try the login scenario.
 
 ```sh
-./target/release/horde --scenario examples/login.json -n 10 -c 2 -v
+horde --scenario examples/login.json -n 10 -c 2 -v
 ```
 
 The example opens a form, submits demo credentials and accesses a protected page using the session cookie. The server listens only on loopback and is for demonstration, not production. Its raw form body uses literal substitution; `form` can be used to encode special characters automatically.
@@ -82,7 +83,7 @@ python3 examples/federated_login_server.py
 Then run the scenario in another terminal.
 
 ```sh
-./target/release/horde --scenario examples/federated-login.json -n 10 -c 2 -L -v
+horde --scenario examples/federated-login.json -n 10 -c 2 -L -v
 ```
 
 The services use different loopback hostnames to demonstrate separate cookies. The scenario extracts a per-session CSRF token from the login form before submitting it. They use demo credentials and a simplified one-time ticket; this is not an OAuth or OpenID Connect implementation. `-L` is required to follow the redirects.

@@ -297,6 +297,21 @@ mod distributed {
             assert_eq!(prepared["assignments"][1]["budget"]["rate_per_second"], 1);
             assert_eq!(prepared["argv"][1], "controller");
             assert_eq!(prepared["argv"][3], json!(config));
+            let scenario = successful_call(
+                &mut client,
+                "prepare_distributed_test",
+                json!({
+                    "inventory": "local", "scenario": "login", "iterations": 5,
+                    "concurrency": 2, "rate_per_second": 3
+                }),
+            )
+            .await;
+            assert_eq!(scenario["budget_unit"], "iterations");
+            assert_eq!(scenario["assignments"][0]["budget"]["requests"], 3);
+            assert_eq!(
+                &scenario["argv"].as_array().unwrap()[4..8],
+                ["--scenario", "login", "--iterations", "5"]
+            );
             let one_grunt = successful_call(
                 &mut client,
                 "prepare_distributed_test",
@@ -349,6 +364,22 @@ mod distributed {
             assert_eq!(summary["agents"][1]["status"], "missing");
             assert_eq!(summary["thresholds"]["p95"], "not_evaluable");
             assert_eq!(summary["metrics_scope"], "confirmed_grunt_results");
+            let scenario_summary = successful_call(
+                &mut client,
+                "summarize_report",
+                json!({"report":{
+                    "schema_version": 1, "type": "distributed_scenario", "partial": true,
+                    "name": "login", "scenarios": {"completed": 2, "failed": 1},
+                    "steps": [{"name": "sign in", "completed": 2, "failed": 1}],
+                    "agents": [{"address": first, "status": "complete"}],
+                    "thresholds": {"p95": "not_evaluable"}
+                }}),
+            )
+            .await;
+            assert_eq!(scenario_summary["type"], "distributed_scenario");
+            assert_eq!(scenario_summary["failure_rate_percent"], 50.0);
+            assert_eq!(scenario_summary["steps"][0]["name"], "sign in");
+            assert_eq!(scenario_summary["agents"][0]["status"], "complete");
             client.finish().await;
             grunt.kill().await.unwrap();
         })

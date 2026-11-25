@@ -1,5 +1,7 @@
 //! Experimental control protocol. Callers supply already accepted TCP streams.
 pub use super::control_network::{ListenerPolicy, is_private_control_ip};
+use super::scenarios::ScenarioPayload;
+pub use super::scenarios::{MAX_SCENARIO_BYTES, ScenarioDescription, ScenarioProfile};
 use super::{
     AgentLimits, Budget, Cancellation, CompletedResult, GruntPolicy, LocalOutcome, StopReason,
     encode_histogram, preflight, run_reserved,
@@ -49,8 +51,23 @@ pub struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
-    Submit { profile: String },
-    SubmitBudget { profile: String, budget: Budget },
+    Submit {
+        profile: String,
+    },
+    SubmitBudget {
+        profile: String,
+        budget: Budget,
+    },
+    DescribeScenario {
+        profile: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<Budget>,
+    },
+    SubmitScenario {
+        profile: String,
+        revision: [u8; 32],
+        budget: Budget,
+    },
     Collect,
     Inspect,
     Cancel,
@@ -75,6 +92,8 @@ pub enum Reply {
     Hello { version: u16, epoch: Id },
     State { status: RunStatus },
     Result { histogram_bytes: usize },
+    ScenarioProfile { description: ScenarioDescription },
+    ScenarioResult { histogram_bytes: Vec<usize> },
     Error { code: ErrorCode },
 }
 
@@ -89,6 +108,7 @@ pub enum ErrorCode {
     ConflictingSubmission,
     Capacity,
     Rejected,
+    ScenarioRevisionMismatch,
 }
 
 /// The protocol selects a locally configured plan and cannot supply target or resource settings.
@@ -97,6 +117,12 @@ pub struct Profile {
     pub budget: Budget,
     pub limits: AgentLimits,
     pub policy: GruntPolicy,
+}
+
+#[derive(Default)]
+pub struct ProfileSet {
+    pub requests: BTreeMap<String, Profile>,
+    pub scenarios: BTreeMap<String, ScenarioProfile>,
 }
 
 pub struct EndpointLimits {
@@ -114,7 +140,7 @@ pub struct Endpoint {
     listener_policy: ListenerPolicy,
     tls: TlsAcceptor,
     controllers: Vec<CertificateDer<'static>>,
-    profiles: BTreeMap<String, Profile>,
+    profiles: ProfileSet,
     config: EndpointLimits,
     epoch: Id,
     sessions: Semaphore,
@@ -135,6 +161,7 @@ struct State {
 struct Run {
     profile: String,
     budget: Budget,
+    scenario_revision: Option<[u8; 32]>,
     result: Option<StoredResult>,
     status: RunStatus,
     session: Option<u64>,
@@ -143,9 +170,50 @@ struct Run {
 }
 
 #[derive(Clone)]
-struct StoredResult {
-    metadata: CompletedResult,
-    histogram: Arc<[u8]>,
+enum StoredResult {
+    Requests {
+        metadata: CompletedResult,
+        histogram: Arc<[u8]>,
+    },
+    Scenario(Arc<ScenarioPayload>),
+}
+
+impl StoredResult {
+    fn bytes(&self) -> usize {
+        MAX_RESULT_METADATA
+            + match self {
+                Self::Requests { histogram, .. } => histogram.len(),
+                Self::Scenario(payload) => payload.bytes(),
+            }
+    }
+
+    async fn write(&self, stream: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
+        match self {
+            Self::Requests {
+                metadata,
+                histogram,
+            } => {
+                write_frame(
+                    stream,
+                    &Reply::Result {
+                        histogram_bytes: histogram.len(),
+                    },
+                )
+                .await?;
+                write_frame_limited(stream, metadata, MAX_RESULT_METADATA).await?;
+                stream.write_all(histogram).await?;
+            }
+            Self::Scenario(payload) => {
+                let histogram_bytes = payload.histograms.iter().map(Vec::len).collect();
+                write_frame(stream, &Reply::ScenarioResult { histogram_bytes }).await?;
+                write_frame_limited(stream, &payload.metadata, MAX_RESULT_METADATA).await?;
+                for histogram in &payload.histograms {
+                    stream.write_all(histogram).await?;
+                }
+            }
+        }
+        stream.flush().await
+    }
 }
 
 impl Run {
@@ -224,9 +292,37 @@ impl Endpoint {
         config: EndpointLimits,
         listener_policy: ListenerPolicy,
     ) -> Result<Arc<Self>, BoxError> {
+        Self::with_profiles(
+            server_chain,
+            server_key,
+            controller_roots,
+            controllers,
+            ProfileSet {
+                requests: profiles,
+                ..ProfileSet::default()
+            },
+            config,
+            listener_policy,
+        )
+    }
+
+    /// Configure locally installed GET and scenario profiles.
+    pub fn with_profiles(
+        server_chain: Vec<CertificateDer<'static>>,
+        server_key: PrivateKeyDer<'static>,
+        controller_roots: RootCertStore,
+        controllers: Vec<CertificateDer<'static>>,
+        profiles: ProfileSet,
+        config: EndpointLimits,
+        listener_policy: ListenerPolicy,
+    ) -> Result<Arc<Self>, BoxError> {
         if controllers.is_empty()
-            || profiles.is_empty()
-            || profiles.iter().any(|(name, profile)| {
+            || (profiles.requests.is_empty() && profiles.scenarios.is_empty())
+            || profiles
+                .scenarios
+                .keys()
+                .any(|name| !valid_profile_name(name))
+            || profiles.requests.iter().any(|(name, profile)| {
                 !valid_profile_name(name)
                     || !profile
                         .plan
@@ -367,20 +463,7 @@ impl Endpoint {
                     .get(&(controller, request.run_id))
                     .and_then(|run| run.result.clone());
                 if let Some(result) = result {
-                    timeout(self.config.frame_timeout, async {
-                        write_frame(
-                            &mut stream,
-                            &Reply::Result {
-                                histogram_bytes: result.histogram.len(),
-                            },
-                        )
-                        .await?;
-                        write_frame_limited(&mut stream, &result.metadata, MAX_RESULT_METADATA)
-                            .await?;
-                        stream.write_all(&result.histogram).await?;
-                        stream.flush().await
-                    })
-                    .await??;
+                    timeout(self.config.frame_timeout, result.write(&mut stream)).await??;
                     continue;
                 }
             }
@@ -400,35 +483,70 @@ impl Endpoint {
         if request.run_id == [0; 16] {
             return error(ErrorCode::InvalidRunId);
         }
+        if let Operation::DescribeScenario { profile, budget } = &request.operation {
+            return match self.profiles.scenarios.get(profile) {
+                Some(job) if budget.is_none_or(|budget| job.validate_budget(budget).is_ok()) => {
+                    Reply::ScenarioProfile {
+                        description: job.description.clone(),
+                    }
+                }
+                Some(_) => error(ErrorCode::Rejected),
+                None => error(ErrorCode::UnknownProfile),
+            };
+        }
         let key = (controller, request.run_id);
         let mut state = self.state.lock().unwrap();
         let submit = match &request.operation {
-            Operation::Submit { profile } => Some((profile, None)),
-            Operation::SubmitBudget { profile, budget } => Some((profile, Some(*budget))),
+            Operation::Submit { profile } => Some((profile, None, None)),
+            Operation::SubmitBudget { profile, budget } => Some((profile, Some(*budget), None)),
+            Operation::SubmitScenario {
+                profile,
+                revision,
+                budget,
+            } => Some((profile, Some(*budget), Some(*revision))),
             _ => None,
         };
         if let Some(run) = state.runs.get_mut(&key) {
             run.expire();
-            if let Some((profile, budget)) = submit
+            if let Some((profile, budget, revision)) = submit
                 && (profile != &run.profile
-                    || budget.unwrap_or(self.profiles[profile].budget) != run.budget)
+                    || revision != run.scenario_revision
+                    || budget.unwrap_or_else(|| self.profiles.requests[profile].budget)
+                        != run.budget)
             {
                 return error(ErrorCode::ConflictingSubmission);
             }
             match request.operation {
                 Operation::Cancel => run.cancel(),
-                Operation::Submit { .. } | Operation::SubmitBudget { .. } | Operation::Inspect => {
-                    run.attach(session)
-                }
-                Operation::Collect => {}
+                Operation::Submit { .. }
+                | Operation::SubmitBudget { .. }
+                | Operation::SubmitScenario { .. }
+                | Operation::Inspect => run.attach(session),
+                Operation::Collect | Operation::DescribeScenario { .. } => {}
             }
             return Reply::State { status: run.status };
         }
-        let Some((profile, requested)) = submit else {
+        let Some((profile, requested, revision)) = submit else {
             return error(ErrorCode::UnknownRun);
         };
-        let Some(job) = self.profiles.get(profile) else {
-            return error(ErrorCode::UnknownProfile);
+        let scenario = if let Some(revision) = revision {
+            let Some(job) = self.profiles.scenarios.get(profile) else {
+                return error(ErrorCode::UnknownProfile);
+            };
+            if revision != job.description.revision {
+                return error(ErrorCode::ScenarioRevisionMismatch);
+            }
+            Some(job)
+        } else {
+            None
+        };
+        let request_profile = if scenario.is_none() {
+            let Some(job) = self.profiles.requests.get(profile) else {
+                return error(ErrorCode::UnknownProfile);
+            };
+            Some(job)
+        } else {
+            None
         };
         if state.runs.len() >= self.config.max_records {
             if !state.record_limit_reported {
@@ -441,16 +559,35 @@ impl Endpoint {
             }
             return error(ErrorCode::Capacity);
         }
-        let budget = requested.unwrap_or(job.budget);
-        if !fits_profile(budget, job.budget)
-            || preflight(budget, job.limits, job.plan.timeout).is_err()
-        {
+        let budget = requested.unwrap_or_else(|| request_profile.expect("request profile").budget);
+        // Scenario histograms are per worker and per step. Keep one scenario
+        // in flight per endpoint and share its slot with single-URL runs.
+        if state.runs.values().any(|run| {
+            matches!(run.status, RunStatus::Running | RunStatus::Cancelling)
+                && (scenario.is_some() || run.scenario_revision.is_some())
+        }) {
             return error(ErrorCode::Rejected);
         }
-        let Ok(reservation) = job.policy.reserve(&job.plan, budget, job.limits) else {
+        if scenario.is_some_and(|job| job.validate_budget(budget).is_err()) {
             return error(ErrorCode::Rejected);
+        }
+        let single_url = if let Some(job) = request_profile {
+            if !fits_profile(budget, job.budget)
+                || preflight(budget, job.limits, job.plan.timeout).is_err()
+            {
+                return error(ErrorCode::Rejected);
+            }
+            let Ok(reservation) = job.policy.reserve(&job.plan, budget, job.limits) else {
+                return error(ErrorCode::Rejected);
+            };
+            Some((
+                (job.plan.clone(), job.limits, job.policy.clone()),
+                reservation,
+            ))
+        } else {
+            None
         };
-        let (plan, limits, policy) = (job.plan.clone(), job.limits, job.policy.clone());
+        let (single_url, reservation) = single_url.unzip();
         let cancel = Cancellation::new();
         let (disconnected, changes) = watch::channel(None);
         state.runs.insert(
@@ -458,6 +595,7 @@ impl Endpoint {
             Run {
                 profile: profile.clone(),
                 budget,
+                scenario_revision: revision,
                 result: None,
                 status: RunStatus::Running,
                 session: Some(session),
@@ -465,10 +603,20 @@ impl Endpoint {
                 disconnected,
             },
         );
+        let scenario = scenario.cloned();
         let endpoint = self.clone();
         tokio::spawn(async move {
-            let outcome = {
-                let run = run_reserved(plan, budget, limits, &policy, cancel);
+            let result = {
+                let run = async {
+                    if let Some(job) = scenario {
+                        return job
+                            .run(budget, cancel)
+                            .await
+                            .map(|payload| StoredResult::Scenario(Arc::new(payload)));
+                    }
+                    let (plan, limits, policy) = single_url.expect("request profile");
+                    run_requests(plan, budget, limits, &policy, cancel).await
+                };
                 let watchdog = endpoint.watch_disconnect(key, changes);
                 tokio::pin!(run, watchdog);
                 tokio::select! {
@@ -476,49 +624,14 @@ impl Endpoint {
                     () = &mut watchdog => run.await,
                 }
             };
-            let (mut status, mut result) = match outcome {
-                Ok(LocalOutcome::Complete {
-                    report,
-                    reason,
-                    started,
-                }) => {
-                    let result = CompletedResult::from_local(&report, reason, started)
-                        .and_then(|metadata| {
-                            metadata.validate(budget, limits.max_samples)?;
-                            let histogram = encode_histogram(
-                                report.bounded_latencies.as_ref(),
-                                metadata.metrics.completed,
-                            )?;
-                            Ok(StoredResult {
-                                metadata,
-                                histogram: histogram.into(),
-                            })
-                        })
-                        .ok();
-                    (
-                        if result.is_some() {
-                            RunStatus::Complete
-                        } else {
-                            RunStatus::Failed
-                        },
-                        result,
-                    )
-                }
-                Ok(LocalOutcome::Partial {
-                    reason: StopReason::Cancelled,
-                }) => (RunStatus::Cancelled, None),
-                Ok(LocalOutcome::Partial {
-                    reason: StopReason::AgentDeadline,
-                }) => (RunStatus::AgentDeadline, None),
-                Ok(LocalOutcome::Partial {
-                    reason: StopReason::SampleLimit,
-                }) => (RunStatus::SampleLimit, None),
-                _ => (RunStatus::Failed, None),
+            let (mut status, mut result) = match result {
+                Ok(result) => (RunStatus::Complete, Some(result)),
+                Err(status) => (status, None),
             };
             let mut state = endpoint.state.lock().unwrap();
             if let Some(stored) = &result {
                 // Charge a fixed metadata allowance and the exact encoded byte count.
-                let charge = MAX_RESULT_METADATA + stored.histogram.len();
+                let charge = stored.bytes();
                 if charge > endpoint.config.max_retained_result_bytes - state.retained_bytes {
                     if !state.result_limit_reported {
                         state.result_limit_reported = true;
@@ -564,6 +677,47 @@ impl Endpoint {
     }
 }
 
+async fn run_requests(
+    plan: TestPlan,
+    budget: Budget,
+    limits: AgentLimits,
+    policy: &GruntPolicy,
+    cancel: Cancellation,
+) -> Result<StoredResult, RunStatus> {
+    match run_reserved(plan, budget, limits, policy, cancel).await {
+        Ok(LocalOutcome::Complete {
+            report,
+            reason,
+            started,
+        }) => {
+            let metadata = CompletedResult::from_local(&report, reason, started)
+                .map_err(|_| RunStatus::Failed)?;
+            metadata
+                .validate(budget, limits.max_samples)
+                .map_err(|_| RunStatus::Failed)?;
+            let histogram = encode_histogram(
+                report.bounded_latencies.as_ref(),
+                metadata.metrics.completed,
+            )
+            .map_err(|_| RunStatus::Failed)?;
+            Ok(StoredResult::Requests {
+                metadata,
+                histogram: histogram.into(),
+            })
+        }
+        Ok(LocalOutcome::Partial {
+            reason: StopReason::Cancelled,
+        }) => Err(RunStatus::Cancelled),
+        Ok(LocalOutcome::Partial {
+            reason: StopReason::AgentDeadline,
+        }) => Err(RunStatus::AgentDeadline),
+        Ok(LocalOutcome::Partial {
+            reason: StopReason::SampleLimit,
+        }) => Err(RunStatus::SampleLimit),
+        _ => Err(RunStatus::Failed),
+    }
+}
+
 fn fits_profile(budget: Budget, ceiling: Budget) -> bool {
     let fits = |a: Option<u64>, b: Option<u64>| b.is_none_or(|b| a.is_some_and(|a| a <= b));
     fits(budget.requests, ceiling.requests)
@@ -574,7 +728,8 @@ fn fits_profile(budget: Budget, ceiling: Budget) -> bool {
             .is_none_or(|b| budget.duration.is_some_and(|a| a <= b))
 }
 
-fn valid_profile_name(name: &str) -> bool {
+/// Validate the identifier used to select a locally configured Grunt profile.
+pub fn valid_profile_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_PROFILE_NAME
         && name

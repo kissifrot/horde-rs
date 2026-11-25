@@ -7,6 +7,7 @@ use horde_rs::{
     distributed::{
         Budget,
         controller::{Controller, Grunt, plan_budgets},
+        transport::valid_profile_name,
     },
 };
 use rmcp::model::{Tool, ToolAnnotations};
@@ -131,11 +132,13 @@ impl Controllers {
             ),
             tool(
                 PREPARE,
-                "Preview the default profile's budget split and return the controller arguments for manual execution.",
+                "Preview a request budget or an installed scenario's iteration budget. Return controller arguments for manual execution.",
                 json!({"inventory": inventory, "requests": positive_integer,
+                    "scenario": {"type":"string","pattern":"^[a-zA-Z0-9_-]{1,64}$","description":"Name of the scenario installed on the Grunts."},
+                    "iterations": positive_integer,
                     "concurrency": positive_integer, "rate_per_second": positive_integer,
                     "deadline_seconds": {"type":"integer","minimum":1,"maximum":3600,"default":DEFAULT_DEADLINE_SECONDS}}),
-                &["inventory", "requests", "concurrency", "rate_per_second"],
+                &["inventory", "concurrency", "rate_per_second"],
                 read_only(),
             ),
         ]
@@ -224,12 +227,33 @@ impl Controllers {
 
     fn prepare(&self, arguments: Value) -> Result<Value, BoxError> {
         let args: PrepareArguments = serde_json::from_value(arguments)?;
+        let (profile, unit, count, workload_args) =
+            match (args.scenario.as_deref(), args.iterations, args.requests) {
+                (None, None, Some(requests)) => (
+                    DEFAULT_PROFILE,
+                    "requests",
+                    requests,
+                    vec!["--requests".to_owned(), requests.to_string()],
+                ),
+                (Some(name), Some(iterations), None) if valid_profile_name(name) => (
+                    name,
+                    "iterations",
+                    iterations,
+                    vec![
+                        "--scenario".to_owned(),
+                        name.to_owned(),
+                        "--iterations".to_owned(),
+                        iterations.to_string(),
+                    ],
+                ),
+                _ => return Err("provide requests or a valid scenario name with iterations".into()),
+            };
         let path = self.path(&args.inventory)?;
         let config = ControllerConfig::read(path)?;
         let grunts = inventory_grunts(&config, &Inventory::read(&config.inventory_path(path))?)?;
         let deadline_seconds = args.deadline_seconds.unwrap_or(DEFAULT_DEADLINE_SECONDS);
         let budget = Budget {
-            requests: Some(args.requests),
+            requests: Some(count),
             concurrency: args.concurrency,
             rate_per_second: args.rate_per_second,
             duration: None,
@@ -258,19 +282,29 @@ impl Controllers {
         let path = path
             .to_str()
             .ok_or("controller configuration path is not UTF-8")?;
+        let argv = [executable, "controller", "--config", path]
+            .map(str::to_owned)
+            .into_iter()
+            .chain(workload_args)
+            .chain([
+                "--concurrency".to_owned(),
+                args.concurrency.to_string(),
+                "--rate".to_owned(),
+                args.rate_per_second.to_string(),
+                "--deadline".to_owned(),
+                deadline_seconds.to_string(),
+            ])
+            .collect::<Vec<_>>();
         Ok(json!({
             "inventory": args.inventory,
-            "profile": DEFAULT_PROFILE,
+            "profile": profile,
+            "budget_unit": unit,
             "budget": budget,
             "deadline_seconds": deadline_seconds,
             "assignments": assignments,
             "unused_grunts": unused,
             "connectivity_checked": false,
-            "argv": [
-                executable, "controller", "--config", path,
-                "--requests", &args.requests.to_string(), "--concurrency", &args.concurrency.to_string(),
-                "--rate", &args.rate_per_second.to_string(), "--deadline", &deadline_seconds.to_string()
-            ],
+            "argv": argv,
         }))
     }
 }
@@ -335,7 +369,9 @@ struct RemoveArgument {
 #[serde(deny_unknown_fields)]
 struct PrepareArguments {
     inventory: String,
-    requests: u64,
+    requests: Option<u64>,
+    scenario: Option<String>,
+    iterations: Option<u64>,
     concurrency: u64,
     rate_per_second: u64,
     deadline_seconds: Option<u64>,

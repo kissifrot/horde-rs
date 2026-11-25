@@ -7,6 +7,8 @@ mod histogram;
 mod policy;
 mod result;
 #[cfg(feature = "distributed-transport")]
+mod scenarios;
+#[cfg(feature = "distributed-transport")]
 pub mod transport;
 pub use histogram::{
     DecodeLimits, DistributedHistogram, MAX_ENVELOPE_BYTES, decode_histogram, encode_histogram,

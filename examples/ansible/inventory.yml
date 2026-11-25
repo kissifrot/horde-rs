@@ -1,0 +1,15 @@
+---
+all:
+  children:
+    horde_grunts:
+      children:
+        staging:
+          hosts:
+            grunt-a:
+              ansible_host: grunt-a.example.test
+            grunt-b:
+              ansible_host: grunt-b.example.test
+          vars:
+            ansible_user: deploy
+            horde_grunt_config: /etc/horde/grunt.json
+            horde_grunt_service: horde-grunt.service

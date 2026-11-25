@@ -15,12 +15,8 @@ for the control channel, workload flow and partial reports.
 
 ## Before the run
 
-- Use the same revision on all three machines. Install the
-  [prerelease](../README.md#linux-and-macos-prereleases) for each machine's
-  architecture or build locally with
-  `cargo build --release --locked --features distributed-transport`.
-  When using a package or standalone executable, use that binary in the
-  commands below in place of `target/release/horde`.
+- Use the same revision on all three machines, with distributed support
+  enabled and `horde` on the PATH. See the [installation guide](installation.md).
 - Provision an internal CA trust root, one controller client certificate
   and distinct server certificates for the Grunts. Each process needs
   its own leaf certificate in DER, its own PKCS#8 DER private key and
@@ -123,7 +119,7 @@ Add `"user_agent": "Horde-Pilot/1.0"` to `grunt.json` to set the User-Agent
 sent to this Grunt's HTTP target. The default is `Horde/<version>`.
 
 ```sh
-target/release/horde grunt --config "$HOME/horde-pilot/grunt.json"
+horde grunt --config "$HOME/horde-pilot/grunt.json"
 ```
 
 Both processes should print their private listening address. For IPv6,
@@ -166,7 +162,7 @@ local private keys by path. `private_network` defaults to false and
 `server_name` is an optional fallback TLS identity.
 
 ```sh
-target/release/horde preflight --config "$HOME/horde-pilot/controller.json"
+horde preflight --config "$HOME/horde-pilot/controller.json"
 ```
 
 Preflight checks each peer through the authenticated protocol hello and
@@ -182,10 +178,10 @@ Use the inventory commands to register or remove Grunts between runs.
 directly at a JSON file with `--inventory grunts.json`.
 
 ```sh
-target/release/horde inventory --config controller.json add 10.0.0.12:7071
-target/release/horde inventory --config controller.json add 10.0.0.13:7071=grunt-b.example.internal
-target/release/horde inventory --config controller.json list
-target/release/horde inventory --config controller.json remove 10.0.0.12:7071
+horde inventory --config controller.json add 10.0.0.12:7071
+horde inventory --config controller.json add 10.0.0.13:7071=grunt-b.example.internal
+horde inventory --config controller.json list
+horde inventory --config controller.json remove 10.0.0.12:7071
 ```
 
 A running controller keeps the peers and budgets it selected at startup.
@@ -198,14 +194,14 @@ applies removals first and saves the validated list before connecting.
 Later runs reuse the saved inventory.
 
 ```sh
-target/release/horde preflight --config controller.json \
+horde preflight --config controller.json \
   --add-grunt 10.0.0.13:7071=grunt-b.example.internal
 ```
 
 From the controller machine, use a small budget first:
 
 ```sh
-target/release/horde controller --config "$HOME/horde-pilot/controller.json" \
+horde controller --config "$HOME/horde-pilot/controller.json" \
   --requests 20 --concurrency 2 --rate 4 --deadline 30 \
   --max-failure-rate 0 > pilot-complete.json
 ```
@@ -243,87 +239,8 @@ the operational prerequisites for doing so.
 
 ## Single-host alternative using containers
 
-On Linux with a local Docker daemon, Rust, Python 3, OpenSSL and
-`ldd`, run:
-
-```sh
-cargo build --release --locked --features distributed-transport
-python3 scripts/pilot-docker.py
-```
-
-The script builds a temporary image from the local release binary and
-HTTP fixture. It allocates private IPs on an internal Docker network,
-issues fresh TLS certificates, and starts two Grunts and a controller.
-It launches the commands with per-role JSON configuration and passes
-the budget and rate directly to the controller.
-Each Grunt's HTTP fixture listens on its own loopback interface. No
-ports are published.
-
-- Preflight checks both Grunts, then repeats with an incorrect TLS identity
-  for Grunt B. It must report A as ready and B as failed. Both loopback HTTP
-  fixtures must observe zero connections in both cases.
-- The source IP check repeats the successful preflight with the same
-  controller certificate and inventory from an unlisted private Docker
-  IP. Both Grunts must close the control connection before the TLS
-  handshake completes. Neither Grunt sends a `hello` or reaches its HTTP
-  target. The JSON report records the source and both failures.
-- Rotation uses two CAs, an IP SAN and a DNS SAN. During overlap, both
-  controller leaves must reach both Grunts, one with the new certificate
-  and one with the old. Removing the old controller leaf must deny it
-  even with both roots installed. With only the new root and leaf
-  configured, the new credentials must work and the old credentials and
-  old-root-only trust must fail. Each preflight checks for zero HTTP
-  connections. The pilot stages credentials in separate role directories
-  on the Docker host and copies only public CSRs to the signer directory.
-- The nominal run checks 10 requests per Grunt, 20 successful responses,
-  40 body bytes and populated merged p95/p99. Both HTTP targets record the
-  User-Agent on every request. The report checks `Horde-Docker-Pilot/1.0`
-  from Grunt A's configuration and the default `Horde/<version>` from Grunt B.
-- The interruption run disconnects Grunt B from the Docker network
-  after its first HTTP request. It checks that B stops before spending
-  its 20-request share, A completes its own 20 requests, and the
-  controller reports B as missing with a partial result and an
-  unevaluable failure threshold.
-- The silent failure run routes B's TLS control stream through a
-  test-only TCP relay on the internal network. After B's first workload
-  request, the relay pauses both directions while keeping both sockets
-  open. The controller must report an I/O timeout and mark B missing
-  while A completes exactly its 20-request share. The failure threshold
-  remains unevaluable. Docker log timestamps measure the controller
-  detection time and the last HTTP connection at B's fixture. The pilot
-  allows 0.5–2.5 seconds for controller detection and 3–6.5 seconds until
-  the last observed connection at B, with at least two more seconds
-  between B's last connection and A's last connection. These windows
-  allow for observation and scheduling around the one-second controller
-  timeout, three-second Grunt frame timeout and two-second reconnection
-  grace.
-- The maintenance run lowers both retention limits on Grunt B. It checks
-  both saturation reasons and their HTTP effects, stops B with SIGTERM,
-  and verifies that only B's epoch changes. A fresh two-request run then
-  completes with one request on each Grunt.
-- The controller stop scenarios send `SIGINT` and `SIGKILL` with both
-  Grunts running. `SIGINT` must exit 130 with a partial report confirming
-  both cancellations. `SIGKILL` must exit 137 with no controller report.
-  For both signals, the Docker pilot observes the HTTP fixtures for seven
-  seconds after sending the signal. Each Grunt must leave part of its
-  20-request share unused and remain quiet for at least three seconds.
-  The last HTTP connection must occur by 1.5 seconds after `SIGINT` or
-  four seconds after `SIGKILL`. The pilot finishes with an authenticated
-  preflight to verify that both Grunts are still reachable.
-- The inventory scenario adds a second Grunt during a one-peer run,
-  verifies that the next run uses both peers, and removes the original
-  Grunt before the following run.
-
-The script removes its containers, network, image and temporary
-credentials on exit, including on failure, SIGINT or SIGTERM. It writes
-the combined report to `target/pilot-docker-report.json` on success.
-Use `--output` to choose another location. The `distributed-pilot`
-GitHub Actions job runs the same script and uploads the JSON report
-as the `horde-distributed-pilot` artifact.
-
-This exercises separate IPs and TLS identities on a single kernel.
-Routing, firewalls and physical link detection remain checks for the
-multi-host pilot.
+Use the [Docker pilot validation](development.md#docker-pilot-validation)
+to exercise two Grunts and a controller on a single Linux host.
 
 ## Restart a Grunt after saturation
 

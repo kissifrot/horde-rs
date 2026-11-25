@@ -193,6 +193,163 @@ fn report(output: &Output) -> Value {
     })
 }
 
+fn scenario_grunt(directory: &Scratch, config_name: &str, file: &str) -> Command {
+    let config = directory.0.join(config_name);
+    std::fs::write(
+        &config,
+        serde_json::json!({
+            "listen": "127.0.0.1:0",
+            "scenarios": {"journey": file},
+            "controller_cert": [fixture("controller.der")],
+            "tls": {
+                "ca": [fixture("ca.der")],
+                "cert": fixture("server.der"),
+                "key": fixture("server-key.der"),
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_horde"));
+    command.args(["grunt", "--config"]).arg(config);
+    command
+}
+
+fn inventory_command(directory: &Scratch, grunts: &[SocketAddr], subcommand: &str) -> Command {
+    let inventory = directory.0.join("inventory.json");
+    let entries = grunts
+        .iter()
+        .map(|address| serde_json::json!({"address": address}))
+        .collect::<Vec<_>>();
+    std::fs::write(
+        &inventory,
+        serde_json::json!({"grunts": entries}).to_string(),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_horde"));
+    command.args([subcommand, "--inventory"]).arg(inventory);
+    identity(&mut command, "controller", "ca.der");
+    command
+}
+
+fn scenario_controller(directory: &Scratch, grunts: &[SocketAddr]) -> Command {
+    let mut command = inventory_command(directory, grunts, "controller");
+    command.args([
+        "--scenario",
+        "journey",
+        "--iterations",
+        "3",
+        "--concurrency",
+        "2",
+        "--rate",
+        "20",
+        "--max-failure-rate",
+        "0",
+    ]);
+    command
+}
+
+#[test]
+fn distributed_scenario_splits_iterations_and_merges_steps() {
+    let scratch = Scratch::new("distributed-scenario");
+    let (target, server) = start_target(6, 0);
+    let url = format!("http://{target}/");
+    let scenario = serde_json::json!({
+        "version": 1, "name": "journey", "steps": [
+            {"name": "first", "url": url},
+            {"name": "unexpected status", "url": url, "expect": {"status": [201]}},
+            {"name": "skipped", "url": url},
+        ],
+    });
+    std::fs::write(scratch.0.join("scenario.json"), scenario.to_string()).unwrap();
+    let (first, _first) =
+        start_grunt_command(scenario_grunt(&scratch, "first.json", "scenario.json"));
+    let (second, _second) =
+        start_grunt_command(scenario_grunt(&scratch, "second.json", "scenario.json"));
+    let preflight = inventory_command(&scratch, &[first, second], "preflight")
+        .args(["--scenario", "journey"])
+        .output_timeout()
+        .unwrap();
+    assert!(preflight.status.success(), "{preflight:?}");
+    let check = report(&preflight);
+    assert_eq!(check["ready"], true);
+    assert_eq!(check["scenario"], "journey");
+    let revision = check["grunts"][0]["scenario_revision"].as_str().unwrap();
+    assert_eq!(revision.len(), 64);
+    assert_eq!(check["grunts"][1]["scenario_revision"], revision);
+    let output = scenario_controller(&scratch, &[first, second])
+        .output_timeout()
+        .unwrap();
+    let run = report(&output);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(run["type"], "distributed_scenario");
+    assert_eq!(run["partial"], false, "{run}");
+    assert_eq!(run["scenarios"]["completed"], 3);
+    assert_eq!(run["scenarios"]["failed"], 3);
+    assert_eq!(run["steps"][0]["completed"], 3);
+    assert_eq!(run["steps"][1]["failed"], 3);
+    assert_eq!(run["steps"][2]["skipped"], 3);
+    assert!(run["steps"][0]["latency_ms"]["p95"].is_number());
+    assert_eq!(run["steps"][2]["latency_ms"]["p95"], Value::Null);
+    assert_eq!(run["thresholds"]["failure_rate"], "failed");
+    assert_eq!(run["agents"][0]["status"], "complete");
+    assert_eq!(run["agents"][1]["status"], "complete");
+    server.join().unwrap();
+}
+
+#[test]
+fn distributed_scenario_rejects_mixed_revisions_before_http() {
+    let scratch = Scratch::new("distributed-scenario-mismatch");
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    for (name, file) in [("first", "a.json"), ("second", "b.json")] {
+        let scenario = serde_json::json!({
+            "version": 1, "name": "journey", "steps": [
+                {"name": name, "url": format!("http://{}/", target.local_addr().unwrap())},
+            ],
+        });
+        std::fs::write(scratch.0.join(file), scenario.to_string()).unwrap();
+    }
+    let (first, _first) = start_grunt_command(scenario_grunt(&scratch, "first.json", "a.json"));
+    let (second, _second) = start_grunt_command(scenario_grunt(&scratch, "second.json", "b.json"));
+    let preflight = inventory_command(&scratch, &[first, second], "preflight")
+        .args(["--scenario", "journey"])
+        .output_timeout()
+        .unwrap();
+    assert_eq!(preflight.status.code(), Some(1), "{preflight:?}");
+    let check = report(&preflight);
+    assert_eq!(check["ready"], false);
+    assert_eq!(check["grunts"][0]["status"], "ready");
+    assert_eq!(check["grunts"][1]["status"], "failed");
+    assert_ne!(
+        check["grunts"][0]["scenario_revision"],
+        check["grunts"][1]["scenario_revision"]
+    );
+    let missing = inventory_command(&scratch, &[first], "preflight")
+        .args(["--scenario", "unknown"])
+        .output_timeout()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+    assert!(
+        report(&missing)["grunts"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not installed")
+    );
+    let output = scenario_controller(&scratch, &[first, second])
+        .output_timeout()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("different revision"),
+        "{output:?}"
+    );
+    target.set_nonblocking(true).unwrap();
+    assert_eq!(
+        target.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
 #[test]
 fn inventory_flags_save_a_valid_snapshot_before_preflight_and_run() {
     let scratch = Scratch::new("inventory");

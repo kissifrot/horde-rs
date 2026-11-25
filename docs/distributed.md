@@ -64,7 +64,7 @@ of the connection, it cancels its run if the controller fails to
 reconnect within the grace period. A configured threshold is
 unevaluable in a partial report.
 
-To try this on one machine, follow the [Docker pilot](distributed-pilot.md#single-host-alternative-using-containers).
+To validate this on one machine, follow the [Docker pilot](development.md#docker-pilot-validation).
 For configuration and commands, see the [two-Grunt walkthrough](distributed-pilot.md#start-each-grunt).
 
 ## Roles and trust
@@ -107,6 +107,24 @@ metadata allowance. The endpoint reports a full record table with the
 `result_storage_capacity`. The controller preserves per-agent
 `status: failed` and includes a `reason` for these failures. Use the same
 revision on the controller and Grunts for the experimental protocol.
+
+Named scenarios use `describe_scenario` with a profile and its assigned
+iteration budget. The response contains the SHA-256 revision of the
+installed JSON and the ordered step names. Once all assigned peers report
+the same description, the controller sends `submit_scenario` with that
+revision on the established sessions. The Grunt checks the revision again
+when accepting the submission. Older Grunts cannot describe the profile, so
+the scenario check fails before submission.
+
+`preflight --scenario` uses the same description exchange without a budget
+to check the installed revision on every peer in the inventory. It closes
+the control sessions after collecting descriptions.
+
+`collect` returns `scenario_result` for a completed scenario, followed by
+a bounded metadata frame and one histogram for overall iteration duration
+plus one per step. The controller checks the lengths against the assigned
+budget, verifies that step counts reflect sequential execution, and merges
+the histograms only from validated complete Grunt results.
 
 The controller opens one authenticated session per assigned Grunt and submits
 each share once. It does not reassign missing shares or resubmit after ambiguous

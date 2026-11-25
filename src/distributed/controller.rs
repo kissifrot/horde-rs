@@ -1,4 +1,5 @@
 //! Coordinator for the experimental Grunt control transport.
+mod scenarios;
 use super::{
     AgentOutcome, Aggregate, Budget, Cancellation, CompletedResult, DecodeLimits,
     MAX_ENVELOPE_BYTES, split_budget,
@@ -8,6 +9,9 @@ use super::{
     },
 };
 use futures_util::{StreamExt, future::join_all, stream};
+pub use scenarios::{
+    ScenarioAgent, ScenarioControllerReport, ScenarioMeasurement, ScenarioPreflight,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
@@ -248,7 +252,7 @@ impl Controller {
                     }
                     aggregate.add_noncomplete(run_id, name, AgentOutcome::Failed)?
                 }
-                None => {}
+                Some(Outcome::Scenario(_)) | None => {}
             }
         }
         Ok(ControllerReport {
@@ -268,24 +272,36 @@ impl Controller {
         cancel: Cancellation,
     ) -> Result<Outcome, BoxError> {
         let mut cancellation = cancel.subscribe();
-        let (epoch, mut stream) = tokio::select! {
+        let connection = tokio::select! {
             biased;
             _ = crate::wait_for_cancel(&mut cancellation) => return Err("submission interrupted".into()),
             connection = timeout(IO_TIMEOUT, self.connect(grunt)) => connection??,
         };
-        if cancel.is_cancelled() {
-            return Err("submission interrupted".into());
-        }
-        let mut reply = exchange(
-            &mut stream,
-            epoch,
+        Self::drive_connected(
+            connection,
             run_id,
             Operation::SubmitBudget {
                 profile: profile.to_owned(),
                 budget,
             },
+            None,
+            cancel,
         )
-        .await?;
+        .await
+    }
+
+    async fn drive_connected(
+        (epoch, mut stream): GruntConnection,
+        run_id: [u8; 16],
+        operation: Operation,
+        scenario: Option<(usize, u64)>,
+        cancel: Cancellation,
+    ) -> Result<Outcome, BoxError> {
+        if cancel.is_cancelled() {
+            return Err("submission interrupted".into());
+        }
+        let mut cancellation = cancel.subscribe();
+        let mut reply = exchange(&mut stream, epoch, run_id, operation).await?;
         let mut cancel_by = None;
         loop {
             match reply {
@@ -303,8 +319,12 @@ impl Controller {
                             },
                         )
                         .await?;
-                        let Reply::Result { histogram_bytes } = read_reply(&mut stream).await?
-                        else {
+                        let response = read_reply(&mut stream).await?;
+                        if let Some((steps, iterations)) = scenario {
+                            return scenarios::collect(&mut stream, response, steps, iterations)
+                                .await;
+                        }
+                        let Reply::Result { histogram_bytes } = response else {
                             return Err("missing completed Grunt result".into());
                         };
                         if !(1..=MAX_ENVELOPE_BYTES).contains(&histogram_bytes) {
@@ -370,9 +390,12 @@ impl Controller {
     }
 }
 
+type GruntConnection = ([u8; 16], TlsStream<TcpStream>);
+
 enum Outcome {
     State(RunStatus),
     Result(Box<CompletedResult>, Vec<u8>),
+    Scenario(super::scenarios::ScenarioPayload),
     Rejected(ErrorCode),
 }
 

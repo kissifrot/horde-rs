@@ -465,6 +465,8 @@ mod tests {
 pub struct Scenario {
     pub name: String,
     steps: Vec<Step>,
+    #[cfg(feature = "distributed-transport")]
+    direct_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -952,7 +954,56 @@ impl Scenario {
         Ok(Self {
             name: file.name,
             steps,
+            #[cfg(feature = "distributed-transport")]
+            direct_only: false,
         })
+    }
+
+    #[cfg(feature = "distributed-transport")]
+    pub(crate) fn restrict_to_loopback(&mut self) -> Result<(), RunError> {
+        for step in &self.steps {
+            let loopback = step
+                .url
+                .as_ref()
+                .and_then(Url::host_str)
+                .and_then(|host| {
+                    host.trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .ok()
+                })
+                .is_some_and(|ip| ip.to_canonical().is_loopback());
+            if !loopback {
+                return Err(
+                    "distributed scenario steps require a static literal loopback IP".into(),
+                );
+            }
+            let headers = step
+                .headers
+                .keys()
+                .chain(step.dynamic_headers.iter().map(|(name, _)| name));
+            if step.method == Method::CONNECT
+                || headers.into_iter().any(|name| {
+                    matches!(
+                        name.as_str(),
+                        "host"
+                            | "content-length"
+                            | "transfer-encoding"
+                            | "upgrade"
+                            | "connection"
+                            | "proxy-authorization"
+                    )
+                })
+            {
+                return Err("distributed scenario method or header denied by Grunt policy".into());
+            }
+        }
+        self.direct_only = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "distributed-transport")]
+    pub(crate) fn step_names(&self) -> impl Iterator<Item = &str> {
+        self.steps.iter().map(|step| step.name.as_str())
     }
 }
 
@@ -972,6 +1023,11 @@ pub struct Counts {
 }
 
 impl Counts {
+    #[cfg(feature = "distributed-transport")]
+    pub(crate) fn bounded_histogram(&self) -> Option<&crate::BoundedLatency> {
+        self.bounded_latencies.as_ref()
+    }
+
     fn record(
         &mut self,
         latency: Duration,
@@ -1305,8 +1361,14 @@ async fn run_scenario_impl(
             .cookie_store(true)
             .timeout(timeout)
             .user_agent(user_agent.clone())
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+            .redirect(reqwest::redirect::Policy::none());
+        #[cfg(feature = "distributed-transport")]
+        let client = if scenario.direct_only {
+            client.no_proxy()
+        } else {
+            client
+        };
+        let client = client.build()?;
         tasks.spawn(async move {
             let mut totals = Counts::default();
             let mut steps = vec![Counts::default(); scenario.steps.len()];

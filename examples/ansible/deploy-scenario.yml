@@ -1,0 +1,61 @@
+---
+- name: Deploy a Horde scenario
+  hosts: horde_grunts
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    horde_scenario_relative_path: "scenarios/{{ horde_scenario_name }}.json"
+  tasks:
+    - name: Check the deployment inputs
+      ansible.builtin.assert:
+        that:
+          - (horde_scenario_name | default('')) is match('^[a-zA-Z0-9_-]{1,64}$')
+          - (horde_scenario_source | default('')) is match('^/')
+          - (horde_grunt_config | default('')) is match('^/')
+          - (horde_grunt_service | default('') | length) > 0
+        fail_msg: Provide the scenario name, absolute source and Grunt config paths, and the Grunt service name.
+
+    - name: Read the existing Grunt configuration
+      ansible.builtin.slurp:
+        src: "{{ horde_grunt_config }}"
+      register: horde_grunt_config_file
+      no_log: true
+
+    - name: Parse the existing Grunt configuration
+      ansible.builtin.set_fact:
+        horde_current_config: "{{ horde_grunt_config_file.content | b64decode | from_json }}"
+      no_log: true
+
+    - name: Create the scenario directory
+      ansible.builtin.file:
+        path: "{{ horde_grunt_config | dirname }}/scenarios"
+        state: directory
+        mode: '0755'
+
+    - name: Copy the scenario JSON without templating it
+      ansible.builtin.copy:
+        src: "{{ horde_scenario_source }}"
+        dest: "{{ horde_grunt_config | dirname }}/{{ horde_scenario_relative_path }}"
+        mode: '0644'
+        backup: true
+        decrypt: false
+      diff: false
+
+    - name: Register the scenario and retain existing settings
+      ansible.builtin.template:
+        src: grunt.json.j2
+        dest: "{{ horde_grunt_config }}"
+        backup: true
+      vars:
+        horde_scenario_registration: "{{ {'scenarios': {horde_scenario_name: horde_scenario_relative_path}} }}"
+        horde_updated_config: "{{ horde_current_config | combine(horde_scenario_registration, recursive=true) }}"
+      when: (horde_current_config.scenarios | default({})).get(horde_scenario_name) != horde_scenario_relative_path
+      diff: false
+      no_log: true
+
+    - name: Restart the Grunt to load the scenario
+      ansible.builtin.systemd_service:
+        name: "{{ horde_grunt_service }}"
+        state: restarted
